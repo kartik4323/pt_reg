@@ -1,0 +1,92 @@
+# Compatibility-driven two-stage 3D fragment assembly.
+# This mock config is intentionally small enough for CPU smoke tests.
+
+mock_data:
+  enabled: true
+  n_objects: 60
+
+data:
+  shapenet_root: "./mock_shapenet_two_stage"
+  categories:
+    - "02691156"
+    - "03001627"
+    - "04379243"
+  num_points_per_object: 256
+  num_points_per_fragment: 96
+  train_split: 0.75
+  val_split: 0.10
+  test_split: 0.15
+  seed: 42
+
+fragment:
+  min_fragments: 3
+  max_fragments: 5
+  strategies: ["plane", "voronoi", "irregular"]
+  boundary_eps: 0.06
+  irregular_noise_scale: 0.05
+
+pairs:
+  perturbed_negative_prob: 0.5
+
+augmentation:
+  fragment_pose_translation: 0.6
+
+model:
+  encoder:
+    type: "token_pointnet"
+    embedding_dim: 64
+    hidden_dim: 96
+    num_tokens: 8
+    dropout: 0.0
+  compatibility:
+    hidden_dims: [128, 96]
+    edge_dim: 64
+    dropout: 0.0
+  assembly:
+    gnn_hidden_dim: 128
+    gnn_layers: 2
+    transformer_layers: 1
+    transformer_heads: 4
+    decoder_layers: 1
+    output_points: 256
+    dropout: 0.0
+
+loss:
+  stage1:
+    margin_direct_semantic: 0.45
+    margin_semantic_negative: 0.20
+    lambda_boundary: 0.2
+    lambda_classification: 0.5
+  stage2:
+    lambda_boundary: 1.0
+    lambda_coverage: 0.5
+    lambda_dropout: 0.1
+    lambda_consistency: 0.1
+    lambda_compat: 0.05
+    boundary_weight: 2.0
+
+stage1:
+  epochs: 3
+  epoch_size: 96
+  batch_size: 8
+  num_workers: 0
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage2:
+  epochs: 3
+  epoch_size: 48
+  batch_size: 4
+  num_workers: 0
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage3:
+  epoch_size: 8
+  batch_size: 2
+  icp_iterations: 3
+
+output:
+  dir: "./outputs_two_stage_mock"

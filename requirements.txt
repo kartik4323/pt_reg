@@ -1,0 +1,6 @@
+torch
+numpy
+PyYAML
+tqdm
+trimesh
+huggingface_hub

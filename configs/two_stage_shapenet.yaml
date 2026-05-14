@@ -1,0 +1,93 @@
+# Real ShapeNet point-cloud config.
+#
+# First create the dataset with scripts/prepare_shapenet_points.py, then point
+# data.shapenet_root at that output directory.
+
+mock_data:
+  enabled: false
+
+data:
+  shapenet_root: "./shape_processed"
+  categories:
+    - "02691156"  # airplane
+    - "03001627"  # chair
+    - "04379243"  # table
+  num_points_per_object: 4096
+  num_points_per_fragment: 1024
+  train_split: 0.80
+  val_split: 0.10
+  test_split: 0.10
+  seed: 42
+
+fragment:
+  min_fragments: 3
+  max_fragments: 6
+  strategies: ["plane", "voronoi", "irregular"]
+  boundary_eps: 0.04
+  irregular_noise_scale: 0.05
+
+pairs:
+  perturbed_negative_prob: 0.5
+
+augmentation:
+  fragment_pose_translation: 0.7
+
+model:
+  encoder:
+    type: "token_pointnet"
+    embedding_dim: 128
+    hidden_dim: 192
+    num_tokens: 16
+    dropout: 0.05
+  compatibility:
+    hidden_dims: [256, 192]
+    edge_dim: 128
+    dropout: 0.05
+  assembly:
+    gnn_hidden_dim: 256
+    gnn_layers: 3
+    transformer_layers: 2
+    transformer_heads: 4
+    decoder_layers: 2
+    output_points: 4096
+    dropout: 0.05
+
+loss:
+  stage1:
+    margin_direct_semantic: 0.45
+    margin_semantic_negative: 0.20
+    lambda_boundary: 0.2
+    lambda_classification: 0.5
+  stage2:
+    lambda_boundary: 2.0
+    lambda_coverage: 1.0
+    lambda_dropout: 0.5
+    lambda_consistency: 0.3
+    lambda_compat: 0.1
+    boundary_weight: 2.0
+
+stage1:
+  epochs: 50
+  epoch_size: 20000
+  batch_size: 16
+  num_workers: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage2:
+  epochs: 80
+  epoch_size: 10000
+  batch_size: 4
+  num_workers: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage3:
+  epoch_size: 512
+  batch_size: 2
+  icp_iterations: 10
+
+output:
+  dir: "./outputs_two_stage_shapenet"

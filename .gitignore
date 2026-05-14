@@ -1,0 +1,54 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+py312_env/
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Dataset downloads and generated ShapeNet point clouds
+downloads/
+shape_processed/
+
+# Training outputs, checkpoints, and experiment trackers
+outputs/
+outputs_*/
+runs/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+
+# Notebook checkpoints
+.ipynb_checkpoints/
