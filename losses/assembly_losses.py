@@ -97,6 +97,7 @@ class AssemblyLoss(nn.Module):
         lambda_consistency: float = 0.3,
         lambda_compat: float = 0.1,
         boundary_weight: float = 2.0,
+        dropout_margin: float = 0.01,
     ) -> None:
         super().__init__()
         self.lambda_boundary = lambda_boundary
@@ -105,6 +106,7 @@ class AssemblyLoss(nn.Module):
         self.lambda_consistency = lambda_consistency
         self.lambda_compat = lambda_compat
         self.boundary_weight = boundary_weight
+        self.dropout_margin = dropout_margin
 
     def forward(
         self,
@@ -133,7 +135,7 @@ class AssemblyLoss(nn.Module):
 
         if dropout_pred is not None:
             drop_cd = chamfer_distance(dropout_pred, target)
-            dropout_penalty = F.relu(plain_cd.detach() - drop_cd)
+            dropout_penalty = F.relu(plain_cd.detach() + self.dropout_margin - drop_cd)
         else:
             dropout_penalty = pred.sum() * 0.0
 
@@ -176,4 +178,5 @@ def build_assembly_loss(cfg: dict) -> AssemblyLoss:
         lambda_consistency=loss_cfg.get("lambda_consistency", 0.3),
         lambda_compat=loss_cfg.get("lambda_compat", 0.1),
         boundary_weight=loss_cfg.get("boundary_weight", 2.0),
+        dropout_margin=loss_cfg.get("dropout_margin", 0.01),
     )

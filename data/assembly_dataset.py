@@ -3,9 +3,8 @@ Datasets for compatibility-driven 3D fragment assembly.
 
 This module supplies the two data views used by the proposed pipeline:
 
-1. CompatibilityTripletDataset for Stage 1. Each item contains an anchor
-   fragment, a direct-match fragment, a semantic-match fragment, and a
-   negative fragment.
+1. CompatibilityPairDataset for Stage 1. Each item contains a fragment pair,
+   a binary fit label, and a pair type.
 2. AssemblyObjectDataset for Stage 2/3. Each item contains a padded set of
    posed fragments, canonical training targets, adjacency labels, and the
    ground-truth rigid transforms from posed fragment frames to the target
@@ -117,6 +116,7 @@ def _apply_row_transform(pts: np.ndarray, rotation: np.ndarray, translation: np.
 def _random_pose(
     pts: np.ndarray,
     translation_scale: float,
+    random_rotation: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Randomly pose a canonical fragment.
@@ -125,7 +125,10 @@ def _random_pose(
     the canonical object frame, using the same row-vector convention:
     canonical = posed @ R_align.T + t_align.
     """
-    rotation_pose = random_rotation_matrix()
+    if random_rotation:
+        rotation_pose = random_rotation_matrix()
+    else:
+        rotation_pose = np.eye(3, dtype=np.float32)
     translation_pose = np.random.uniform(
         -translation_scale, translation_scale, size=(3,)
     ).astype(np.float32)
@@ -313,8 +316,8 @@ class _ObjectBackedDataset(Dataset):
         return _load_point_cloud(self.data_root / synset / f"{obj_id}.npy")
 
 
-class CompatibilityTripletDataset(_ObjectBackedDataset):
-    """Triplets for Stage 1 margin-based compatibility pretraining."""
+class CompatibilityPairDataset(_ObjectBackedDataset):
+    """Pair samples for Stage 1 binary compatibility pretraining."""
 
     def __init__(
         self,
@@ -326,85 +329,124 @@ class CompatibilityTripletDataset(_ObjectBackedDataset):
         super().__init__(data_root, split, cfg)
         stage_cfg = cfg.get("stage1", {})
         self.epoch_size = epoch_size or stage_cfg.get("epoch_size", len(self.objects) * 4)
-        self.translation_scale = cfg.get("augmentation", {}).get("fragment_pose_translation", 0.7)
-        self.hard_negative_prob = cfg.get("pairs", {}).get("perturbed_negative_prob", 0.0)
+        aug_cfg = cfg.get("augmentation", {})
+        self.translation_scale = aug_cfg.get("fragment_pose_translation", 0.7)
+        self.random_rotation = aug_cfg.get("random_fragment_rotation", True)
+        pair_cfg = cfg.get("pairs", {})
+        self.pair_ratios = {
+            "positive": pair_cfg.get("positive_ratio", 0.5),
+            "easy_negative": pair_cfg.get("easy_negative_ratio", 0.2),
+            "hard_negative": pair_cfg.get("hard_negative_ratio", 0.2),
+            "perturbed_positive": pair_cfg.get("perturbed_positive_ratio", 0.1),
+        }
+        total = sum(max(0.0, float(v)) for v in self.pair_ratios.values())
+        if total <= 0:
+            raise ValueError("At least one Stage 1 pair sampling ratio must be positive")
+        self.pair_types = list(self.pair_ratios.keys())
+        self.pair_probs = [max(0.0, float(self.pair_ratios[k])) / total for k in self.pair_types]
+        self.perturb_noise = pair_cfg.get("perturb_jitter_std", 0.03)
+        self.perturb_scale = pair_cfg.get("perturb_anisotropic_scale", 0.12)
 
     def __len__(self) -> int:
         return self.epoch_size
 
     def __getitem__(self, idx: int) -> dict:
+        pair_type = random.choices(self.pair_types, weights=self.pair_probs, k=1)[0]
+        if pair_type == "positive":
+            frag_a, mask_a, frag_b, mask_b = self._positive_pair()
+            label = 1.0
+        elif pair_type == "easy_negative":
+            frag_a, mask_a, frag_b, mask_b = self._easy_negative_pair()
+            label = 0.0
+        elif pair_type == "hard_negative":
+            frag_a, mask_a, frag_b, mask_b = self._hard_negative_pair()
+            label = 0.0
+        elif pair_type == "perturbed_positive":
+            frag_a, mask_a, frag_b, mask_b = self._perturbed_positive_pair()
+            label = 0.0
+        else:
+            raise ValueError(f"Unknown pair type: {pair_type}")
+
+        frag_a, rot_a, trans_a = _random_pose(
+            frag_a, self.translation_scale, self.random_rotation
+        )
+        frag_b, rot_b, trans_b = _random_pose(
+            frag_b, self.translation_scale, self.random_rotation
+        )
+
+        return {
+            "frag_a": torch.from_numpy(frag_a),
+            "frag_b": torch.from_numpy(frag_b),
+            "label": torch.tensor(label, dtype=torch.float32),
+            "pair_type": pair_type,
+            "boundary_a": torch.from_numpy(mask_a.astype(np.float32)),
+            "boundary_b": torch.from_numpy(mask_b.astype(np.float32)),
+            "align_rotations": torch.from_numpy(np.stack([rot_a, rot_b], axis=0)),
+            "align_translations": torch.from_numpy(np.stack([trans_a, trans_b], axis=0)),
+        }
+
+    def _positive_pair(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         synset, obj_id = random.choice(self.objects)
         pts = self._load(synset, obj_id)
         frag_set = self.generator(
             pts,
             num_fragments=max(3, self.generator.min_fragments),
         )
-        n_frag = len(frag_set.fragments)
-
         adjacent_pairs = np.argwhere(np.triu(frag_set.adjacency, k=1))
         if len(adjacent_pairs) == 0:
-            anchor_idx, direct_idx = 0, 1
+            idx_a, idx_b = 0, 1
         else:
-            anchor_idx, direct_idx = adjacent_pairs[np.random.randint(len(adjacent_pairs))]
-            anchor_idx, direct_idx = int(anchor_idx), int(direct_idx)
-
-        non_adj = [
-            i
-            for i in range(n_frag)
-            if i != anchor_idx and i != direct_idx and not frag_set.adjacency[anchor_idx, i]
-        ]
-        if not non_adj:
-            non_adj = [i for i in range(n_frag) if i != anchor_idx and i != direct_idx]
-        semantic_idx = int(random.choice(non_adj)) if non_adj else int((anchor_idx + 2) % n_frag)
-
-        neg_pts, neg_boundary = self._negative_fragment(synset, obj_id)
-
-        anchor, anchor_rot, anchor_trans = _random_pose(
-            frag_set.fragments[anchor_idx], self.translation_scale
+            idx_a, idx_b = adjacent_pairs[np.random.randint(len(adjacent_pairs))]
+            idx_a, idx_b = int(idx_a), int(idx_b)
+        return (
+            frag_set.fragments[idx_a],
+            frag_set.boundary_masks[idx_a],
+            frag_set.fragments[idx_b],
+            frag_set.boundary_masks[idx_b],
         )
-        direct, direct_rot, direct_trans = _random_pose(
-            frag_set.fragments[direct_idx], self.translation_scale
-        )
-        semantic, semantic_rot, semantic_trans = _random_pose(
-            frag_set.fragments[semantic_idx], self.translation_scale
-        )
-        negative, neg_rot, neg_trans = _random_pose(neg_pts, self.translation_scale)
 
-        return {
-            "anchor": torch.from_numpy(anchor),
-            "direct": torch.from_numpy(direct),
-            "semantic": torch.from_numpy(semantic),
-            "negative": torch.from_numpy(negative),
-            "anchor_boundary": torch.from_numpy(frag_set.boundary_masks[anchor_idx].astype(np.float32)),
-            "direct_boundary": torch.from_numpy(frag_set.boundary_masks[direct_idx].astype(np.float32)),
-            "semantic_boundary": torch.from_numpy(frag_set.boundary_masks[semantic_idx].astype(np.float32)),
-            "negative_boundary": torch.from_numpy(neg_boundary.astype(np.float32)),
-            "class_labels": torch.tensor([0, 1, 2], dtype=torch.long),
-            "object_id": obj_id,
-            "synset": synset,
-            "align_rotations": torch.from_numpy(
-                np.stack([anchor_rot, direct_rot, semantic_rot, neg_rot], axis=0)
-            ),
-            "align_translations": torch.from_numpy(
-                np.stack([anchor_trans, direct_trans, semantic_trans, neg_trans], axis=0)
-            ),
-        }
+    def _easy_negative_pair(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        first = random.choice(self.objects)
+        candidates = [obj for obj in self.objects if obj[0] != first[0]]
+        if not candidates:
+            candidates = [obj for obj in self.objects if obj != first]
+        second = random.choice(candidates)
+        frag_a, mask_a = self._random_fragment(*first)
+        frag_b, mask_b = self._random_fragment(*second)
+        return frag_a, mask_a, frag_b, mask_b
 
-    def _negative_fragment(self, anchor_synset: str, anchor_obj_id: str) -> Tuple[np.ndarray, np.ndarray]:
-        if random.random() < self.hard_negative_prob:
-            same_class = [oid for oid in self.by_synset.get(anchor_synset, []) if oid != anchor_obj_id]
-            if same_class:
-                neg_synset = anchor_synset
-                neg_obj_id = random.choice(same_class)
-            else:
-                neg_synset, neg_obj_id = random.choice(self.objects)
-        else:
-            candidates = [(s, o) for s, o in self.objects if o != anchor_obj_id]
-            neg_synset, neg_obj_id = random.choice(candidates)
+    def _hard_negative_pair(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        synset, obj_id = random.choice(self.objects)
+        same_class = [oid for oid in self.by_synset.get(synset, []) if oid != obj_id]
+        if not same_class:
+            return self._easy_negative_pair()
+        other_id = random.choice(same_class)
+        frag_a, mask_a = self._random_fragment(synset, obj_id)
+        frag_b, mask_b = self._random_fragment(synset, other_id)
+        return frag_a, mask_a, frag_b, mask_b
 
-        neg_set = self.generator(self._load(neg_synset, neg_obj_id), num_fragments=2)
-        idx = random.randrange(len(neg_set.fragments))
-        return neg_set.fragments[idx], neg_set.boundary_masks[idx]
+    def _perturbed_positive_pair(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        frag_a, mask_a, frag_b, mask_b = self._positive_pair()
+        frag_b = self._perturb_fragment_geometry(frag_b)
+        return frag_a, mask_a, frag_b, mask_b
+
+    def _random_fragment(self, synset: str, obj_id: str) -> Tuple[np.ndarray, np.ndarray]:
+        frag_set = self.generator(self._load(synset, obj_id), num_fragments=2)
+        idx = random.randrange(len(frag_set.fragments))
+        return frag_set.fragments[idx], frag_set.boundary_masks[idx]
+
+    def _perturb_fragment_geometry(self, fragment: np.ndarray) -> np.ndarray:
+        centered = fragment - fragment.mean(axis=0, keepdims=True)
+        scales = np.random.uniform(
+            1.0 - self.perturb_scale,
+            1.0 + self.perturb_scale,
+            size=(1, 3),
+        ).astype(np.float32)
+        noise = np.random.normal(0.0, self.perturb_noise, size=fragment.shape).astype(np.float32)
+        return (centered * scales + fragment.mean(axis=0, keepdims=True) + noise).astype(np.float32)
+
+
+CompatibilityTripletDataset = CompatibilityPairDataset
 
 
 class AssemblyObjectDataset(_ObjectBackedDataset):
@@ -422,7 +464,9 @@ class AssemblyObjectDataset(_ObjectBackedDataset):
         frag_cfg = cfg.get("fragment", {})
         self.epoch_size = epoch_size or stage_cfg.get("epoch_size", len(self.objects))
         self.max_fragments = frag_cfg.get("max_fragments", 6)
-        self.translation_scale = cfg.get("augmentation", {}).get("fragment_pose_translation", 0.7)
+        aug_cfg = cfg.get("augmentation", {})
+        self.translation_scale = aug_cfg.get("fragment_pose_translation", 0.7)
+        self.random_rotation = aug_cfg.get("random_fragment_rotation", True)
 
     def __len__(self) -> int:
         return self.epoch_size
@@ -447,7 +491,9 @@ class AssemblyObjectDataset(_ObjectBackedDataset):
         for frag_idx, (frag, bmask) in enumerate(zip(frag_set.fragments, frag_set.boundary_masks)):
             if frag_idx >= max_frag:
                 break
-            posed, rot_align, trans_align = _random_pose(frag, self.translation_scale)
+            posed, rot_align, trans_align = _random_pose(
+                frag, self.translation_scale, self.random_rotation
+            )
             fragments[frag_idx] = posed
             canonical_fragments[frag_idx] = frag
             boundary_masks[frag_idx] = bmask.astype(np.float32)

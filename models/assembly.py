@@ -16,6 +16,8 @@ from models.token_encoder import TokenPointNetEncoder
 class AssemblyOutput:
     point_cloud: torch.Tensor
     node_features: torch.Tensor
+    interaction_features: torch.Tensor
+    fused_features: torch.Tensor
     refined_features: torch.Tensor
     compatibility_scores: torch.Tensor
     edge_features: torch.Tensor
@@ -190,6 +192,15 @@ class FragmentAssemblyModel(nn.Module):
         self.num_tokens = num_tokens
         self.embedding_dim = embedding_dim
         self.edge_dim = edge_dim
+        self.interaction_fusion = nn.Sequential(
+            nn.Linear(embedding_dim + edge_dim, gnn_hidden_dim),
+            nn.LayerNorm(gnn_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(gnn_hidden_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.SiLU(),
+        )
 
         self.gnn = CompatibilityGNN(
             node_dim=embedding_dim,
@@ -245,7 +256,12 @@ class FragmentAssemblyModel(nn.Module):
         )
 
         scores, edges = self._pairwise_compatibility(embeddings, fragment_mask)
-        node_features = self.gnn(embeddings, edges, scores, fragment_mask)
+        interaction_features = self._aggregate_interactions(edges, scores, fragment_mask)
+        fused_features = self.interaction_fusion(
+            torch.cat([embeddings, interaction_features], dim=-1)
+        )
+        fused_features = torch.where(fragment_mask.unsqueeze(-1), fused_features, embeddings)
+        node_features = self.gnn(fused_features, edges, scores, fragment_mask)
         refined = self.refinement(
             node_features,
             src_key_padding_mask=~fragment_mask,
@@ -266,6 +282,8 @@ class FragmentAssemblyModel(nn.Module):
         return AssemblyOutput(
             point_cloud=point_cloud,
             node_features=node_features,
+            interaction_features=interaction_features,
+            fused_features=fused_features,
             refined_features=refined,
             compatibility_scores=scores,
             edge_features=edges,
@@ -297,6 +315,20 @@ class FragmentAssemblyModel(nn.Module):
         scores = torch.where(pair_mask, scores, torch.zeros_like(scores))
         edges = torch.where(pair_mask.unsqueeze(-1), edges, torch.zeros_like(edges))
         return scores, edges
+
+    def _aggregate_interactions(
+        self,
+        edges: torch.Tensor,
+        scores: torch.Tensor,
+        fragment_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pair_mask = fragment_mask[:, :, None] & fragment_mask[:, None, :]
+        eye = torch.eye(fragment_mask.shape[1], dtype=torch.bool, device=fragment_mask.device)[None, :, :]
+        pair_mask = pair_mask & ~eye
+        weights = torch.where(pair_mask, scores, torch.zeros_like(scores))
+        denom = weights.sum(dim=2, keepdim=True).clamp(min=1.0e-6)
+        aggregated = (edges * weights.unsqueeze(-1)).sum(dim=2) / denom
+        return torch.where(fragment_mask.unsqueeze(-1), aggregated, torch.zeros_like(aggregated))
 
     def _encode_fragment_set(
         self,

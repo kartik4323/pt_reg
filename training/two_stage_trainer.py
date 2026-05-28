@@ -11,7 +11,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.assembly_dataset import AssemblyObjectDataset, CompatibilityTripletDataset
+from data.assembly_dataset import AssemblyObjectDataset, CompatibilityPairDataset
 from losses.assembly_losses import build_assembly_loss
 from losses.stage1_losses import build_stage1_loss
 from models.assembly import FragmentAssemblyModel, build_assembly_model
@@ -33,7 +33,7 @@ def _save_json(path: Path, payload: dict) -> None:
 
 
 class Stage1Trainer:
-    """Compatibility pretraining with the three-class margin objective."""
+    """Compatibility pretraining with binary BCE + InfoNCE objective."""
 
     def __init__(self, cfg: dict, device: torch.device) -> None:
         self.cfg = cfg
@@ -50,7 +50,7 @@ class Stage1Trainer:
             weight_decay=stage_cfg.get("weight_decay", 1.0e-4),
         )
 
-        dataset = CompatibilityTripletDataset(
+        dataset = CompatibilityPairDataset(
             data_root=cfg["data"]["shapenet_root"],
             split="train",
             cfg=cfg,
@@ -74,8 +74,8 @@ class Stage1Trainer:
                 "Stage 1 "
                 f"epoch={epoch + 1}/{self.epochs} "
                 f"loss={metrics['loss']:.4f} "
-                f"triplet={metrics['loss_triplet']:.4f} "
-                f"class={metrics['loss_class']:.4f}"
+                f"bce={metrics['loss_bce']:.4f} "
+                f"contrast={metrics['loss_contrast']:.4f}"
             )
 
         ckpt_path = self.out_dir / "stage1_pretrained.pt"
@@ -99,15 +99,14 @@ class Stage1Trainer:
             batch = _move_to_device(batch, self.device)
             self.optimizer.zero_grad(set_to_none=True)
             output = self.model(
-                batch["anchor"],
-                batch["direct"],
-                batch["semantic"],
-                batch["negative"],
+                batch["frag_a"],
+                batch["frag_b"],
             )
             losses = self.criterion(
                 output,
-                anchor_boundary=batch["anchor_boundary"],
-                direct_boundary=batch["direct_boundary"],
+                labels=batch["label"],
+                boundary_a=batch.get("boundary_a"),
+                boundary_b=batch.get("boundary_b"),
             )
             losses["loss"].backward()
             if self.grad_clip > 0:
@@ -153,11 +152,9 @@ class Stage2Trainer:
 
         self.criterion = build_assembly_loss(cfg).to(device)
         stage_cfg = cfg.get("stage2", {})
-        self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=stage_cfg.get("learning_rate", 1.0e-4),
-            weight_decay=stage_cfg.get("weight_decay", 1.0e-4),
-        )
+        self.stage_cfg = stage_cfg
+        self.freeze_pretrained = freeze_pretrained
+        self.optimizer = self._build_optimizer()
         dataset = AssemblyObjectDataset(
             data_root=cfg["data"]["shapenet_root"],
             split="train",
@@ -175,6 +172,7 @@ class Stage2Trainer:
         self.grad_clip = stage_cfg.get("gradient_clip", 1.0)
         self.use_subset = cfg.get("loss", {}).get("stage2", {}).get("lambda_consistency", 0.0) > 0
         self.use_dropout = cfg.get("loss", {}).get("stage2", {}).get("lambda_dropout", 0.0) > 0
+        self.unfreeze_epoch = stage_cfg.get("unfreeze_pretrained_epoch")
 
     def load_stage1(self, checkpoint_path: str) -> None:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -184,6 +182,14 @@ class Stage2Trainer:
     def train(self) -> Path:
         metrics: Dict[str, float] = {}
         for epoch in range(self.epochs):
+            if (
+                self.freeze_pretrained
+                and self.unfreeze_epoch is not None
+                and epoch == int(self.unfreeze_epoch)
+            ):
+                self.model.unfreeze_pretrained()
+                self.freeze_pretrained = False
+                self.optimizer = self._build_optimizer()
             metrics = self._train_epoch(epoch)
             print(
                 "Stage 2 "
@@ -204,6 +210,34 @@ class Stage2Trainer:
         )
         _save_json(self.out_dir / "stage2_metrics.json", metrics)
         return ckpt_path
+
+    def _build_optimizer(self) -> AdamW:
+        lr = self.stage_cfg.get("learning_rate", 1.0e-4)
+        pretrained_lr = self.stage_cfg.get("pretrained_learning_rate", lr)
+        weight_decay = self.stage_cfg.get("weight_decay", 1.0e-4)
+
+        pretrained_params = []
+        pretrained_ids = set()
+        for module in (self.model.encoder, self.model.compatibility):
+            for param in module.parameters():
+                if param.requires_grad:
+                    pretrained_params.append(param)
+                    pretrained_ids.add(id(param))
+
+        new_params = [
+            param
+            for param in self.model.parameters()
+            if param.requires_grad and id(param) not in pretrained_ids
+        ]
+
+        groups = []
+        if new_params:
+            groups.append({"params": new_params, "lr": lr})
+        if pretrained_params:
+            groups.append({"params": pretrained_params, "lr": pretrained_lr})
+        if not groups:
+            raise RuntimeError("Stage 2 has no trainable parameters")
+        return AdamW(groups, weight_decay=weight_decay)
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()

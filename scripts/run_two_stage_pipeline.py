@@ -95,12 +95,15 @@ def main() -> None:
         if stage1_ckpt is None:
             default_stage1 = Path(cfg["output"]["dir"]) / "stage1_pretrained.pt"
             stage1_ckpt = str(default_stage1) if default_stage1.exists() else None
+        freeze_pretrained = cfg.get("stage2", {}).get("freeze_pretrained", True)
+        if args.no_freeze:
+            freeze_pretrained = False
         stage2_ckpt = str(
             Stage2Trainer(
                 cfg,
                 device,
                 stage1_checkpoint=stage1_ckpt,
-                freeze_pretrained=not args.no_freeze,
+                freeze_pretrained=freeze_pretrained,
             ).train()
         )
         print(f"Saved Stage 2 checkpoint: {stage2_ckpt}")

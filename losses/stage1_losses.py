@@ -1,4 +1,4 @@
-"""Losses for Stage 1 compatibility pretraining."""
+"""Losses for Stage 1 binary compatibility pretraining."""
 
 from __future__ import annotations
 
@@ -38,93 +38,94 @@ def boundary_alignment_loss(
     return (1.0 - F.cosine_similarity(feat_a, feat_b, dim=-1)).mean()
 
 
-class Stage1CompatibilityLoss(nn.Module):
-    """
-    Multi-margin triplet loss plus optional boundary and class supervision.
+class InfoNCELoss(nn.Module):
+    """Symmetric InfoNCE over paired fragment embeddings."""
 
-    Distances are ordered as:
-        d(anchor, direct) < d(anchor, semantic) < d(anchor, negative)
-    """
+    def __init__(self, temperature: float = 0.07) -> None:
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+        if z_a.shape[0] < 2:
+            return z_a.sum() * 0.0
+
+        z_a = F.normalize(z_a, dim=-1)
+        z_b = F.normalize(z_b, dim=-1)
+        logits = z_a @ z_b.T / self.temperature
+        labels = torch.arange(z_a.shape[0], device=z_a.device)
+        loss_ab = F.cross_entropy(logits, labels)
+        loss_ba = F.cross_entropy(logits.T, labels)
+        return 0.5 * (loss_ab + loss_ba)
+
+
+class Stage1CompatibilityLoss(nn.Module):
+    """BCE fit supervision plus InfoNCE over positive pairs."""
 
     def __init__(
         self,
-        margin_direct_semantic: float = 0.5,
-        margin_semantic_negative: float = 0.25,
-        lambda_boundary: float = 0.2,
-        lambda_classification: float = 0.5,
+        lambda_contrast: float = 0.5,
+        temperature: float = 0.07,
+        pos_weight: float = 1.0,
+        lambda_boundary: float = 0.0,
     ) -> None:
         super().__init__()
-        self.margin_direct_semantic = margin_direct_semantic
-        self.margin_semantic_negative = margin_semantic_negative
+        self.lambda_contrast = lambda_contrast
         self.lambda_boundary = lambda_boundary
-        self.lambda_classification = lambda_classification
+        self.infonce = InfoNCELoss(temperature=temperature)
+        self.register_buffer("pos_weight", torch.tensor(float(pos_weight)))
 
     def forward(
         self,
         output: Stage1Output,
-        anchor_boundary: torch.Tensor,
-        direct_boundary: torch.Tensor,
+        labels: torch.Tensor,
+        boundary_a: torch.Tensor | None = None,
+        boundary_b: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
-        z_anchor = output.anchor.embedding
-        d_direct = _cosine_distance(z_anchor, output.direct.embedding)
-        d_semantic = _cosine_distance(z_anchor, output.semantic.embedding)
-        d_negative = _cosine_distance(z_anchor, output.negative.embedding)
-
-        loss_direct_semantic = F.relu(
-            d_direct - d_semantic + self.margin_direct_semantic
-        ).mean()
-        loss_semantic_negative = F.relu(
-            d_semantic - d_negative + self.margin_semantic_negative
-        ).mean()
-        loss_triplet = loss_direct_semantic + loss_semantic_negative
-
-        boundary = boundary_alignment_loss(
-            output.anchor,
-            anchor_boundary,
-            output.direct,
-            direct_boundary,
+        labels = labels.to(output.pair.logits.dtype)
+        loss_bce = F.binary_cross_entropy_with_logits(
+            output.pair.logits,
+            labels,
+            pos_weight=self.pos_weight.to(output.pair.logits.device),
         )
 
-        logits = torch.cat(
-            [
-                output.direct_pair.logits,
-                output.semantic_pair.logits,
-                output.negative_pair.logits,
-            ],
-            dim=0,
+        positive = labels > 0.5
+        loss_contrast = self.infonce(
+            output.frag_a.embedding[positive],
+            output.frag_b.embedding[positive],
         )
-        labels = torch.cat(
-            [
-                torch.zeros_like(d_direct, dtype=torch.long),
-                torch.ones_like(d_semantic, dtype=torch.long),
-                torch.full_like(d_negative, 2, dtype=torch.long),
-            ],
-            dim=0,
-        )
-        loss_class = F.cross_entropy(logits, labels)
 
-        total = (
-            loss_triplet
-            + self.lambda_boundary * boundary
-            + self.lambda_classification * loss_class
-        )
+        if self.lambda_boundary > 0 and boundary_a is not None and boundary_b is not None:
+            boundary = boundary_alignment_loss(
+                output.frag_a,
+                boundary_a,
+                output.frag_b,
+                boundary_b,
+            )
+        else:
+            boundary = output.pair.logits.sum() * 0.0
+
+        total = loss_bce + self.lambda_contrast * loss_contrast + self.lambda_boundary * boundary
 
         return {
             "loss": total,
-            "loss_triplet": loss_triplet.detach(),
+            "loss_bce": loss_bce.detach(),
+            "loss_contrast": loss_contrast.detach(),
             "loss_boundary": boundary.detach(),
-            "loss_class": loss_class.detach(),
-            "dist_direct": d_direct.mean().detach(),
-            "dist_semantic": d_semantic.mean().detach(),
-            "dist_negative": d_negative.mean().detach(),
+            "positive_rate": labels.mean().detach(),
+            "score_positive": output.pair.score[positive].mean().detach()
+            if positive.any()
+            else output.pair.score.sum().detach() * 0.0,
+            "score_negative": output.pair.score[~positive].mean().detach()
+            if (~positive).any()
+            else output.pair.score.sum().detach() * 0.0,
         }
 
 
 def build_stage1_loss(cfg: dict) -> Stage1CompatibilityLoss:
     loss_cfg = cfg.get("loss", {}).get("stage1", {})
     return Stage1CompatibilityLoss(
-        margin_direct_semantic=loss_cfg.get("margin_direct_semantic", 0.5),
-        margin_semantic_negative=loss_cfg.get("margin_semantic_negative", 0.25),
-        lambda_boundary=loss_cfg.get("lambda_boundary", 0.2),
-        lambda_classification=loss_cfg.get("lambda_classification", 0.5),
+        lambda_contrast=loss_cfg.get("lambda_contrast", 0.5),
+        temperature=loss_cfg.get("temperature", 0.07),
+        pos_weight=loss_cfg.get("pos_weight", 1.0),
+        lambda_boundary=loss_cfg.get("lambda_boundary", 0.0),
     )

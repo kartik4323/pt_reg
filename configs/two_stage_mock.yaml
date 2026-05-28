@@ -26,17 +26,24 @@ fragment:
   irregular_noise_scale: 0.05
 
 pairs:
-  perturbed_negative_prob: 0.5
+  positive_ratio: 0.5
+  easy_negative_ratio: 0.2
+  hard_negative_ratio: 0.2
+  perturbed_positive_ratio: 0.1
+  perturb_jitter_std: 0.03
+  perturb_anisotropic_scale: 0.12
 
 augmentation:
+  random_fragment_rotation: true
   fragment_pose_translation: 0.6
 
 model:
   encoder:
-    type: "token_pointnet"
+    type: "se3_invariant"
     embedding_dim: 64
     hidden_dim: 96
     num_tokens: 8
+    num_neighbors: 8
     dropout: 0.0
   compatibility:
     hidden_dims: [128, 96]
@@ -53,10 +60,10 @@ model:
 
 loss:
   stage1:
-    margin_direct_semantic: 0.45
-    margin_semantic_negative: 0.20
-    lambda_boundary: 0.2
-    lambda_classification: 0.5
+    lambda_contrast: 0.5
+    temperature: 0.07
+    pos_weight: 1.0
+    lambda_boundary: 0.0
   stage2:
     lambda_boundary: 1.0
     lambda_coverage: 0.5
@@ -64,6 +71,7 @@ loss:
     lambda_consistency: 0.1
     lambda_compat: 0.05
     boundary_weight: 2.0
+    dropout_margin: 0.01
 
 stage1:
   epochs: 3
@@ -71,8 +79,11 @@ stage1:
   batch_size: 8
   num_workers: 0
   learning_rate: 0.0003
+  pretrained_learning_rate: 0.00005
   weight_decay: 0.0001
   gradient_clip: 1.0
+  freeze_pretrained: true
+  unfreeze_pretrained_epoch: 2
 
 stage2:
   epochs: 3

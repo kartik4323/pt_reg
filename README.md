@@ -2,10 +2,18 @@
 
 This repository is now focused on the two-stage pipeline:
 
-1. Stage 1 learns direct, semantic, and negative fragment compatibility.
+1. Stage 1 learns binary fit/non-fit fragment compatibility with BCE + InfoNCE.
 2. Stage 2 reconstructs the full object with a compatibility graph, residual
    GNN, refinement transformer, and cross-attention point decoder.
 3. Stage 3 estimates post-hoc SE(3) fragment poses with ICP.
+
+The default encoder in the provided configs is `se3_invariant`: learned scalar
+fragment embeddings and tokens are invariant to global rotation/translation,
+while centered `token_xyz` vectors are rotation-equivariant. The older raw-XYZ
+PointNet path is still available as `type: "token_pointnet"` for ablations.
+An optional `type: "se3_transformer"` backend is available for experiments with
+`e3nn` and `torch-geometric`; those dependencies are intentionally not required
+for the default lightweight install.
 
 ## Quick Mock Run
 
@@ -160,5 +168,10 @@ environment.
   `data.num_points_per_fragment`.
 - Fragment count is controlled by `fragment.min_fragments` and
   `fragment.max_fragments`; keep `max_fragments < 10`.
+- Stage 1 pair sampling is controlled by `pairs.positive_ratio`,
+  `pairs.easy_negative_ratio`, `pairs.hard_negative_ratio`, and
+  `pairs.perturbed_positive_ratio`.
+- To try the optional graph SE(3) backend, install `e3nn` and
+  `torch-geometric`, then set `model.encoder.type: "se3_transformer"`.
 - If memory is tight, reduce `stage2.batch_size`,
   `model.assembly.output_points`, or `data.num_points_per_fragment`.
