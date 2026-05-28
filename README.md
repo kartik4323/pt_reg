@@ -62,7 +62,7 @@ $env:HF_TOKEN="hf_your_token_here"
 python scripts\get_shapenet_data.py `
   --source huggingface `
   --output-root .\shape_processed `
-  --categories 02691156 03001627 04379243 `
+  --categories     - 02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459 04256520 04379243 `
   --num-points 4096
 ```
 
@@ -82,7 +82,7 @@ python scripts\get_shapenet_data.py `
   --archive-root C:\path\to\ShapeNetArchives `
   --extract-root .\downloads\ShapeNetCore `
   --output-root .\shape_processed `
-  --categories 02691156 03001627 04379243 `
+  --categories 02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459 04256520 04379243 `
   --num-points 4096
 ```
 
@@ -94,7 +94,7 @@ If you already have extracted meshes, you can use the converter directly:
 python scripts\prepare_shapenet_points.py `
   --input-root C:\path\to\ShapeNetCore `
   --output-root .\shape_processed `
-  --categories 02691156 03001627 04379243 `
+  --categories 02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459 04256520 04379243 `
   --num-points 4096
 ```
 

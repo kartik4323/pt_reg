@@ -10,7 +10,14 @@ data:
   shapenet_root: "./shape_processed"
   categories:
     - "02691156"  # airplane
+    - "02828884"  # bench
+    - "02933112"  # cabinet
+    - "02958343"  # car
     - "03001627"  # chair
+    - "03211117"  # display
+    - "03636649"  # lamp
+    - "03691459"  # speaker
+    - "04256520"  # sofa
     - "04379243"  # table
   num_points_per_object: 4096
   num_points_per_fragment: 1024
