@@ -141,6 +141,34 @@ python scripts\run_two_stage_pipeline.py --config configs\two_stage_shapenet.yam
 
 Use `--device cpu` if CUDA is not available.
 
+### 4. Run Inference
+
+After Stage 2 training, reconstruct from a dataset sample:
+
+```powershell
+python scripts\infer_assembly.py `
+  --config configs\two_stage_shapenet.yaml `
+  --checkpoint outputs_two_stage_shapenet\stage2_assembly.pt `
+  --split test `
+  --index 0 `
+  --device cuda `
+  --output-dir outputs\inference
+```
+
+Or reconstruct from explicit fragment `.npy` files:
+
+```powershell
+python scripts\infer_assembly.py `
+  --config configs\two_stage_shapenet.yaml `
+  --checkpoint outputs_two_stage_shapenet\stage2_assembly.pt `
+  --fragments fragment_a.npy fragment_b.npy fragment_c.npy `
+  --device cuda `
+  --output-dir outputs\inference
+```
+
+The script writes `.npy` and `.ply` reconstructions plus compatibility scores
+and metadata.
+
 ## Troubleshooting
 
 If PowerShell prints `No pyvenv.cfg file` before the script starts, your
