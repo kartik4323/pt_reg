@@ -5,7 +5,9 @@ This repository is now focused on the two-stage pipeline:
 1. Stage 1 learns binary fit/non-fit fragment compatibility with BCE + InfoNCE.
 2. Stage 2 reconstructs the full object with a compatibility graph, residual
    GNN, refinement transformer, and cross-attention point decoder.
-3. Stage 3 estimates post-hoc SE(3) fragment poses with ICP.
+3. Stage 3 learns fragment-to-object SE(3) poses with a pose-sensitive branch,
+   cross-attention to the reconstructed object, and optional ICP only as a
+   baseline/refinement.
 
 The default encoder in the provided configs is `se3_invariant`: learned scalar
 fragment embeddings and tokens are invariant to global rotation/translation,
@@ -57,12 +59,12 @@ ShapeNetCore is gated. First request/accept access on the dataset host, then
 use a token from that account. With Hugging Face access approved:
 
 ```powershell
-$env:HF_TOKEN="hf_your_token_here"
+$env:HF_TOKEN="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"
 
 python scripts\get_shapenet_data.py `
   --source huggingface `
   --output-root .\shape_processed `
-  --categories     - 02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459 04256520 04379243 `
+  --categories 02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459 04256520 04379243 `
   --num-points 4096
 ```
 
@@ -128,9 +130,11 @@ python scripts\run_two_stage_pipeline.py `
 
 python scripts\run_two_stage_pipeline.py `
   --config configs\two_stage_shapenet.yaml `
-  --mode stage3 `
+  --mode stage3-train `
   --stage2-checkpoint outputs_two_stage_shapenet\stage2_assembly.pt `
   --device cuda
+
+# Note: `--mode stage3` runs stage 3 evaluation only; use `--mode stage3-train` to train and save the stage 3 model.
 ```
 
 To run everything in sequence:
@@ -140,6 +144,21 @@ python scripts\run_two_stage_pipeline.py --config configs\two_stage_shapenet.yam
 ```
 
 Use `--device cpu` if CUDA is not available.
+
+Before training Stage 3, validate the synthetic pose labels and transform
+convention with the oracle alignment check:
+
+```powershell
+python scripts\oracle_stage3_alignment.py `
+  --config configs\two_stage_shapenet.yaml `
+  --split train `
+  --num-samples 64 `
+  --device cuda
+```
+
+The oracle fragment MSE and pose errors should be near zero, and the oracle
+union Chamfer should be clearly better than random/model output. If not, fix
+the transform labels before training.
 
 ### 4. Run Inference
 
@@ -160,14 +179,48 @@ Or reconstruct from explicit fragment `.npy` files:
 ```powershell
 python scripts\infer_assembly.py `
   --config configs\two_stage_shapenet.yaml `
-  --checkpoint outputs_two_stage_shapenet\stage2_assembly.pt `
+  --stage2-checkpoint outputs_two_stage_shapenet\stage2_assembly.pt `
   --fragments fragment_a.npy fragment_b.npy fragment_c.npy `
   --device cuda `
   --output-dir outputs\inference
 ```
 
+To test the whole pipeline from one complete object point cloud, let the script
+cut the object into fragments, reconstruct it, run Stage 3 assembly, and compare
+against the original object:
+
+```powershell
+python scripts\infer_assembly.py `
+  --config configs\two_stage_shapenet.yaml `
+  --stage1-checkpoint outputs_two_stage_shapenet\stage1_pretrained.pt `
+  --stage2-checkpoint outputs_two_stage_shapenet\stage2_assembly.pt `
+  --stage3-checkpoint outputs_two_stage_shapenet\stage3_pose.pt `
+  --object-point-cloud shape_processed\02691156\<object_id>.npy `
+  --num-fragments 5 `
+  --cut-strategy irregular `
+  --pose-mode auto `
+  --device cuda `
+  --output-dir outputs\inference
+```
+
 The script writes `.npy` and `.ply` reconstructions plus compatibility scores
-and metadata.
+and metadata. In object-point-cloud mode it also writes aligned fragments,
+aligned union point clouds, predicted rotations/translations, the generated
+input fragments, the ground-truth object point cloud, and comparison metrics.
+
+Visualize an inference folder:
+
+```powershell
+python scripts\visualize_inference.py `
+  --dir outputs\inference `
+  --prefix <output_prefix> `
+  --show-target `
+  --show-aligned `
+  --show-fragments
+```
+
+Use `--list` to show available prefixes. The visualizer uses Open3D when
+installed and falls back to matplotlib.
 
 ## Troubleshooting
 

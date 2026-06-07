@@ -1,8 +1,10 @@
-"""Token-preserving point-cloud encoders.
+"""Token-preserving and dense point-feature point-cloud encoders.
 
 The assembly pipeline needs two outputs per fragment: a pooled geometry
-embedding and a set of spatial tokens. The default encoder below is an
-SE(3)-safe scalar encoder:
+embedding and a set of spatial tokens. Stage 3 GPAT-style pose assembly also
+uses the dense `point_features` returned by every encoder, so callers can keep
+one feature vector per input point instead of pooling before matching. The
+default encoder below is an SE(3)-safe scalar encoder:
 
 * learned scalar features are invariant to global translation and rotation;
 * `token_xyz` is centered relative geometry, so it is translation-invariant and
@@ -429,6 +431,7 @@ class SE3TransformerTokenEncoder(nn.Module):
 
 
 def build_token_encoder(cfg: Optional[dict] = None) -> nn.Module:
+    """Build an encoder that returns pooled tokens and dense point features."""
     cfg = cfg or {}
     enc_type = cfg.get("type", "se3_invariant")
     common = {

@@ -14,7 +14,7 @@ import torch
 import yaml
 
 from data.mock_dataset import generate_mock_dataset
-from training.two_stage_trainer import Stage1Trainer, Stage2Trainer, run_pose_stage
+from training.two_stage_trainer import Stage1Trainer, Stage2Trainer, Stage3PoseTrainer, run_pose_stage
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,13 +22,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/two_stage_mock.yaml")
     parser.add_argument(
         "--mode",
-        choices=["mock-data", "stage1", "stage2", "stage3", "all", "smoke"],
+        choices=[
+            "mock-data",
+            "stage1",
+            "stage2",
+            "stage3",
+            "stage3-train",
+            "stage3-train-gt",
+            "stage3-eval",
+            "stage3-gt",
+            "stage3-gt-eval",
+            "all",
+            "smoke",
+        ],
         default="smoke",
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--stage1-checkpoint", default=None)
     parser.add_argument("--stage2-checkpoint", default=None)
+    parser.add_argument("--stage3-checkpoint", default=None)
     parser.add_argument("--no-freeze", action="store_true")
+    parser.add_argument("--fine-tune-reconstruction", action="store_true")
+    parser.add_argument(
+        "--stage3-target-source",
+        choices=["reconstruction", "ground_truth"],
+        default=None,
+        help="Target object fed to learned Stage 3 during evaluation.",
+    )
     parser.add_argument("--make-mock-data", action="store_true")
     return parser.parse_args()
 
@@ -57,7 +77,7 @@ def shrink_for_smoke(cfg: dict) -> dict:
     cfg["stage3"] = dict(cfg.get("stage3", {}))
     cfg["stage1"].update({"epochs": 1, "epoch_size": 12, "batch_size": 3, "num_workers": 0})
     cfg["stage2"].update({"epochs": 1, "epoch_size": 8, "batch_size": 2, "num_workers": 0})
-    cfg["stage3"].update({"epoch_size": 4, "batch_size": 2})
+    cfg["stage3"].update({"epochs": 1, "epoch_size": 4, "batch_size": 2, "num_workers": 0})
     return cfg
 
 
@@ -86,6 +106,7 @@ def main() -> None:
 
     stage1_ckpt = args.stage1_checkpoint
     stage2_ckpt = args.stage2_checkpoint
+    stage3_ckpt = args.stage3_checkpoint
 
     if args.mode in {"stage1", "all", "smoke"}:
         stage1_ckpt = str(Stage1Trainer(cfg, device).train())
@@ -108,7 +129,7 @@ def main() -> None:
         )
         print(f"Saved Stage 2 checkpoint: {stage2_ckpt}")
 
-    if args.mode in {"stage3", "all", "smoke"}:
+    if args.mode in {"stage3-train", "stage3-train-gt", "all", "smoke"}:
         if stage2_ckpt is None:
             default_stage2 = Path(cfg["output"]["dir"]) / "stage2_assembly.pt"
             if not default_stage2.exists():
@@ -116,12 +137,49 @@ def main() -> None:
                     "Stage 2 checkpoint not provided and outputs/stage2_assembly.pt was not found."
                 )
             stage2_ckpt = str(default_stage2)
+        target_source = "ground_truth" if args.mode == "stage3-train-gt" else "reconstruction"
+        stage3_ckpt = str(
+            Stage3PoseTrainer(
+                cfg,
+                device,
+                stage2_checkpoint=stage2_ckpt,
+                freeze_reconstruction=not args.fine_tune_reconstruction,
+                target_source=target_source,
+            ).train()
+        )
+        print(f"Saved Stage 3 checkpoint: {stage3_ckpt}")
+
+    if args.mode in {"stage3", "stage3-eval", "stage3-gt", "stage3-gt-eval", "all", "smoke"}:
+        if stage2_ckpt is None:
+            default_stage2 = Path(cfg["output"]["dir"]) / "stage2_assembly.pt"
+            if not default_stage2.exists():
+                raise FileNotFoundError(
+                    "Stage 2 checkpoint not provided and outputs/stage2_assembly.pt was not found."
+                )
+            stage2_ckpt = str(default_stage2)
+        eval_target_source = args.stage3_target_source
+        if eval_target_source is None:
+            eval_target_source = (
+                "ground_truth"
+                if args.mode in {"stage3-gt", "stage3-gt-eval"}
+                else "reconstruction"
+            )
+        if stage3_ckpt is None:
+            default_name = (
+                "stage3_pose_gt_target.pt"
+                if eval_target_source == "ground_truth"
+                else "stage3_pose.pt"
+            )
+            default_stage3 = Path(cfg["output"]["dir"]) / default_name
+            stage3_ckpt = str(default_stage3) if default_stage3.exists() else None
         metrics = run_pose_stage(
             cfg,
             device,
             stage2_checkpoint=stage2_ckpt,
+            stage3_checkpoint=stage3_ckpt,
             split="test",
             icp_iterations=cfg.get("stage3", {}).get("icp_iterations", 5),
+            target_source=eval_target_source,
         )
         print(
             "Stage 3 pose metrics: "

@@ -57,6 +57,14 @@ model:
     decoder_layers: 1
     output_points: 256
     dropout: 0.0
+  pose:
+    architecture: "target_segmentation"
+    hidden_dim: 128
+    num_heads: 4
+    cross_attention_layers: 1
+    transformer_layers: 1
+    dropout: 0.0
+    freeze_encoders: true
 
 loss:
   stage1:
@@ -72,6 +80,19 @@ loss:
     lambda_compat: 0.05
     boundary_weight: 2.0
     dropout_margin: 0.01
+  stage3:
+    lambda_segmentation: 2.0
+    lambda_matching: 2.0
+    lambda_matching_early: 4.0
+    lambda_matching_mid: 2.0
+    lambda_matching_late: 1.0
+    lambda_recon: 1.0
+    lambda_coverage: 1.0
+    lambda_gt: 0.5
+    lambda_overlap: 0.05
+    lambda_pose: 1.0
+    overlap_threshold: 0.03
+    segmentation_outlier_threshold: 0.08
 
 stage1:
   epochs: 3
@@ -95,9 +116,17 @@ stage2:
   gradient_clip: 1.0
 
 stage3:
+  epochs: 2
   epoch_size: 8
   batch_size: 2
-  icp_iterations: 3
+  num_workers: 0
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  pose_only_epochs: 1
+  geometry_epochs: 1
+  initialization_icp_iterations: 0
+  icp_iterations: 0
 
 output:
   dir: "./outputs_two_stage_mock"
