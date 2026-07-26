@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import math
+import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch.optim import AdamW
@@ -22,7 +24,19 @@ from models.pose import (
     build_pose_loss,
     differentiable_icp_initialization,
     pose_supervised_loss,
+    rotation_geodesic_error,
 )
+from utils.run_artifacts import (
+    HistoryWriter,
+    RunLogger,
+    build_results_markdown,
+    summarize_distribution,
+    write_manifest,
+)
+
+
+def _current_lrs(optimizer) -> List[float]:
+    return [float(group["lr"]) for group in optimizer.param_groups]
 
 
 def _move_to_device(batch: dict, device: torch.device) -> dict:
@@ -73,10 +87,24 @@ class Stage1Trainer:
         self.grad_clip = stage_cfg.get("gradient_clip", 1.0)
 
     def train(self) -> Path:
+        logger = RunLogger(self.out_dir, "stage1")
+        history = HistoryWriter(self.out_dir, "stage1")
+        write_manifest(
+            self.out_dir,
+            "stage1",
+            self.cfg,
+            self.device,
+            extra={"epochs": self.epochs, "num_batches_per_epoch": len(self.loader)},
+        )
         metrics: Dict[str, float] = {}
         for epoch in range(self.epochs):
+            start = time.perf_counter()
             metrics = self._train_epoch(epoch)
-            print(
+            elapsed = time.perf_counter() - start
+            history.append(
+                {"epoch": epoch + 1, "seconds": elapsed, "lr": _current_lrs(self.optimizer), **metrics}
+            )
+            logger.log(
                 "Stage 1 "
                 f"epoch={epoch + 1}/{self.epochs} "
                 f"loss={metrics['loss']:.4f} "
@@ -95,6 +123,7 @@ class Stage1Trainer:
             ckpt_path,
         )
         _save_json(self.out_dir / "stage1_metrics.json", metrics)
+        build_results_markdown(self.out_dir)
         return ckpt_path
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -153,6 +182,14 @@ class Stage2Trainer:
                 )
                 self.reference_model.eval()
                 self.reference_model.freeze_pretrained()
+        if freeze_pretrained and stage1_checkpoint is None:
+            print(
+                "WARNING [Stage 2]: freeze_pretrained requested but no Stage 1 "
+                "checkpoint was loaded. Freezing a randomly-initialized encoder "
+                "would leave it untrained forever; training the encoder from "
+                "scratch instead. Provide --stage1-checkpoint to freeze."
+            )
+            freeze_pretrained = False
         if freeze_pretrained:
             self.model.freeze_pretrained()
 
@@ -186,6 +223,20 @@ class Stage2Trainer:
         self.model.compatibility.load_state_dict(checkpoint["compatibility"], strict=True)
 
     def train(self) -> Path:
+        logger = RunLogger(self.out_dir, "stage2")
+        history = HistoryWriter(self.out_dir, "stage2")
+        write_manifest(
+            self.out_dir,
+            "stage2",
+            self.cfg,
+            self.device,
+            extra={
+                "epochs": self.epochs,
+                "num_batches_per_epoch": len(self.loader),
+                "freeze_pretrained": self.freeze_pretrained,
+                "unfreeze_pretrained_epoch": self.unfreeze_epoch,
+            },
+        )
         metrics: Dict[str, float] = {}
         for epoch in range(self.epochs):
             if (
@@ -196,8 +247,14 @@ class Stage2Trainer:
                 self.model.unfreeze_pretrained()
                 self.freeze_pretrained = False
                 self.optimizer = self._build_optimizer()
+                logger.log(f"Stage 2 unfroze pretrained modules at epoch {epoch + 1}")
+            start = time.perf_counter()
             metrics = self._train_epoch(epoch)
-            print(
+            elapsed = time.perf_counter() - start
+            history.append(
+                {"epoch": epoch + 1, "seconds": elapsed, "lr": _current_lrs(self.optimizer), **metrics}
+            )
+            logger.log(
                 "Stage 2 "
                 f"epoch={epoch + 1}/{self.epochs} "
                 f"loss={metrics['loss']:.4f} "
@@ -215,6 +272,7 @@ class Stage2Trainer:
             ckpt_path,
         )
         _save_json(self.out_dir / "stage2_metrics.json", metrics)
+        build_results_markdown(self.out_dir)
         return ckpt_path
 
     def _build_optimizer(self) -> AdamW:
@@ -338,8 +396,8 @@ class Stage3PoseTrainer:
             raise ValueError("target_source must be 'reconstruction' or 'ground_truth'")
         self.target_source = target_source
 
-        self.reconstruction_model = build_assembly_model(cfg).to(device)
-        # Load stage-2 checkpoint on CPU first to reduce peak GPU memory usage
+        # Build and load the stage-2 checkpoint on CPU first to reduce peak GPU
+        # memory usage, then move the model to the target device once.
         self.reconstruction_model = build_assembly_model(cfg)
         checkpoint = torch.load(stage2_checkpoint, map_location="cpu")
         self.reconstruction_model.load_state_dict(checkpoint["model"], strict=True)
@@ -399,10 +457,37 @@ class Stage3PoseTrainer:
             self.pose_model.freeze_pretrained()
 
     def train(self) -> Path:
+        stage_tag = "stage3_gt_target" if self.target_source == "ground_truth" else "stage3"
+        logger = RunLogger(self.out_dir, stage_tag)
+        history = HistoryWriter(self.out_dir, stage_tag)
+        write_manifest(
+            self.out_dir,
+            stage_tag,
+            self.cfg,
+            self.device,
+            extra={
+                "epochs": self.epochs,
+                "num_batches_per_epoch": len(self.loader),
+                "target_source": self.target_source,
+                "freeze_reconstruction": self.freeze_reconstruction,
+                "pose_architecture": self.cfg.get("model", {}).get("pose", {}).get("architecture"),
+            },
+        )
         metrics: Dict[str, float] = {}
         for epoch in range(self.epochs):
+            start = time.perf_counter()
             metrics = self._train_epoch(epoch)
-            print(
+            elapsed = time.perf_counter() - start
+            history.append(
+                {
+                    "epoch": epoch + 1,
+                    "seconds": elapsed,
+                    "lr": _current_lrs(self.optimizer),
+                    "weights": self._loss_weights_for_epoch(epoch),
+                    **metrics,
+                }
+            )
+            logger.log(
                 "Stage 3 "
                 f"epoch={epoch + 1}/{self.epochs} "
                 f"loss={metrics['loss']:.4f} "
@@ -432,6 +517,7 @@ class Stage3PoseTrainer:
             else "stage3_pose_metrics.json"
         )
         _save_json(self.out_dir / metrics_name, metrics)
+        build_results_markdown(self.out_dir)
         return ckpt_path
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -626,6 +712,8 @@ def run_pose_stage(
 
     totals: Dict[str, float] = {}
     steps = 0
+    rot_deg_all: List[float] = []
+    trans_all: List[float] = []
     for batch in tqdm(loader, desc="Stage3 pose", leave=False):
         batch = _move_to_device(batch, device)
         output = model(batch["fragments"], batch["fragment_mask"])
@@ -668,7 +756,35 @@ def run_pose_stage(
             totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
         steps += 1
 
+        # Per-fragment errors over the valid fragments, for distribution stats.
+        mask = batch["fragment_mask"].reshape(-1).bool()
+        rot_deg = (
+            rotation_geodesic_error(rotations, batch["align_rotations"]).reshape(-1)
+            * 180.0
+            / math.pi
+        )
+        trans = torch.linalg.vector_norm(
+            translations - batch["align_translations"], dim=-1
+        ).reshape(-1)
+        rot_deg_all.extend(rot_deg[mask].detach().cpu().tolist())
+        trans_all.extend(trans[mask].detach().cpu().tolist())
+
     metrics = {key: value / max(steps, 1) for key, value in totals.items()}
     out_dir = Path(cfg["output"]["dir"])
-    _save_json(out_dir / "stage3_pose_metrics.json", metrics)
+
+    # Rich, target-source-specific eval report (fixes the old unconditional
+    # stage3_pose_metrics.json overwrite). Means hide the tail, so also report
+    # the full error distribution.
+    report = {
+        "target_source": target_source,
+        "split": split,
+        "num_samples": len(dataset),
+        "num_fragments_evaluated": len(rot_deg_all),
+        "has_pose_checkpoint": pose_model is not None,
+        "means": metrics,
+        "rotation_error_deg": summarize_distribution(rot_deg_all),
+        "translation_error": summarize_distribution(trans_all),
+    }
+    _save_json(out_dir / f"stage3_eval_{target_source}.json", report)
+    build_results_markdown(out_dir)
     return metrics

@@ -100,11 +100,8 @@ stage1:
   batch_size: 8
   num_workers: 0
   learning_rate: 0.0003
-  pretrained_learning_rate: 0.00005
   weight_decay: 0.0001
   gradient_clip: 1.0
-  freeze_pretrained: true
-  unfreeze_pretrained_epoch: 2
 
 stage2:
   epochs: 3
@@ -112,8 +109,11 @@ stage2:
   batch_size: 4
   num_workers: 0
   learning_rate: 0.0003
+  pretrained_learning_rate: 0.00005
   weight_decay: 0.0001
   gradient_clip: 1.0
+  freeze_pretrained: true
+  unfreeze_pretrained_epoch: 2
 
 stage3:
   epochs: 2

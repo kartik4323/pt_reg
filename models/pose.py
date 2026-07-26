@@ -137,10 +137,28 @@ def differentiable_icp_initialization(
 
 
 def rotation_geodesic_error(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Geodesic angle (radians) between rotations. For *reporting* only.
+
+    ``acos`` has an unbounded derivative near ``|cos| -> 1`` (i.e. exactly as the
+    prediction converges to the target), so this must not be used as a training
+    objective. Use :func:`rotation_chordal_error` for gradients.
+    """
     rot_delta = pred.transpose(-1, -2) @ target
     trace = rot_delta.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
     cos_theta = ((trace - 1.0) / 2.0).clamp(-1.0 + 1.0e-6, 1.0 - 1.0e-6)
     return torch.acos(cos_theta)
+
+
+def rotation_chordal_error(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Squared chordal (Frobenius) distance ``||R_pred - R_gt||_F^2``.
+
+    Smooth everywhere with a gradient that *vanishes* at convergence, so it is
+    safe to backprop through the differentiable Kabsch/SVD. Related to the
+    geodesic angle by ``||R_pred - R_gt||_F^2 = 4 (1 - cos theta)``, so it is on
+    a comparable scale to the (radian) geodesic term it replaces. Returns a
+    per-rotation tensor with the trailing (3, 3) dims reduced.
+    """
+    return ((pred - target) ** 2).sum(dim=(-2, -1))
 
 
 def _knn_indices(points: torch.Tensor, k: int) -> torch.Tensor:
@@ -1432,17 +1450,30 @@ def pose_supervised_loss(
     gt_translations: torch.Tensor,
     fragment_mask: torch.Tensor,
 ) -> dict:
-    """Detached evaluation helper; not used as a Stage 3 training objective."""
-    rot_error = rotation_geodesic_error(pred_rotations, gt_rotations)
+    """Active Stage 3 pose objective (weighted by ``loss.stage3.lambda_pose``).
+
+    Backprop uses the smooth chordal rotation term plus a translation L2; the
+    geodesic angle is computed detached purely for the human-readable
+    ``rotation_error_deg`` metric.
+    """
+    mask = fragment_mask.to(pred_rotations.dtype)
+    denom = mask.sum().clamp(min=1.0)
+
+    # --- differentiable training terms ---
+    chordal = rotation_chordal_error(pred_rotations, gt_rotations)
     trans_error = torch.linalg.vector_norm(pred_translations - gt_translations, dim=-1)
-    mask = fragment_mask.to(rot_error.dtype)
-    loss_rot = (rot_error * mask).sum() / mask.sum().clamp(min=1.0)
-    loss_trans = (trans_error * mask).sum() / mask.sum().clamp(min=1.0)
+    loss_rot = (chordal * mask).sum() / denom
+    loss_trans = (trans_error * mask).sum() / denom
+
+    # --- detached reporting term (interpretable degrees) ---
+    geodesic_rad = rotation_geodesic_error(pred_rotations.detach(), gt_rotations)
+    rotation_error_deg = (geodesic_rad * mask).sum() / denom * 180.0 / torch.pi
+
     return {
         "loss": loss_rot + loss_trans,
         "loss_rotation": loss_rot.detach(),
         "loss_translation": loss_trans.detach(),
-        "rotation_error_deg": (loss_rot.detach() * 180.0 / torch.pi),
+        "rotation_error_deg": rotation_error_deg.detach(),
         "translation_error": loss_trans.detach(),
     }
 

@@ -31,6 +31,26 @@ python scripts\run_two_stage_pipeline.py --config configs\two_stage_mock.yaml --
 
 Outputs are written to the directory configured by `output.dir`.
 
+### Generated run artifacts
+
+Every training/eval run writes self-describing files into `output.dir` so a run
+can be diagnosed after the fact (useful when training on a remote GPU box and
+copying the directory back):
+
+- `run_manifest_{stage}.json` — resolved config + environment (torch/CUDA/device,
+  host, timestamp) that produced the run.
+- `{stage}_history.jsonl` — one JSON line per epoch: all loss/metric values, the
+  learning rate(s), per-epoch wall-time (and, for Stage 3, the loss weights).
+- `{stage}_train.log` — plaintext mirror of the per-epoch console summary lines.
+- `stage3_eval_{reconstruction,ground_truth}.json` — pose-error **distributions**
+  (mean / p50 / p90 / p95 / max), not just means. Named by target source so a
+  ground-truth eval no longer clobbers the reconstruction eval.
+- `oracle_alignment_report.json` — output of the pre-flight label check (below).
+- `RESULTS.md` — human-readable roll-up of whatever artifacts are present.
+
+Copy the whole `output.dir` back for analysis; `RESULTS.md` + the `*_history.jsonl`
+files are the fastest way to see what happened.
+
 ## Use The Original ShapeNet Dataset
 
 The training code expects point clouds in this layout:
@@ -59,7 +79,7 @@ ShapeNetCore is gated. First request/accept access on the dataset host, then
 use a token from that account. With Hugging Face access approved:
 
 ```powershell
-$env:HF_TOKEN="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"
+$env:HF_TOKEN="hf_your_token_here"   # do NOT commit a real token
 
 python scripts\get_shapenet_data.py `
   --source huggingface `
@@ -102,7 +122,10 @@ python scripts\prepare_shapenet_points.py `
 
 ### 2. Edit The YAML
 
-Use `configs/two_stage_shapenet.yaml` and change:
+Use `configs/two_stage_shapenet.yaml`. As shipped it trains on 10 categories
+(`02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459
+04256520 04379243`). Edit the `data` block to point at your data and, if you
+want a smaller/different set, trim the `categories` list — e.g.:
 
 ```yaml
 data:
@@ -221,6 +244,12 @@ python scripts\visualize_inference.py `
 
 Use `--list` to show available prefixes. The visualizer uses Open3D when
 installed and falls back to matplotlib.
+
+The default (multi-view) mode needs `<prefix>_target.npy`,
+`<prefix>_reconstruction.npy`, and `<prefix>_aligned_union.npy` to all exist,
+so run inference with `--save-inputs` and a Stage 3 pose (object-point-cloud
+mode does both automatically). For a plain dataset reconstruction without those
+files, pass `--legacy-scene` instead.
 
 ## Troubleshooting
 
