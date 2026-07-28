@@ -95,6 +95,32 @@ If the repository layout or access flow downloads more than you want, add
 `--hf-all-files` to mirror the full repository. Without it, the script tries to
 download category-matching files only.
 
+#### Low-disk machines: `--per-category`
+
+By default the script extracts **all** category archives before converting any
+of them, so it needs every category's extracted meshes on disk at once (far more
+than the downloaded zips). On a space-constrained box this fails with
+`No space left on device` partway through. Add `--per-category` to stream one
+synset at a time — extract → convert to `.npy` → delete that synset's extracted
+meshes before the next — which caps peak disk at roughly a single category. Add
+`--delete-archives` to also delete each source archive once its category is
+converted. The mode rebuilds a correct cumulative `metadata.json` at the end and
+is resumable: synsets already present in `--output-root` are skipped.
+
+If you already downloaded the zips (they live under `--download-root`, default
+`./downloads/shapenet_hf`), add `--skip-download` so it reuses them:
+
+```powershell
+python scripts\get_shapenet_data.py `
+  --source huggingface `
+  --skip-download `
+  --per-category `
+  --delete-archives `
+  --output-root .\shape_processed `
+  --categories 02691156 02828884 02933112 02958343 03001627 03211117 03636649 03691459 04256520 04379243 `
+  --num-points 4096
+```
+
 If you already have ShapeNet zip/tar files, skip Hugging Face and prepare from
 local archives:
 
