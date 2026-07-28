@@ -1,7 +1,13 @@
-# Real ShapeNet point-cloud config.
+# Stage-3 DIAGNOSTIC config.
 #
-# First create the dataset with scripts/prepare_shapenet_points.py, then point
-# data.shapenet_root at that output directory.
+# Purpose: cheaply test the new direct-correspondence loss on real ShapeNet
+# BEFORE committing to the full Stage-2 capacity-bump retrain. It keeps the
+# ORIGINAL capacity (encoder.num_tokens=16, assembly.decoder_layers=2) so the
+# existing stage1_pretrained.pt / stage2_assembly.pt still load, and writes to a
+# separate output dir so it never clobbers the real run.
+#
+# Use only for `--mode stage3-train-gt` / `stage3-gt` with
+# --stage2-checkpoint outputs_two_stage_shapenet/stage2_assembly.pt
 
 mock_data:
   enabled: false
@@ -50,7 +56,7 @@ model:
     type: "se3_invariant"
     embedding_dim: 128
     hidden_dim: 192
-    num_tokens: 32
+    num_tokens: 16       # ORIGINAL — matches existing checkpoints
     num_neighbors: 16
     dropout: 0.05
   compatibility:
@@ -62,7 +68,7 @@ model:
     gnn_layers: 3
     transformer_layers: 2
     transformer_heads: 4
-    decoder_layers: 4
+    decoder_layers: 2    # ORIGINAL — must match existing stage2_assembly.pt
     output_points: 4096
     dropout: 0.05
   pose:
@@ -79,8 +85,6 @@ loss:
     lambda_contrast: 0.5
     temperature: 0.07
     pos_weight: 1.0
-    # Boundary masks are available, but no true pointwise boundary
-    # correspondences are known. Keep this off by default.
     lambda_boundary: 0.0
   stage2:
     lambda_boundary: 2.0
@@ -96,8 +100,7 @@ loss:
     lambda_matching_early: 4.0
     lambda_matching_mid: 2.0
     lambda_matching_late: 1.0
-    # Direct supervision of the point-correspondence Kabsch consumes. Without
-    # this the assignment is only trained indirectly and rotation stays ~random.
+    # The fix under test: direct correspondence supervision.
     lambda_correspondence: 3.0
     lambda_correspondence_early: 4.0
     lambda_recon: 1.0
@@ -141,7 +144,6 @@ stage3:
   geometry_epochs: 10
   initialization_icp_iterations: 0
   icp_iterations: 0
-  lambda_pose: 1.0
 
 output:
-  dir: "./outputs_two_stage_shapenet"
+  dir: "./outputs_stage3_diag"

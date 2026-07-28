@@ -1322,6 +1322,7 @@ class TargetSegmentationPoseLoss(nn.Module):
         lambda_gt: float = 0.0,
         lambda_overlap: float = 0.1,
         lambda_pose: float = 0.0,
+        lambda_correspondence: float = 0.0,
         overlap_threshold: float = 0.03,
         segmentation_outlier_threshold: Optional[float] = None,
     ) -> None:
@@ -1332,6 +1333,7 @@ class TargetSegmentationPoseLoss(nn.Module):
         self.lambda_gt = lambda_gt
         self.lambda_overlap = lambda_overlap
         self.lambda_pose = lambda_pose
+        self.lambda_correspondence = lambda_correspondence
         self.overlap_threshold = overlap_threshold
         self.segmentation_outlier_threshold = segmentation_outlier_threshold
 
@@ -1397,6 +1399,15 @@ class TargetSegmentationPoseLoss(nn.Module):
                 "loss_translation": zero.detach(),
             }
 
+        correspondence_loss, correspondence_accuracy = dense_correspondence_loss(
+            output.assignment_matrix,
+            fragments,
+            reconstructed_object,
+            fragment_mask,
+            gt_rotations,
+            gt_translations,
+        )
+
         loss_weights = {
             "lambda_segmentation": self.lambda_segmentation,
             "lambda_matching": self.lambda_segmentation,
@@ -1405,6 +1416,7 @@ class TargetSegmentationPoseLoss(nn.Module):
             "lambda_gt": self.lambda_gt,
             "lambda_overlap": self.lambda_overlap,
             "lambda_pose": self.lambda_pose,
+            "lambda_correspondence": self.lambda_correspondence,
         }
         if weights is not None:
             loss_weights.update(weights)
@@ -1418,6 +1430,7 @@ class TargetSegmentationPoseLoss(nn.Module):
             + loss_weights["lambda_gt"] * loss_gt
             + loss_weights["lambda_overlap"] * overlap
             + loss_weights["lambda_pose"] * pose_loss["loss"]
+            + loss_weights["lambda_correspondence"] * correspondence_loss
         )
         diagnostics = PoseAssemblyLoss._pose_diagnostics(
             output,
@@ -1437,10 +1450,60 @@ class TargetSegmentationPoseLoss(nn.Module):
             "loss_gt_cd": loss_gt.detach(),
             "loss_overlap": overlap.detach(),
             "loss_pose": pose_loss["loss"].detach(),
+            "loss_correspondence": correspondence_loss.detach(),
+            "correspondence_accuracy": correspondence_accuracy,
             "loss_rotation": pose_loss["loss_rotation"],
             "loss_translation": pose_loss["loss_translation"],
             **diagnostics,
         }
+
+
+def dense_correspondence_loss(
+    assignment: torch.Tensor,
+    fragments: torch.Tensor,
+    target_object: torch.Tensor,
+    fragment_mask: torch.Tensor,
+    gt_rotations: torch.Tensor,
+    gt_translations: torch.Tensor,
+    eps: float = 1.0e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Direct supervision for the soft point-correspondence Kabsch consumes.
+
+    The ground-truth correspondence of a fragment point is the target-object point
+    nearest to that fragment point once it is placed by the GT pose. We push the
+    assignment (already a softmax over the M target points) toward that index with
+    a masked NLL. This is what makes the correspondence sharp enough for Kabsch to
+    recover *rotation*; without it the matching is only trained indirectly and
+    rotation collapses to ~random.
+
+    ``assignment`` has shape (B, F, N, M) of probabilities. Returns (nll_loss,
+    accuracy) where accuracy is the fraction of valid fragment points whose argmax
+    assignment hits the GT-nearest target point.
+    """
+    if assignment is None or gt_rotations is None or gt_translations is None:
+        zero = fragments.sum() * 0.0
+        return zero, zero.detach()
+
+    batch_size, max_fragments, points_per_fragment, num_target = assignment.shape
+    placed = apply_fragment_transforms(fragments, gt_rotations, gt_translations)
+    flat_placed = placed.reshape(batch_size * max_fragments, points_per_fragment, 3)
+    expanded_target = target_object[:, None].expand(
+        batch_size, max_fragments, target_object.shape[1], 3
+    ).reshape(batch_size * max_fragments, target_object.shape[1], 3)
+    with torch.no_grad():
+        labels = torch.cdist(flat_placed, expanded_target, p=2).argmin(dim=-1)
+    labels = labels.reshape(batch_size, max_fragments, points_per_fragment)
+
+    log_prob = assignment.clamp(min=eps).log()
+    nll = -log_prob.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # (B, F, N)
+    mask = fragment_mask[:, :, None].expand_as(nll).to(nll.dtype)
+    denom = mask.sum().clamp(min=1.0)
+    loss = (nll * mask).sum() / denom
+
+    with torch.no_grad():
+        correct = (assignment.argmax(dim=-1) == labels).to(nll.dtype)
+        accuracy = (correct * mask).sum() / denom
+    return loss, accuracy.detach()
 
 
 def pose_supervised_loss(
@@ -1535,6 +1598,7 @@ def build_pose_loss(cfg: dict) -> nn.Module:
             lambda_gt=loss_cfg.get("lambda_gt", 0.0),
             lambda_overlap=loss_cfg.get("lambda_overlap", 0.1),
             lambda_pose=loss_cfg.get("lambda_pose", 0.0),
+            lambda_correspondence=loss_cfg.get("lambda_correspondence", 0.0),
             overlap_threshold=loss_cfg.get("overlap_threshold", 0.03),
             segmentation_outlier_threshold=loss_cfg.get("segmentation_outlier_threshold"),
         )
