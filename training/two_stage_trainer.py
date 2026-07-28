@@ -435,6 +435,10 @@ class Stage3PoseTrainer:
         )
         self.epochs = self.stage_cfg.get("epochs", 10)
         self.grad_clip = self.stage_cfg.get("gradient_clip", 1.0)
+        # Effective batch = batch_size * grad_accum_steps. Lets a 24 GB card keep
+        # batch_size=1 (memory-bound by the dense object attention) while still
+        # taking optimizer steps over several fragments' worth of gradient.
+        self.grad_accum_steps = max(1, int(self.stage_cfg.get("grad_accum_steps", 1)))
         self.initialization_icp_iterations = self.stage_cfg.get(
             "initialization_icp_iterations",
             min(3, self.stage_cfg.get("icp_iterations", 3)),
@@ -528,9 +532,15 @@ class Stage3PoseTrainer:
         totals: Dict[str, float] = {}
         steps = 0
 
-        for batch in tqdm(self.loader, desc=f"Stage3 epoch {epoch + 1}", leave=False):
+        accum = self.grad_accum_steps
+        num_batches = len(self.loader)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in enumerate(
+            tqdm(self.loader, desc=f"Stage3 epoch {epoch + 1}", leave=False)
+        ):
             batch = _move_to_device(batch, self.device)
-            self.optimizer.zero_grad(set_to_none=True)
+            is_step_boundary = ((batch_idx + 1) % accum == 0) or (batch_idx + 1 == num_batches)
 
             # Use AMP context for forward and loss computation to reduce memory
             autocast_ctx = (
@@ -584,21 +594,27 @@ class Stage3PoseTrainer:
                     weights=self._loss_weights_for_epoch(epoch),
                 )
 
-            loss = losses["loss"]
+            # Scale the loss so accumulated gradients average over the micro-batches.
+            loss = losses["loss"] / accum
             if self.use_amp:
                 self.scaler.scale(loss).backward()
-                if self.grad_clip > 0:
-                    # unscale before clipping
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.pose_model.parameters(), self.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                if is_step_boundary:
+                    if self.grad_clip > 0:
+                        # unscale before clipping
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.pose_model.parameters(), self.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
             else:
                 loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.pose_model.parameters(), self.grad_clip)
-                self.optimizer.step()
+                if is_step_boundary:
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.pose_model.parameters(), self.grad_clip)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
 
+            # Report the unscaled per-batch losses (not the /accum training loss).
             for key, value in losses.items():
                 totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
             steps += 1

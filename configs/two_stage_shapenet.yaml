@@ -131,8 +131,14 @@ stage2:
 
 stage3:
   epochs: 30
-  epoch_size: 2048
-  batch_size: 4
+  epoch_size: 1024
+  # batch_size MUST stay 1 on a 24 GB card: the Stage-3 dense attention /
+  # assignment over the 4096-point object is ~16 GB at batch 1 and scales
+  # linearly, so batch 4 tried to allocate 64 GiB and OOM'd. For a less noisy
+  # effective batch, use gradient accumulation rather than raising this.
+  batch_size: 1
+  # Effective batch = batch_size * grad_accum_steps = 4, at batch-1 memory.
+  grad_accum_steps: 4
   num_workers: 4
   learning_rate: 0.0001
   weight_decay: 0.0001
@@ -141,7 +147,6 @@ stage3:
   geometry_epochs: 10
   initialization_icp_iterations: 0
   icp_iterations: 0
-  lambda_pose: 1.0
 
 output:
   dir: "./outputs_two_stage_shapenet"

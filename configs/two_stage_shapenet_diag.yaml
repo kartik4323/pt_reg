@@ -134,8 +134,9 @@ stage2:
 
 stage3:
   epochs: 30
-  epoch_size: 2048
-  batch_size: 4
+  epoch_size: 1024
+  batch_size: 1        # 24 GB card: batch>1 OOMs (see main config note)
+  grad_accum_steps: 4  # effective batch 4 at batch-1 memory
   num_workers: 4
   learning_rate: 0.0001
   weight_decay: 0.0001
