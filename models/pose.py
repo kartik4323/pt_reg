@@ -161,6 +161,23 @@ def rotation_chordal_error(pred: torch.Tensor, target: torch.Tensor) -> torch.Te
     return ((pred - target) ** 2).sum(dim=(-2, -1))
 
 
+def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    """Zhou et al. (2019) 6D continuity representation -> SO(3) via Gram-Schmidt.
+
+    ``d6``: (..., 6). Returns (..., 3, 3) rotation matrices (orthonormal rows,
+    det = +1). Continuous and differentiable, unlike quaternion/Euler
+    parametrizations (which have double-cover / gimbal discontinuities that are
+    poor regression targets). The output is always a proper rotation, so no
+    reflection failure mode and no renormalization step is needed.
+    """
+    a1 = d6[..., 0:3]
+    a2 = d6[..., 3:6]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = F.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-2)
+
+
 def _knn_indices(points: torch.Tensor, k: int) -> torch.Tensor:
     """Return k nearest-neighbor indices per point, excluding self when possible."""
     num_points = points.shape[1]
@@ -172,11 +189,17 @@ def _knn_indices(points: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _gather_neighbors(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    # Gather k neighbors per point without materializing the (B, N, N, dim)
+    # intermediate that a broadcast-expand + gather would create. On a 4096-point
+    # object with dim=256 that intermediate (and its backward grad) is ~17 GB at
+    # batch 1; the flat index_select below produces the (B, N, k, dim) result
+    # directly (~tens of MB).
     batch_size, num_points, dim = values.shape
     k = indices.shape[-1]
-    expanded = values[:, None].expand(batch_size, num_points, num_points, dim)
-    gather_index = indices.unsqueeze(-1).expand(batch_size, num_points, k, dim)
-    return expanded.gather(dim=2, index=gather_index)
+    offset = (torch.arange(batch_size, device=values.device) * num_points).view(batch_size, 1, 1)
+    flat_index = (indices + offset).reshape(-1)
+    gathered = values.reshape(batch_size * num_points, dim)[flat_index]
+    return gathered.reshape(batch_size, num_points, k, dim)
 
 
 class PoseSensitivePointEncoder(nn.Module):
@@ -1283,6 +1306,176 @@ class TargetSegmentationPoseEstimator(nn.Module):
         return self.object_encoder(target_object)
 
 
+class DirectRegressionPoseEstimator(nn.Module):
+    """Regress each fragment's SE(3) pose directly, bypassing correspondence + Kabsch.
+
+    Shares the front-end of ``TargetSegmentationPoseEstimator`` (frozen SE(3)-invariant
+    encoders + pose-sensitive encoders + fusion + GPAT cross-attention). Instead of a
+    per-point assignment, it pools each fragment's cross-attended features into a single
+    descriptor and an MLP head emits a 6D-continuity rotation and a placed-centroid. This
+    needs only a global orientation/position signal (far better conditioned than
+    point-identity on feature-poor fracture surfaces) and removes the differentiable-SVD.
+    """
+
+    def __init__(
+        self,
+        fragment_encoder: nn.Module,
+        object_encoder: nn.Module,
+        embedding_dim: int = 128,
+        hidden_dim: int = 256,
+        num_heads: int = 4,
+        cross_attention_layers: int = 2,
+        transformer_layers: int = 2,
+        dropout: float = 0.0,
+        freeze_encoders: bool = True,
+        num_neighbors: int = 16,
+        head_hidden_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.fragment_encoder = fragment_encoder
+        self.object_encoder = object_encoder
+        self.embedding_dim = embedding_dim
+        self.freeze_encoders = freeze_encoders
+
+        # --- front-end shared with TargetSegmentationPoseEstimator ---
+        self.fragment_pose_encoder = PoseSensitivePointEncoder(
+            embedding_dim=embedding_dim, hidden_dim=hidden_dim,
+            num_neighbors=num_neighbors, dropout=dropout,
+        )
+        self.object_pose_encoder = PoseSensitivePointEncoder(
+            embedding_dim=embedding_dim, hidden_dim=hidden_dim,
+            num_neighbors=num_neighbors, dropout=dropout,
+        )
+        self.fragment_point_fusion = nn.Sequential(
+            nn.Linear(embedding_dim * 2 + 3, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(),
+            nn.Dropout(dropout), nn.Linear(hidden_dim, embedding_dim), nn.LayerNorm(embedding_dim), nn.SiLU(),
+        )
+        self.object_point_fusion = nn.Sequential(
+            nn.Linear(embedding_dim * 2 + 3, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(),
+            nn.Dropout(dropout), nn.Linear(hidden_dim, embedding_dim), nn.LayerNorm(embedding_dim), nn.SiLU(),
+        )
+        total_layers = max(int(cross_attention_layers), int(transformer_layers), 1)
+        self.gpat_transformer = GPATCoarseToFineTransformer(
+            embedding_dim=embedding_dim, hidden_dim=hidden_dim,
+            num_heads=num_heads, num_layers=total_layers, dropout=dropout,
+        )
+
+        # --- regression head ---
+        self.frag_query = nn.Parameter(torch.randn(embedding_dim) * 0.02)
+        self.frag_score = nn.Linear(embedding_dim, embedding_dim)
+        self.head_mlp = nn.Sequential(
+            nn.Linear(embedding_dim * 3 + 6, head_hidden_dim), nn.LayerNorm(head_hidden_dim), nn.SiLU(),
+            nn.Dropout(dropout), nn.Linear(head_hidden_dim, head_hidden_dim), nn.LayerNorm(head_hidden_dim), nn.SiLU(),
+        )
+        self.rot_head = nn.Linear(head_hidden_dim, 6)
+        self.centroid_head = nn.Linear(head_hidden_dim, 3)
+        # Identity rotation + centroid-at-origin at init (benign, non-exploding start).
+        nn.init.zeros_(self.rot_head.weight)
+        self.rot_head.bias.data = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        nn.init.zeros_(self.centroid_head.weight)
+        nn.init.zeros_(self.centroid_head.bias)
+
+        if freeze_encoders:
+            self.freeze_pretrained()
+
+    def freeze_pretrained(self) -> None:
+        for module in (self.fragment_encoder, self.object_encoder):
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+
+    def unfreeze_pretrained(self) -> None:
+        for module in (self.fragment_encoder, self.object_encoder):
+            for param in module.parameters():
+                param.requires_grad = True
+
+    def _encode_fragments(self, flat_fragments: torch.Tensor) -> FragmentEncoding:
+        if self.freeze_encoders:
+            with torch.no_grad():
+                return self.fragment_encoder(flat_fragments)
+        return self.fragment_encoder(flat_fragments)
+
+    def _encode_object(self, target_object: torch.Tensor) -> FragmentEncoding:
+        if self.freeze_encoders:
+            with torch.no_grad():
+                return self.object_encoder(target_object)
+        return self.object_encoder(target_object)
+
+    def forward(
+        self,
+        fragments: torch.Tensor,
+        target_object: torch.Tensor,
+        fragment_mask: torch.Tensor,
+        initial_rotations: Optional[torch.Tensor] = None,
+        initial_translations: Optional[torch.Tensor] = None,
+    ) -> PoseEstimatorOutput:
+        del initial_rotations, initial_translations
+        if fragments.dim() != 4 or fragments.shape[-1] != 3:
+            raise ValueError("fragments must have shape (B, F, N, 3)")
+        if target_object.dim() != 3 or target_object.shape[-1] != 3:
+            raise ValueError("target_object must have shape (B, M, 3)")
+
+        batch_size, max_fragments, points_per_fragment, _ = fragments.shape
+        flat = fragments.reshape(batch_size * max_fragments, points_per_fragment, 3)
+        dense_frag_pretrained = self._encode_fragments(flat).point_features.reshape(
+            batch_size, max_fragments, points_per_fragment, self.embedding_dim
+        )
+        dense_obj_pretrained = self._encode_object(target_object).point_features
+        dense_frag_pose = self.fragment_pose_encoder(flat).reshape(
+            batch_size, max_fragments, points_per_fragment, self.embedding_dim
+        )
+        dense_obj_pose = self.object_pose_encoder(target_object)
+
+        fragment_features = self.fragment_point_fusion(
+            torch.cat([dense_frag_pretrained, dense_frag_pose, fragments], dim=-1)
+        )
+        object_features = self.object_point_fusion(
+            torch.cat([dense_obj_pretrained, dense_obj_pose, target_object], dim=-1)
+        )
+        fragment_features = torch.where(
+            fragment_mask[:, :, None, None], fragment_features, torch.zeros_like(fragment_features)
+        )
+        refined_fragments, refined_object = self.gpat_transformer(
+            fragment_features, object_features, fragment_mask
+        )
+
+        # --- pool each fragment to one descriptor ---
+        frag_mean = refined_fragments.mean(dim=2)
+        scores = torch.einsum("bfnd,d->bfn", self.frag_score(refined_fragments), self.frag_query)
+        attn = scores.softmax(dim=2)
+        frag_attn = torch.einsum("bfn,bfnd->bfd", attn, refined_fragments)
+        obj_ctx = refined_object.mean(dim=1, keepdim=True).expand(batch_size, max_fragments, self.embedding_dim)
+        c_in = fragments.mean(dim=2)
+        obj_centroid = target_object.mean(dim=1, keepdim=True).expand(batch_size, max_fragments, 3)
+
+        h = self.head_mlp(torch.cat([frag_mean, frag_attn, obj_ctx, c_in, obj_centroid], dim=-1))
+        rotations = rotation_6d_to_matrix(self.rot_head(h))
+        c_pred = self.centroid_head(h)
+        # placed_centroid = R @ c_in + t  ==  c_pred  =>  t = c_pred - R @ c_in
+        translations = c_pred - torch.einsum("bfcd,bfd->bfc", rotations, c_in)
+
+        eye = torch.eye(3, device=fragments.device, dtype=fragments.dtype)[None, None]
+        rotations = torch.where(fragment_mask[:, :, None, None], rotations, eye)
+        translations = torch.where(fragment_mask[:, :, None], translations, torch.zeros_like(translations))
+        aligned = apply_fragment_transforms(fragments, rotations, translations)
+        aligned = torch.where(fragment_mask[:, :, None, None], aligned, torch.zeros_like(aligned))
+        aligned_union = aligned.reshape(batch_size, max_fragments * points_per_fragment, 3)
+
+        placeholder = fragments.new_zeros(batch_size, max_fragments, points_per_fragment, 1)
+        return PoseEstimatorOutput(
+            rotations=rotations,
+            translations=translations,
+            aligned_fragments=aligned,
+            aligned_union=aligned_union,
+            fragment_features=fragment_features,
+            object_features=object_features,
+            refined_fragment_features=refined_fragments,
+            refined_object_features=refined_object,
+            matching_logits=placeholder,
+            assignment_matrix=placeholder,
+        )
+
+
 def target_segmentation_labels(
     target_object: torch.Tensor,
     target_fragments: torch.Tensor,
@@ -1582,6 +1775,106 @@ def pose_supervised_loss(
     }
 
 
+class DirectRegressionPoseLoss(nn.Module):
+    """Loss for ``DirectRegressionPoseEstimator``: chordal+translation pose regression
+    plus an auxiliary Chamfer placing the union onto the target object."""
+
+    def __init__(
+        self,
+        lambda_pose: float = 8.0,
+        lambda_recon: float = 1.0,
+        lambda_coverage: float = 0.5,
+        lambda_gt: float = 0.0,
+        lambda_overlap: float = 0.0,
+        overlap_threshold: float = 0.03,
+    ) -> None:
+        super().__init__()
+        self.lambda_pose = lambda_pose
+        self.lambda_recon = lambda_recon
+        self.lambda_coverage = lambda_coverage
+        self.lambda_gt = lambda_gt
+        self.lambda_overlap = lambda_overlap
+        self.overlap_threshold = overlap_threshold
+
+    def forward(
+        self,
+        output: PoseEstimatorOutput,
+        fragments: torch.Tensor,
+        fragment_mask: torch.Tensor,
+        reconstructed_object: torch.Tensor,
+        ground_truth_object: Optional[torch.Tensor] = None,
+        target_fragments: Optional[torch.Tensor] = None,
+        gt_rotations: Optional[torch.Tensor] = None,
+        gt_translations: Optional[torch.Tensor] = None,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if gt_rotations is not None and gt_translations is not None:
+            pose_loss = pose_supervised_loss(
+                output.rotations, output.translations, gt_rotations, gt_translations, fragment_mask
+            )
+        else:
+            zero = output.aligned_union.sum() * 0.0
+            pose_loss = {
+                "loss": zero,
+                "loss_rotation": zero.detach(),
+                "loss_translation": zero.detach(),
+                "rotation_error_deg": zero.detach(),
+                "translation_error": zero.detach(),
+            }
+
+        batch_size, max_fragments, points_per_fragment, _ = fragments.shape
+        union_mask = fragment_mask[:, :, None].expand(
+            batch_size, max_fragments, points_per_fragment
+        ).reshape(batch_size, max_fragments * points_per_fragment)
+        loss_recon_cd, recon_fit, recon_coverage = masked_chamfer_distance(
+            output.aligned_union, reconstructed_object, union_mask
+        )
+        if ground_truth_object is not None:
+            loss_gt, _, _ = masked_chamfer_distance(output.aligned_union, ground_truth_object, union_mask)
+        else:
+            loss_gt = output.aligned_union.sum() * 0.0
+        overlap = overlap_loss(output.aligned_fragments, fragment_mask, self.overlap_threshold)
+
+        loss_weights = {
+            "lambda_pose": self.lambda_pose,
+            "lambda_recon": self.lambda_recon,
+            "lambda_coverage": self.lambda_coverage,
+            "lambda_gt": self.lambda_gt,
+            "lambda_overlap": self.lambda_overlap,
+        }
+        if weights is not None:
+            loss_weights.update({k: v for k, v in weights.items() if k in loss_weights})
+
+        total = (
+            loss_weights["lambda_pose"] * pose_loss["loss"]
+            + loss_weights["lambda_recon"] * recon_fit
+            + loss_weights["lambda_coverage"] * recon_coverage
+            + loss_weights["lambda_gt"] * loss_gt
+            + loss_weights["lambda_overlap"] * overlap
+        )
+
+        zero = (output.aligned_union.sum() * 0.0).detach()
+        return {
+            "loss": total,
+            "loss_pose": pose_loss["loss"].detach(),
+            "loss_rotation": pose_loss["loss_rotation"],
+            "loss_translation": pose_loss["loss_translation"],
+            "rotation_error_deg": pose_loss["rotation_error_deg"],
+            "translation_error": pose_loss["translation_error"],
+            "loss_recon_cd": loss_recon_cd.detach(),
+            "loss_recon_fit": recon_fit.detach(),
+            "loss_coverage": recon_coverage.detach(),
+            "loss_gt_cd": loss_gt.detach(),
+            "loss_overlap": overlap.detach(),
+            # placeholders so the shared Stage-3 log line / history render cleanly
+            "loss_matching": zero,
+            "matching_accuracy": zero,
+            "loss_correspondence": zero,
+            "correspondence_accuracy": zero,
+            "loss_align": zero,
+        }
+
+
 def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> nn.Module:
     model_cfg = cfg.get("model", {})
     enc_cfg = model_cfg.get("encoder", {})
@@ -1592,6 +1885,20 @@ def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> n
     fragment_encoder = build_token_encoder(enc_cfg)
     object_encoder = build_token_encoder(enc_cfg)
     architecture = pose_cfg.get("architecture", "target_segmentation")
+    if architecture == "direct_regression":
+        return DirectRegressionPoseEstimator(
+            fragment_encoder=fragment_encoder,
+            object_encoder=object_encoder,
+            embedding_dim=enc_cfg.get("embedding_dim", 128),
+            hidden_dim=pose_cfg.get("hidden_dim", 256),
+            num_heads=pose_cfg.get("num_heads", model_cfg.get("assembly", {}).get("transformer_heads", 4)),
+            cross_attention_layers=pose_cfg.get("cross_attention_layers", 2),
+            transformer_layers=pose_cfg.get("transformer_layers", 2),
+            dropout=pose_cfg.get("dropout", enc_cfg.get("dropout", 0.0)),
+            freeze_encoders=freeze_encoders,
+            num_neighbors=pose_cfg.get("num_neighbors", enc_cfg.get("num_neighbors", 16)),
+            head_hidden_dim=pose_cfg.get("head_hidden_dim", pose_cfg.get("hidden_dim", 256)),
+        )
     if architecture == "target_segmentation":
         return TargetSegmentationPoseEstimator(
             fragment_encoder=fragment_encoder,
@@ -1628,7 +1935,17 @@ def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> n
 def build_pose_loss(cfg: dict) -> nn.Module:
     loss_cfg = cfg.get("loss", {}).get("stage3", {})
     pose_cfg = cfg.get("model", {}).get("pose", {})
-    if pose_cfg.get("architecture", "target_segmentation") == "target_segmentation":
+    architecture = pose_cfg.get("architecture", "target_segmentation")
+    if architecture == "direct_regression":
+        return DirectRegressionPoseLoss(
+            lambda_pose=loss_cfg.get("lambda_pose", 8.0),
+            lambda_recon=loss_cfg.get("lambda_recon", 1.0),
+            lambda_coverage=loss_cfg.get("lambda_coverage", 0.5),
+            lambda_gt=loss_cfg.get("lambda_gt", 0.0),
+            lambda_overlap=loss_cfg.get("lambda_overlap", 0.0),
+            overlap_threshold=loss_cfg.get("overlap_threshold", 0.03),
+        )
+    if architecture == "target_segmentation":
         return TargetSegmentationPoseLoss(
             lambda_segmentation=loss_cfg.get(
                 "lambda_segmentation",
