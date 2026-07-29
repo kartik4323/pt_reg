@@ -498,6 +498,7 @@ class Stage3PoseTrainer:
                 f"seg={metrics['loss_matching']:.4f} "
                 f"corr={metrics.get('loss_correspondence', 0.0):.4f} "
                 f"corr_acc={metrics.get('correspondence_accuracy', 0.0):.3f} "
+                f"align={metrics.get('loss_align', 0.0):.4f} "
                 f"pose={metrics.get('loss_pose', 0.0):.4f} "
                 f"seg_acc={metrics.get('matching_accuracy', 0.0):.3f} "
                 f"recon_cd={metrics['loss_recon_cd']:.4f} "
@@ -630,6 +631,7 @@ class Stage3PoseTrainer:
         final_matching = base.get("lambda_matching", 2.0)
         final_pose = base.get("lambda_pose", 0.0)
         final_correspondence = base.get("lambda_correspondence", 0.0)
+        final_align = base.get("lambda_align", 0.0)
         weights = {
             "lambda_matching": final_matching,
             "lambda_recon": final_recon,
@@ -638,6 +640,7 @@ class Stage3PoseTrainer:
             "lambda_overlap": final_overlap,
             "lambda_pose": final_pose,
             "lambda_correspondence": final_correspondence,
+            "lambda_align": final_align,
         }
 
         if epoch < self.pose_only_epochs:
@@ -651,6 +654,7 @@ class Stage3PoseTrainer:
                     "lambda_correspondence": base.get(
                         "lambda_correspondence_early", final_correspondence * 1.5
                     ),
+                    "lambda_align": base.get("lambda_align_early", final_align * 1.5),
                 }
             )
         elif epoch < self.pose_only_epochs + self.geometry_epochs:
@@ -667,6 +671,7 @@ class Stage3PoseTrainer:
                     "lambda_overlap": base.get("lambda_overlap_mid", final_overlap * 0.5 * mid_progress),
                     "lambda_pose": base.get("lambda_pose_mid", final_pose),
                     "lambda_correspondence": base.get("lambda_correspondence_mid", final_correspondence),
+                    "lambda_align": base.get("lambda_align_mid", final_align),
                 }
             )
         else:
@@ -684,6 +689,7 @@ class Stage3PoseTrainer:
                     "lambda_overlap": final_overlap * late_progress,
                     "lambda_pose": base.get("lambda_pose_late", final_pose),
                     "lambda_correspondence": base.get("lambda_correspondence_late", final_correspondence),
+                    "lambda_align": base.get("lambda_align_late", final_align),
                 }
             )
         return weights

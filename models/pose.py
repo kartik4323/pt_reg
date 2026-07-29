@@ -1323,6 +1323,7 @@ class TargetSegmentationPoseLoss(nn.Module):
         lambda_overlap: float = 0.1,
         lambda_pose: float = 0.0,
         lambda_correspondence: float = 0.0,
+        lambda_align: float = 0.0,
         overlap_threshold: float = 0.03,
         segmentation_outlier_threshold: Optional[float] = None,
     ) -> None:
@@ -1334,6 +1335,7 @@ class TargetSegmentationPoseLoss(nn.Module):
         self.lambda_overlap = lambda_overlap
         self.lambda_pose = lambda_pose
         self.lambda_correspondence = lambda_correspondence
+        self.lambda_align = lambda_align
         self.overlap_threshold = overlap_threshold
         self.segmentation_outlier_threshold = segmentation_outlier_threshold
 
@@ -1407,6 +1409,14 @@ class TargetSegmentationPoseLoss(nn.Module):
             gt_rotations,
             gt_translations,
         )
+        align_loss = aligned_point_loss(
+            output.assignment_matrix,
+            fragments,
+            reconstructed_object,
+            fragment_mask,
+            gt_rotations,
+            gt_translations,
+        )
 
         loss_weights = {
             "lambda_segmentation": self.lambda_segmentation,
@@ -1417,6 +1427,7 @@ class TargetSegmentationPoseLoss(nn.Module):
             "lambda_overlap": self.lambda_overlap,
             "lambda_pose": self.lambda_pose,
             "lambda_correspondence": self.lambda_correspondence,
+            "lambda_align": self.lambda_align,
         }
         if weights is not None:
             loss_weights.update(weights)
@@ -1431,6 +1442,7 @@ class TargetSegmentationPoseLoss(nn.Module):
             + loss_weights["lambda_overlap"] * overlap
             + loss_weights["lambda_pose"] * pose_loss["loss"]
             + loss_weights["lambda_correspondence"] * correspondence_loss
+            + loss_weights["lambda_align"] * align_loss
         )
         diagnostics = PoseAssemblyLoss._pose_diagnostics(
             output,
@@ -1452,6 +1464,7 @@ class TargetSegmentationPoseLoss(nn.Module):
             "loss_pose": pose_loss["loss"].detach(),
             "loss_correspondence": correspondence_loss.detach(),
             "correspondence_accuracy": correspondence_accuracy,
+            "loss_align": align_loss.detach(),
             "loss_rotation": pose_loss["loss_rotation"],
             "loss_translation": pose_loss["loss_translation"],
             **diagnostics,
@@ -1504,6 +1517,34 @@ def dense_correspondence_loss(
         correct = (assignment.argmax(dim=-1) == labels).to(nll.dtype)
         accuracy = (correct * mask).sum() / denom
     return loss, accuracy.detach()
+
+
+def aligned_point_loss(
+    assignment: torch.Tensor,
+    fragments: torch.Tensor,
+    target_object: torch.Tensor,
+    fragment_mask: torch.Tensor,
+    gt_rotations: torch.Tensor,
+    gt_translations: torch.Tensor,
+) -> torch.Tensor:
+    """Smooth, well-posed geometric supervision for the soft correspondence.
+
+    The soft-corresponded position of a fragment point is the assignment-weighted
+    average of object points, ``(assignment @ object)``. Its ground truth is the
+    fragment point placed by the GT pose. Unlike the hard nearest-point NLL, this
+    does not require identifying the exact object point (ill-posed on smooth
+    surfaces where many points are near-equidistant) -- it only requires the
+    weighted-average position to be correct, which is exactly what the downstream
+    Kabsch consumes. This is the term that actually makes the correspondence
+    geometrically meaningful for rotation.
+    """
+    if assignment is None or gt_rotations is None or gt_translations is None:
+        return fragments.sum() * 0.0
+    corresponded = torch.einsum("bfnm,bmc->bfnc", assignment, target_object)
+    gt_placed = apply_fragment_transforms(fragments, gt_rotations, gt_translations)
+    err = ((corresponded - gt_placed) ** 2).sum(dim=-1)  # (B, F, N)
+    mask = fragment_mask[:, :, None].expand_as(err).to(err.dtype)
+    return (err * mask).sum() / mask.sum().clamp(min=1.0)
 
 
 def pose_supervised_loss(
@@ -1599,6 +1640,7 @@ def build_pose_loss(cfg: dict) -> nn.Module:
             lambda_overlap=loss_cfg.get("lambda_overlap", 0.1),
             lambda_pose=loss_cfg.get("lambda_pose", 0.0),
             lambda_correspondence=loss_cfg.get("lambda_correspondence", 0.0),
+            lambda_align=loss_cfg.get("lambda_align", 0.0),
             overlap_threshold=loss_cfg.get("overlap_threshold", 0.03),
             segmentation_outlier_threshold=loss_cfg.get("segmentation_outlier_threshold"),
         )

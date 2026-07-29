@@ -86,8 +86,9 @@ loss:
     lambda_matching_early: 4.0
     lambda_matching_mid: 2.0
     lambda_matching_late: 1.0
-    lambda_correspondence: 3.0
-    lambda_correspondence_early: 4.0
+    lambda_align: 5.0
+    lambda_correspondence: 1.0
+    lambda_correspondence_early: 2.0
     lambda_recon: 1.0
     lambda_coverage: 1.0
     lambda_gt: 0.5
