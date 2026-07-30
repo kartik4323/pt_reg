@@ -15,11 +15,17 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+import trimesh
+
+from utils.point_cloud_utils import normalize_point_cloud_np
 
 
 ARCHIVE_EXTENSIONS = (
@@ -107,6 +113,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "In --per-category mode, delete each source archive after its category "
             "has been successfully converted, to reclaim disk space. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--extraction-mode",
+        choices=["stream", "bulk"],
+        default="stream",
+        help=(
+            "In --per-category mode: 'stream' (default) converts one mesh at a time "
+            "directly from a .zip archive without ever extracting the whole category "
+            "to disk -- peak disk usage per object is a few MB instead of the tens of "
+            "GB a full-category extraction can need. 'bulk' extracts the whole "
+            "category first (legacy behavior; also the automatic fallback for .tar "
+            "archives, which are not streamed)."
         ),
     )
     return parser.parse_args()
@@ -287,6 +306,93 @@ def rebuild_metadata(output_root: Path) -> dict:
     return metadata
 
 
+def _load_mesh(path: Path) -> trimesh.Trimesh:
+    loaded = trimesh.load(str(path), force="mesh")
+    if isinstance(loaded, trimesh.Scene):
+        geometries = [geom for geom in loaded.geometry.values() if len(geom.vertices) > 0]
+        if not geometries:
+            raise ValueError("empty scene")
+        loaded = trimesh.util.concatenate(geometries)
+    if loaded.is_empty or len(loaded.vertices) == 0:
+        raise ValueError("empty mesh")
+    return loaded
+
+
+def find_zip_objects(zf: zipfile.ZipFile, synset: str) -> Dict[str, str]:
+    """Map object_id -> zip member path, for every model_normalized.obj of this synset."""
+    suffix = "/models/model_normalized.obj"
+    objects: Dict[str, str] = {}
+    for name in zf.namelist():
+        if not name.endswith(suffix):
+            continue
+        if f"/{synset}/" not in f"/{name}":
+            continue
+        object_id = name[: -len(suffix)].rsplit("/", 1)[-1]
+        objects[object_id] = name
+    return objects
+
+
+def _safe_extract_member(zf: zipfile.ZipFile, member: str, dest_root: Path) -> Path:
+    target = (dest_root / member).resolve()
+    if not str(target).startswith(str(dest_root.resolve())):
+        raise RuntimeError(f"Unsafe zip member path: {member}")
+    zf.extract(member, dest_root)
+    return target
+
+
+def stream_convert_category(
+    archive: Path,
+    synset: str,
+    output_root: Path,
+    num_points: int,
+    max_objects: Optional[int] = None,
+) -> int:
+    """Convert one category directly from its zip, one mesh at a time.
+
+    Extracts a single object's model_normalized.obj (+ .mtl if present) into a
+    throwaway temp dir, converts it to a point cloud, then discards it before
+    moving to the next object. Peak disk usage is a few MB per object instead
+    of the tens of GB a full-category extraction can need -- the repeated
+    cause of "no space left" failures on disk-constrained boxes. Textures are
+    not extracted (not needed for point sampling); trimesh logs a warning and
+    continues without them.
+    """
+    out_dir = output_root / synset
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    converted = 0
+    with zipfile.ZipFile(archive) as zf:
+        objects = find_zip_objects(zf, synset)
+        object_ids = sorted(objects)
+        if max_objects is not None:
+            object_ids = object_ids[:max_objects]
+        print(f"{synset}: found {len(object_ids)} mesh entries in {archive.name} (streaming)")
+
+        for index, object_id in enumerate(object_ids, start=1):
+            obj_member = objects[object_id]
+            mtl_member = obj_member.rsplit("/", 1)[0] + "/model_normalized.mtl"
+            has_mtl = mtl_member in zf.namelist()
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                try:
+                    obj_path = _safe_extract_member(zf, obj_member, tmp_path)
+                    if has_mtl:
+                        _safe_extract_member(zf, mtl_member, tmp_path)
+                    mesh = _load_mesh(obj_path)
+                    points = mesh.sample(num_points).astype(np.float32)
+                    points = normalize_point_cloud_np(points)
+                    np.save(out_dir / f"{object_id}.npy", points)
+                    converted += 1
+                except Exception as exc:
+                    print(f"[WARN] skipped {synset}/{object_id}: {exc}")
+                    continue
+            if index % 100 == 0:
+                print(f"  processed {index}/{len(object_ids)}")
+
+    print(f"[OK] streamed {converted} point clouds for {synset} -> {out_dir}")
+    return converted
+
+
 def run_per_category(args: argparse.Namespace, downloaded_root: Optional[Path]) -> None:
     """Extract -> convert -> delete, one synset at a time (bounded peak disk)."""
     candidates = gather_candidate_archives(args, downloaded_root)
@@ -315,10 +421,28 @@ def run_per_category(args: argparse.Namespace, downloaded_root: Optional[Path]) 
             skipped.append(synset)
             continue
 
-        # Extract into a synset-NEUTRAL working dir. Naming it after the synset
-        # would duplicate the synset in the mesh path (the archive already has an
-        # inner <synset>/ folder), which makes object_id_from_mesh label every
-        # object with the synset id -> filename collisions -> lost objects.
+        use_stream = args.extraction_mode == "stream" and archive.name.lower().endswith(".zip")
+        if use_stream:
+            # Convert straight from the zip, one mesh at a time -- no full-category
+            # extraction, so peak disk usage never scales with archive size.
+            try:
+                stream_convert_category(
+                    archive, synset, output_root, args.num_points, args.max_objects_per_category
+                )
+                done.append(synset)
+                if args.delete_archives:
+                    archive.unlink(missing_ok=True)
+                    print(f"[cleanup] deleted archive {archive.name}")
+            except Exception as exc:  # keep going; a bad synset shouldn't abort the run
+                print(f"[error] {synset}: {exc}")
+                skipped.append(synset)
+            continue
+
+        # Bulk fallback (.tar archives, or --extraction-mode bulk): extract the
+        # whole category into a synset-NEUTRAL working dir. Naming it after the
+        # synset would duplicate the synset in the mesh path (the archive already
+        # has an inner <synset>/ folder), which makes object_id_from_mesh label
+        # every object with the synset id -> filename collisions -> lost objects.
         cat_extract = extract_base / "_per_category_work"
         if cat_extract.exists():
             shutil.rmtree(cat_extract)
