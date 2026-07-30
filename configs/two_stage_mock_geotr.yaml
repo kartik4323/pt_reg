@@ -1,0 +1,144 @@
+# Tiny mock config for CPU smoke-testing the GeoTransformer Stage-3 matcher.
+# Mock shapes are symmetric primitives, so absolute rotation numbers are not
+# meaningful; this validates plumbing + that the matcher can overfit a batch.
+
+mock_data:
+  enabled: true
+  n_objects: 60
+
+data:
+  shapenet_root: "./mock_shapenet_two_stage"
+  allow_missing_categories: false
+  categories:
+    - "02691156"
+    - "03001627"
+    - "04379243"
+  num_points_per_object: 256
+  num_points_per_fragment: 96
+  train_split: 0.75
+  val_split: 0.10
+  test_split: 0.15
+  seed: 42
+
+fragment:
+  min_fragments: 3
+  max_fragments: 5
+  strategies: ["plane", "voronoi", "irregular"]
+  boundary_eps: 0.06
+  irregular_noise_scale: 0.05
+
+pairs:
+  positive_ratio: 0.5
+  easy_negative_ratio: 0.2
+  hard_negative_ratio: 0.2
+  perturbed_positive_ratio: 0.1
+  perturb_jitter_std: 0.03
+  perturb_anisotropic_scale: 0.12
+
+augmentation:
+  random_fragment_rotation: true
+  fragment_pose_translation: 0.6
+
+model:
+  encoder:
+    type: "se3_invariant"
+    embedding_dim: 64
+    hidden_dim: 96
+    num_tokens: 8
+    num_neighbors: 8
+    dropout: 0.0
+  compatibility:
+    hidden_dims: [128, 96]
+    edge_dim: 64
+    dropout: 0.0
+  assembly:
+    gnn_hidden_dim: 128
+    gnn_layers: 2
+    transformer_layers: 1
+    transformer_heads: 4
+    decoder_layers: 1
+    output_points: 256
+    dropout: 0.0
+  pose:
+    architecture: "geotransformer"
+    hidden_dim: 128
+    num_heads: 4
+    num_blocks: 2
+    num_fragment_superpoints: 32
+    num_object_superpoints: 64
+    sigma_d: 0.15
+    sigma_a: 15.0
+    angle_k: 3
+    dropout: 0.0
+    freeze_encoders: true
+
+loss:
+  stage1:
+    lambda_contrast: 0.5
+    temperature: 0.07
+    pos_weight: 1.0
+    lambda_boundary: 0.0
+  stage2:
+    lambda_boundary: 1.0
+    lambda_coverage: 0.5
+    lambda_dropout: 0.1
+    lambda_consistency: 0.1
+    lambda_compat: 0.05
+    boundary_weight: 2.0
+    dropout_margin: 0.01
+  stage3:
+    lambda_matching: 2.0
+    lambda_matching_early: 4.0
+    lambda_align: 5.0
+    lambda_align_early: 6.0
+    lambda_pose: 0.5
+    lambda_pose_late: 3.0
+    lambda_recon: 1.0
+    lambda_coverage: 1.0
+    lambda_gt: 0.5
+    lambda_overlap: 0.05
+    matching_radius: 0.08
+    circle_pos_margin: 0.1
+    circle_neg_margin: 1.4
+    circle_log_scale: 24.0
+    overlap_threshold: 0.03
+    min_fragment_extent: 0.0
+    fragment_size_softness: 0.0
+
+stage1:
+  epochs: 3
+  epoch_size: 96
+  batch_size: 8
+  num_workers: 0
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage2:
+  epochs: 3
+  epoch_size: 48
+  batch_size: 4
+  num_workers: 0
+  learning_rate: 0.0003
+  pretrained_learning_rate: 0.00005
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  freeze_pretrained: true
+  unfreeze_pretrained_epoch: 2
+
+stage3:
+  epochs: 2
+  epoch_size: 8
+  batch_size: 1
+  grad_accum_steps: 2
+  num_workers: 0
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  pose_only_epochs: 1
+  geometry_epochs: 1
+  initialization_icp_iterations: 0
+  icp_iterations: 0
+
+output:
+  dir: "./outputs_two_stage_mock_geotr"

@@ -1,0 +1,156 @@
+# Full-pipeline ShapeNet config with a GeoTransformer geometric-attention Stage-3.
+# All 10 categories (the multi-category guard in data/assembly_dataset.py will
+# error if any are missing from metadata.json). Train Stage 3 with
+# --mode stage3-train-gt; evaluate with both --mode stage3-gt and stage3-eval.
+
+mock_data:
+  enabled: false
+
+data:
+  shapenet_root: "./shape_processed"
+  allow_missing_categories: false
+  categories:
+    - "02691156" # airplane
+    - "02828884" # bench
+    - "02933112" # cabinet
+    - "02958343" # car
+    - "03001627" # chair
+    - "03211117" # display
+    - "03636649" # lamp
+    - "03691459" # speaker
+    - "04256520" # sofa
+    - "04379243" # table
+  num_points_per_object: 4096
+  num_points_per_fragment: 1024
+  train_split: 0.80
+  val_split: 0.10
+  test_split: 0.10
+  seed: 42
+
+fragment:
+  min_fragments: 3
+  max_fragments: 6
+  strategies: ["plane", "voronoi", "irregular"]
+  boundary_eps: 0.04
+  irregular_noise_scale: 0.05
+
+pairs:
+  positive_ratio: 0.5
+  easy_negative_ratio: 0.2
+  hard_negative_ratio: 0.2
+  perturbed_positive_ratio: 0.1
+  perturb_jitter_std: 0.03
+  perturb_anisotropic_scale: 0.12
+
+augmentation:
+  random_fragment_rotation: true
+  fragment_pose_translation: 0.7
+
+model:
+  encoder:
+    type: "se3_invariant"
+    embedding_dim: 128
+    hidden_dim: 192
+    num_tokens: 32
+    num_neighbors: 16
+    dropout: 0.05
+  compatibility:
+    hidden_dims: [256, 192]
+    edge_dim: 128
+    dropout: 0.05
+  assembly:
+    gnn_hidden_dim: 256
+    gnn_layers: 3
+    transformer_layers: 2
+    transformer_heads: 4
+    decoder_layers: 4
+    output_points: 4096
+    dropout: 0.05
+  pose:
+    architecture: "geotransformer"
+    hidden_dim: 256
+    num_heads: 4
+    num_blocks: 3
+    num_fragment_superpoints: 128
+    num_object_superpoints: 256
+    sigma_d: 0.15        # normalized-unit scale (objects are unit-normalized)
+    sigma_a: 15.0
+    angle_k: 3
+    dropout: 0.05
+    freeze_encoders: true
+
+loss:
+  stage1:
+    lambda_contrast: 0.5
+    temperature: 0.07
+    pos_weight: 1.0
+    lambda_boundary: 0.0
+  stage2:
+    lambda_boundary: 2.0
+    lambda_coverage: 1.0
+    lambda_dropout: 0.5
+    lambda_consistency: 0.3
+    lambda_compat: 0.1
+    boundary_weight: 2.0
+    dropout_margin: 0.01
+  stage3:
+    # Coarse circle matching + aligned-point are the rotation drivers; chordal
+    # pose (the only SVD-path term) stays small early and ramps in late.
+    lambda_matching: 2.0
+    lambda_matching_early: 4.0
+    lambda_matching_mid: 2.0
+    lambda_matching_late: 1.0
+    lambda_align: 5.0
+    lambda_align_early: 6.0
+    lambda_pose: 0.5
+    lambda_pose_late: 3.0
+    lambda_recon: 1.0
+    lambda_coverage: 1.0
+    lambda_gt: 1.0
+    lambda_overlap: 0.1
+    matching_radius: 0.04
+    circle_pos_margin: 0.1
+    circle_neg_margin: 1.4
+    circle_log_scale: 24.0
+    overlap_threshold: 0.03
+    # Soft down-weight of geometrically-unrecoverable small fragments.
+    min_fragment_extent: 0.30
+    fragment_size_softness: 0.05
+
+stage1:
+  epochs: 50
+  epoch_size: 20000
+  batch_size: 16
+  num_workers: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage2:
+  epochs: 80
+  epoch_size: 10000
+  batch_size: 4
+  num_workers: 4
+  learning_rate: 0.0001
+  pretrained_learning_rate: 0.00001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  freeze_pretrained: true
+  unfreeze_pretrained_epoch: 20
+
+stage3:
+  epochs: 40
+  epoch_size: 4096       # superpoint matching is memory-cheap -> more data/epoch
+  batch_size: 1
+  grad_accum_steps: 4
+  num_workers: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  pose_only_epochs: 8     # matching/align-first (SVD stability)
+  geometry_epochs: 12
+  initialization_icp_iterations: 0
+  icp_iterations: 0
+
+output:
+  dir: "./outputs_geotr"

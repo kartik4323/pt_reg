@@ -10,7 +10,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.token_encoder import FragmentEncoding, build_token_encoder
+from models.token_encoder import (
+    FragmentEncoding,
+    _batched_fps_indices,
+    _gather_points,
+    build_token_encoder,
+)
 
 
 def _alignment_compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -573,6 +578,8 @@ class PoseEstimatorOutput:
     assignment_matrix: torch.Tensor
     target_logits: Optional[torch.Tensor] = None
     target_probabilities: Optional[torch.Tensor] = None
+    fragment_superpoints: Optional[torch.Tensor] = None
+    object_superpoints: Optional[torch.Tensor] = None
 
     @property
     def fragment_tokens(self) -> torch.Tensor:
@@ -1875,6 +1882,472 @@ class DirectRegressionPoseLoss(nn.Module):
         }
 
 
+# ============================================================================
+# GeoTransformer Stage-3 matcher (geometric-attention correspondence + Kabsch)
+# ----------------------------------------------------------------------------
+# Coarse-path v1: rotation-invariant geometric self-attention over superpoints
+# + coarse Gaussian-correlation matching -> soft superpoint assignment ->
+# DifferentiableKabsch. (Fine patch-level OT refinement is a planned follow-up.)
+# ============================================================================
+
+
+def _sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sinusoidal embedding of a scalar tensor -> (..., dim). No parameters."""
+    half = dim // 2
+    freq = 1.0 / (10000.0 ** (torch.arange(half, device=values.device, dtype=torch.float32) * 2.0 / dim))
+    ang = values.to(torch.float32).unsqueeze(-1) * freq
+    return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+
+def _gather_rows(coords: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """coords (B,n,3), idx (B,m,k) -> (B,m,k,3). Small tensors (superpoint scale)."""
+    b, n, c = coords.shape
+    m, k = idx.shape[1], idx.shape[2]
+    expanded = coords[:, None, :, :].expand(b, m, n, c)
+    return torch.gather(expanded, 2, idx.unsqueeze(-1).expand(b, m, k, c))
+
+
+class GeometricStructureEmbedding(nn.Module):
+    """GeoTransformer relative-position map: pairwise distances + triplet angles."""
+
+    def __init__(self, hidden_dim: int, sigma_d: float, sigma_a: float, angle_k: int) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.sigma_d = sigma_d
+        self.sigma_a = sigma_a
+        self.angle_k = angle_k
+        self.proj_d = nn.Linear(hidden_dim, hidden_dim)
+        self.proj_a = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        b, n, _ = coords.shape
+        with torch.no_grad():
+            dist = torch.cdist(coords, coords)                       # (B,n,n)
+            d_emb = _sinusoidal_embedding(dist / self.sigma_d, self.hidden_dim)
+            k = min(self.angle_k + 1, n)
+            knn_idx = dist.topk(k=k, dim=-1, largest=False).indices[..., 1:]  # (B,n,k-1)
+            kk = knn_idx.shape[-1]
+            if kk == 0:
+                a_emb = torch.zeros_like(d_emb)
+            else:
+                knn_pts = _gather_rows(coords, knn_idx)              # (B,n,kk,3)
+                v_ref = knn_pts - coords.unsqueeze(2)                # (B,n,kk,3)
+                v_ij = coords.unsqueeze(1) - coords.unsqueeze(2)     # (B,n,n,3) = P_j - P_i
+                vij = v_ij.unsqueeze(3).expand(b, n, n, kk, 3)
+                vrf = v_ref.unsqueeze(2).expand(b, n, n, kk, 3)
+                cross = torch.linalg.cross(vij, vrf, dim=-1)
+                angle = torch.atan2(torch.linalg.vector_norm(cross, dim=-1), (vij * vrf).sum(-1))
+                a_ind = angle * (180.0 / (self.sigma_a * torch.pi))
+                a_emb = _sinusoidal_embedding(a_ind, self.hidden_dim).max(dim=3).values  # (B,n,n,H)
+        return self.proj_d(d_emb) + self.proj_a(a_emb)
+
+
+class GeometricSelfAttention(nn.Module):
+    """Self-attention with a relative-position bias (GeoTransformer RPE form)."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.h = num_heads
+        self.d = hidden_dim // num_heads
+        self.q = nn.Linear(hidden_dim, hidden_dim)
+        self.k = nn.Linear(hidden_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, hidden_dim)
+        self.p = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, rpe: torch.Tensor) -> torch.Tensor:
+        b, n, hd = x.shape
+        q = self.q(x).view(b, n, self.h, self.d).transpose(1, 2)          # (B,h,n,d)
+        k = self.k(x).view(b, n, self.h, self.d).transpose(1, 2)
+        v = self.v(x).view(b, n, self.h, self.d).transpose(1, 2)
+        p = self.p(rpe).view(b, n, n, self.h, self.d).permute(0, 3, 1, 2, 4)  # (B,h,n,n,d)
+        attn_e = torch.einsum("bhic,bhjc->bhij", q, k)
+        attn_p = torch.einsum("bhic,bhijc->bhij", q, p)
+        attn = ((attn_e + attn_p) / (self.d ** 0.5)).softmax(dim=-1)
+        attn = self.dropout(attn)
+        out = torch.einsum("bhij,bhjc->bhic", attn, v).transpose(1, 2).reshape(b, n, hd)
+        return self.out(out)
+
+
+def _ffn(hidden_dim: int, dropout: float) -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Dropout(dropout),
+        nn.Linear(hidden_dim * 2, hidden_dim), nn.Dropout(dropout),
+    )
+
+
+class GeometricTransformerBlock(nn.Module):
+    """One block: geometric self-attn (frag & obj) + bidirectional cross-attn."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.self_frag = GeometricSelfAttention(hidden_dim, num_heads, dropout)
+        self.self_obj = GeometricSelfAttention(hidden_dim, num_heads, dropout)
+        self.cross_f2o = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.cross_o2f = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(6)])
+        self.ffn_frag = _ffn(hidden_dim, dropout)
+        self.ffn_obj = _ffn(hidden_dim, dropout)
+        self.ffn_norm_frag = nn.LayerNorm(hidden_dim)
+        self.ffn_norm_obj = nn.LayerNorm(hidden_dim)
+
+    def forward(self, frag, obj, rpe_frag, rpe_obj, batch, num_frag, key_mask):
+        # frag (B*F, Sf, H), obj (B, So, H), rpe_frag (B*F,Sf,Sf,H), rpe_obj (B,So,So,H)
+        so = obj.shape[1]
+        frag = frag + self.self_frag(self.norms[0](frag), rpe_frag)
+        obj = obj + self.self_obj(self.norms[1](obj), rpe_obj)
+
+        obj_exp = obj.unsqueeze(1).expand(batch, num_frag, so, obj.shape[-1]).reshape(batch * num_frag, so, obj.shape[-1])
+        f_q = self.norms[2](frag)
+        frag = frag + self.cross_f2o(f_q, obj_exp, obj_exp, need_weights=False)[0]
+
+        frag_keys = frag.reshape(batch, num_frag * frag.shape[1], frag.shape[-1])
+        o_q = self.norms[3](obj)
+        obj = obj + self.cross_o2f(o_q, frag_keys, frag_keys, key_padding_mask=~key_mask, need_weights=False)[0]
+
+        frag = frag + self.ffn_frag(self.ffn_norm_frag(frag))
+        obj = obj + self.ffn_obj(self.ffn_norm_obj(obj))
+        return frag, obj
+
+
+class SuperpointDescriptor(nn.Module):
+    """Invariant superpoint descriptor: projected frozen features + trainable local invariants."""
+
+    def __init__(self, encoder_dim: int, hidden_dim: int, local_k: int = 8) -> None:
+        super().__init__()
+        self.local_k = local_k
+        self.proj_frozen = nn.Linear(encoder_dim, hidden_dim)
+        self.proj_local = nn.Linear(7, hidden_dim)  # 4 kNN dist stats + 3 covariance eigvals
+
+    def local_invariants(self, coords: torch.Tensor) -> torch.Tensor:
+        b, n, _ = coords.shape
+        with torch.no_grad():
+            dist = torch.cdist(coords, coords)
+            k = min(self.local_k + 1, n)
+            knn_d, knn_i = dist.topk(k=k, dim=-1, largest=False)
+            nd = knn_d[..., 1:]                                    # (B,n,k-1)
+            if nd.shape[-1] == 0:
+                nd = torch.zeros(b, n, 1, device=coords.device)
+            stats = torch.stack(
+                [nd.min(-1).values, nd.mean(-1), nd.std(-1, unbiased=False), nd.max(-1).values], dim=-1
+            )                                                      # (B,n,4)
+            neigh = _gather_rows(coords, knn_i[..., 1:] if knn_i.shape[-1] > 1 else knn_i)  # (B,n,kk,3)
+            centered = neigh - neigh.mean(2, keepdim=True)
+            cov = centered.transpose(-1, -2) @ centered / max(centered.shape[2], 1)
+            eig = torch.linalg.eigvalsh(cov)                       # (B,n,3) ascending, >=0
+            eig = eig / (eig.sum(-1, keepdim=True) + 1e-8)
+            feats = torch.cat([stats, eig], dim=-1)                # (B,n,7)
+        return feats
+
+    def forward(self, frozen_feats: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        return self.proj_frozen(frozen_feats) + self.proj_local(self.local_invariants(coords))
+
+
+class GeoTransformerPoseEstimator(nn.Module):
+    """Geometric-attention superpoint matcher -> weighted Kabsch (per fragment)."""
+
+    def __init__(
+        self,
+        fragment_encoder: nn.Module,
+        object_encoder: nn.Module,
+        embedding_dim: int = 128,
+        hidden_dim: int = 256,
+        num_heads: int = 4,
+        num_blocks: int = 3,
+        num_fragment_superpoints: int = 128,
+        num_object_superpoints: int = 256,
+        sigma_d: float = 0.15,
+        sigma_a: float = 15.0,
+        angle_k: int = 3,
+        dropout: float = 0.0,
+        freeze_encoders: bool = True,
+    ) -> None:
+        super().__init__()
+        self.fragment_encoder = fragment_encoder
+        self.object_encoder = object_encoder
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.freeze_encoders = freeze_encoders
+        self.num_fragment_superpoints = num_fragment_superpoints
+        self.num_object_superpoints = num_object_superpoints
+
+        self.descriptor = SuperpointDescriptor(embedding_dim, hidden_dim)
+        self.geo_embed = GeometricStructureEmbedding(hidden_dim, sigma_d, sigma_a, angle_k)
+        self.blocks = nn.ModuleList(
+            [GeometricTransformerBlock(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
+        )
+        self.frag_out = nn.Linear(hidden_dim, hidden_dim)
+        self.obj_out = nn.Linear(hidden_dim, hidden_dim)
+        self.kabsch = DifferentiableKabsch()
+        if freeze_encoders:
+            self.freeze_pretrained()
+
+    def freeze_pretrained(self) -> None:
+        for module in (self.fragment_encoder, self.object_encoder):
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+
+    def unfreeze_pretrained(self) -> None:
+        for module in (self.fragment_encoder, self.object_encoder):
+            for param in module.parameters():
+                param.requires_grad = True
+
+    def _encode(self, encoder: nn.Module, points: torch.Tensor) -> torch.Tensor:
+        if self.freeze_encoders:
+            with torch.no_grad():
+                return encoder(points).point_features
+        return encoder(points).point_features
+
+    def _superpoints(self, points: torch.Tensor, feats: torch.Tensor, num_sp: int):
+        n = points.shape[1]
+        sp = min(num_sp, n)
+        idx = _batched_fps_indices(points.detach(), sp)            # (B, sp)
+        sp_xyz = _gather_points(points, idx)                       # (B, sp, 3)
+        sp_feat = _gather_points(feats, idx)                       # (B, sp, C)
+        return sp_xyz, sp_feat
+
+    def forward(
+        self,
+        fragments: torch.Tensor,
+        target_object: torch.Tensor,
+        fragment_mask: torch.Tensor,
+        initial_rotations: Optional[torch.Tensor] = None,
+        initial_translations: Optional[torch.Tensor] = None,
+    ) -> PoseEstimatorOutput:
+        del initial_rotations, initial_translations
+        if fragments.dim() != 4 or fragments.shape[-1] != 3:
+            raise ValueError("fragments must have shape (B, F, N, 3)")
+        if target_object.dim() != 3 or target_object.shape[-1] != 3:
+            raise ValueError("target_object must have shape (B, M, 3)")
+
+        b, num_frag, n_pts, _ = fragments.shape
+        flat = fragments.reshape(b * num_frag, n_pts, 3)
+        frag_pf = self._encode(self.fragment_encoder, flat)                    # (B*F, N, C)
+        sp_frag_xyz, sp_frag_feat = self._superpoints(flat, frag_pf, self.num_fragment_superpoints)
+        obj_pf = self._encode(self.object_encoder, target_object)              # (B, M, C)
+        sp_obj_xyz, sp_obj_feat = self._superpoints(target_object, obj_pf, self.num_object_superpoints)
+
+        desc_frag = self.descriptor(sp_frag_feat, sp_frag_xyz)                 # (B*F, Sf, H)
+        desc_obj = self.descriptor(sp_obj_feat, sp_obj_xyz)                    # (B, So, H)
+
+        rpe_frag = self.geo_embed(sp_frag_xyz)                                 # (B*F, Sf, Sf, H)
+        rpe_obj = self.geo_embed(sp_obj_xyz)                                   # (B, So, So, H)
+
+        sf = sp_frag_xyz.shape[1]
+        key_mask = fragment_mask[:, :, None].expand(b, num_frag, sf).reshape(b, num_frag * sf)
+        frag = desc_frag
+        obj = desc_obj
+        for block in self.blocks:
+            frag, obj = block(frag, obj, rpe_frag, rpe_obj, b, num_frag, key_mask)
+        frag = self.frag_out(frag).reshape(b, num_frag, sf, self.hidden_dim)
+        obj = self.obj_out(obj)                                                # (B, So, H)
+
+        # Coarse Gaussian-correlation matching + dual normalization -> soft assignment.
+        fn = F.normalize(frag, dim=-1)
+        on = F.normalize(obj, dim=-1)
+        sim = torch.einsum("bfsh,boh->bfso", fn, on)                           # cosine in [-1,1]
+        score = torch.exp(2.0 * (sim - 1.0))                                   # ~exp(-||.||^2)
+        row = score / score.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        col = score / score.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        assignment = row * col                                                 # (B,F,Sf,So)
+        assignment = torch.where(fragment_mask[:, :, None, None], assignment, torch.zeros_like(assignment))
+
+        sp_frag_xyz_bf = sp_frag_xyz.reshape(b, num_frag, sf, 3)
+        rotations, translations = self.kabsch(sp_frag_xyz_bf, sp_obj_xyz, assignment, fragment_mask)
+
+        eye = torch.eye(3, device=fragments.device, dtype=fragments.dtype)[None, None]
+        rotations = torch.where(fragment_mask[:, :, None, None], rotations, eye)
+        translations = torch.where(fragment_mask[:, :, None], translations, torch.zeros_like(translations))
+        aligned = apply_fragment_transforms(fragments, rotations, translations)
+        aligned = torch.where(fragment_mask[:, :, None, None], aligned, torch.zeros_like(aligned))
+        aligned_union = aligned.reshape(b, num_frag * n_pts, 3)
+
+        return PoseEstimatorOutput(
+            rotations=rotations,
+            translations=translations,
+            aligned_fragments=aligned,
+            aligned_union=aligned_union,
+            fragment_features=frag,
+            object_features=obj,
+            refined_fragment_features=frag,
+            refined_object_features=obj,
+            matching_logits=assignment,
+            assignment_matrix=assignment,
+            fragment_superpoints=sp_frag_xyz_bf,
+            object_superpoints=sp_obj_xyz,
+        )
+
+
+def fragment_extent(fragments: torch.Tensor) -> torch.Tensor:
+    """Rotation/translation-invariant per-fragment size proxy (radius). (B,F)."""
+    centroid = fragments.mean(dim=2, keepdim=True)
+    return torch.linalg.vector_norm(fragments - centroid, dim=-1).max(dim=-1).values
+
+
+class GeoTransformerPoseLoss(nn.Module):
+    """Coarse circle loss + aligned-point + chordal + chamfer, with soft size down-weight."""
+
+    def __init__(
+        self,
+        lambda_matching: float = 2.0,
+        lambda_align: float = 5.0,
+        lambda_pose: float = 0.5,
+        lambda_recon: float = 1.0,
+        lambda_coverage: float = 1.0,
+        lambda_gt: float = 0.0,
+        lambda_overlap: float = 0.1,
+        matching_radius: float = 0.04,
+        pos_margin: float = 0.1,
+        neg_margin: float = 1.4,
+        log_scale: float = 24.0,
+        overlap_threshold: float = 0.03,
+        min_fragment_extent: float = 0.0,
+        fragment_size_softness: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.lambda_matching = lambda_matching
+        self.lambda_align = lambda_align
+        self.lambda_pose = lambda_pose
+        self.lambda_recon = lambda_recon
+        self.lambda_coverage = lambda_coverage
+        self.lambda_gt = lambda_gt
+        self.lambda_overlap = lambda_overlap
+        self.matching_radius = matching_radius
+        self.pos_margin = pos_margin
+        self.neg_margin = neg_margin
+        self.log_scale = log_scale
+        self.overlap_threshold = overlap_threshold
+        self.min_fragment_extent = min_fragment_extent
+        self.fragment_size_softness = fragment_size_softness
+
+    def _frag_weight(self, fragments: torch.Tensor, fragment_mask: torch.Tensor) -> torch.Tensor:
+        mask = fragment_mask.to(fragments.dtype)
+        if self.min_fragment_extent <= 0.0:
+            return mask
+        extent = fragment_extent(fragments)
+        if self.fragment_size_softness > 0.0:
+            gate = torch.sigmoid((extent - self.min_fragment_extent) / self.fragment_size_softness)
+        else:
+            gate = (extent >= self.min_fragment_extent).to(fragments.dtype)
+        return mask * gate
+
+    def _circle_loss(self, output, sp_frag_canon, sp_obj, fragment_mask, frag_weight):
+        feat_f = F.normalize(output.fragment_features, dim=-1)      # (B,F,Sf,H)
+        feat_o = F.normalize(output.object_features, dim=-1)        # (B,So,H)
+        feat_dist = torch.sqrt((2.0 - 2.0 * torch.einsum("bfsh,boh->bfso", feat_f, feat_o)).clamp(min=1e-8))
+        with torch.no_grad():
+            coord_dist = torch.cdist(sp_frag_canon, sp_obj[:, None].expand(-1, sp_frag_canon.shape[1], -1, -1))
+            positive = coord_dist < self.matching_radius                       # (B,F,Sf,So)
+        pos_term = torch.where(positive, feat_dist, torch.zeros_like(feat_dist))
+        neg_term = torch.where(~positive, feat_dist, torch.full_like(feat_dist, 1e4))
+        has_pos = positive.any(dim=-1)                                         # (B,F,Sf)
+        # row-wise circle-style loss over object superpoints
+        w_pos = F.relu(pos_term - self.pos_margin).detach()
+        w_neg = F.relu(self.neg_margin - neg_term).detach()
+        l_pos = torch.logsumexp(self.log_scale * (pos_term - self.pos_margin) * w_pos + (~positive) * (-1e4), dim=-1)
+        l_neg = torch.logsumexp(self.log_scale * (self.neg_margin - neg_term) * w_neg + positive * (-1e4), dim=-1)
+        row_loss = F.softplus(l_pos + l_neg) / self.log_scale                   # (B,F,Sf)
+        row_w = has_pos.to(feat_dist.dtype) * frag_weight[:, :, None]
+        return (row_loss * row_w).sum() / row_w.sum().clamp(min=1.0)
+
+    def forward(
+        self,
+        output: PoseEstimatorOutput,
+        fragments: torch.Tensor,
+        fragment_mask: torch.Tensor,
+        reconstructed_object: torch.Tensor,
+        ground_truth_object: Optional[torch.Tensor] = None,
+        target_fragments: Optional[torch.Tensor] = None,
+        gt_rotations: Optional[torch.Tensor] = None,
+        gt_translations: Optional[torch.Tensor] = None,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        frag_weight = self._frag_weight(fragments, fragment_mask)
+
+        # Superpoint tensors carried on the output; place fragment superpoints by GT pose.
+        sp_frag = output.fragment_superpoints                       # (B,F,Sf,3)
+        sp_obj = output.object_superpoints                          # (B,So,3)
+        if gt_rotations is not None and gt_translations is not None:
+            sp_frag_canon = apply_fragment_transforms(sp_frag, gt_rotations, gt_translations)
+            coarse = self._circle_loss(output, sp_frag_canon, sp_obj, fragment_mask, frag_weight)
+            # Row-normalize the (dual-softmax, sub-stochastic) assignment so the
+            # soft-corresponded position is a proper convex combination of object
+            # points; without this the weighted mean shrinks to the origin and the
+            # aligned-point loss is biased (stuck) rather than a geometric driver.
+            assign_norm = output.assignment_matrix / output.assignment_matrix.sum(
+                dim=-1, keepdim=True
+            ).clamp(min=1e-8)
+            align = aligned_point_loss(
+                assign_norm, sp_frag, sp_obj, fragment_mask, gt_rotations, gt_translations
+            )
+            pose_loss = pose_supervised_loss(
+                output.rotations, output.translations, gt_rotations, gt_translations, fragment_mask
+            )
+        else:
+            zero = output.aligned_union.sum() * 0.0
+            coarse = zero
+            align = zero
+            pose_loss = {"loss": zero, "loss_rotation": zero.detach(),
+                         "loss_translation": zero.detach(), "rotation_error_deg": zero.detach(),
+                         "translation_error": zero.detach()}
+
+        b, num_frag, n_pts, _ = fragments.shape
+        union_mask = fragment_mask[:, :, None].expand(b, num_frag, n_pts).reshape(b, num_frag * n_pts)
+        loss_recon_cd, recon_fit, recon_coverage = masked_chamfer_distance(
+            output.aligned_union, reconstructed_object, union_mask
+        )
+        if ground_truth_object is not None:
+            loss_gt, _, _ = masked_chamfer_distance(output.aligned_union, ground_truth_object, union_mask)
+        else:
+            loss_gt = output.aligned_union.sum() * 0.0
+        overlap = overlap_loss(output.aligned_fragments, fragment_mask, self.overlap_threshold)
+
+        loss_weights = {
+            "lambda_matching": self.lambda_matching,
+            "lambda_align": self.lambda_align,
+            "lambda_pose": self.lambda_pose,
+            "lambda_recon": self.lambda_recon,
+            "lambda_coverage": self.lambda_coverage,
+            "lambda_gt": self.lambda_gt,
+            "lambda_overlap": self.lambda_overlap,
+        }
+        if weights is not None:
+            loss_weights.update({k: v for k, v in weights.items() if k in loss_weights})
+
+        total = (
+            loss_weights["lambda_matching"] * coarse
+            + loss_weights["lambda_align"] * align
+            + loss_weights["lambda_pose"] * pose_loss["loss"]
+            + loss_weights["lambda_recon"] * recon_fit
+            + loss_weights["lambda_coverage"] * recon_coverage
+            + loss_weights["lambda_gt"] * loss_gt
+            + loss_weights["lambda_overlap"] * overlap
+        )
+        zero = (output.aligned_union.sum() * 0.0).detach()
+        return {
+            "loss": total,
+            "loss_matching": coarse.detach() if torch.is_tensor(coarse) else zero,
+            "loss_recon_cd": loss_recon_cd.detach(),
+            "loss_align": align.detach() if torch.is_tensor(align) else zero,
+            "loss_pose": pose_loss["loss"].detach(),
+            "loss_recon_fit": recon_fit.detach(),
+            "loss_coverage": recon_coverage.detach(),
+            "loss_gt_cd": loss_gt.detach(),
+            "loss_overlap": overlap.detach(),
+            "loss_rotation": pose_loss["loss_rotation"],
+            "loss_translation": pose_loss["loss_translation"],
+            "rotation_error_deg": pose_loss["rotation_error_deg"],
+            "translation_error": pose_loss["translation_error"],
+            "frac_fragments_weighted": (frag_weight.sum() / fragment_mask.to(frag_weight.dtype).sum().clamp(min=1.0)).detach(),
+            # correspondence-metric placeholders for the shared log line
+            "matching_accuracy": zero,
+            "loss_correspondence": zero,
+            "correspondence_accuracy": zero,
+        }
+
+
 def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> nn.Module:
     model_cfg = cfg.get("model", {})
     enc_cfg = model_cfg.get("encoder", {})
@@ -1885,6 +2358,22 @@ def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> n
     fragment_encoder = build_token_encoder(enc_cfg)
     object_encoder = build_token_encoder(enc_cfg)
     architecture = pose_cfg.get("architecture", "target_segmentation")
+    if architecture == "geotransformer":
+        return GeoTransformerPoseEstimator(
+            fragment_encoder=fragment_encoder,
+            object_encoder=object_encoder,
+            embedding_dim=enc_cfg.get("embedding_dim", 128),
+            hidden_dim=pose_cfg.get("hidden_dim", 256),
+            num_heads=pose_cfg.get("num_heads", model_cfg.get("assembly", {}).get("transformer_heads", 4)),
+            num_blocks=pose_cfg.get("num_blocks", 3),
+            num_fragment_superpoints=pose_cfg.get("num_fragment_superpoints", 128),
+            num_object_superpoints=pose_cfg.get("num_object_superpoints", 256),
+            sigma_d=pose_cfg.get("sigma_d", 0.15),
+            sigma_a=pose_cfg.get("sigma_a", 15.0),
+            angle_k=pose_cfg.get("angle_k", 3),
+            dropout=pose_cfg.get("dropout", enc_cfg.get("dropout", 0.0)),
+            freeze_encoders=freeze_encoders,
+        )
     if architecture == "direct_regression":
         return DirectRegressionPoseEstimator(
             fragment_encoder=fragment_encoder,
@@ -1936,6 +2425,23 @@ def build_pose_loss(cfg: dict) -> nn.Module:
     loss_cfg = cfg.get("loss", {}).get("stage3", {})
     pose_cfg = cfg.get("model", {}).get("pose", {})
     architecture = pose_cfg.get("architecture", "target_segmentation")
+    if architecture == "geotransformer":
+        return GeoTransformerPoseLoss(
+            lambda_matching=loss_cfg.get("lambda_matching", 2.0),
+            lambda_align=loss_cfg.get("lambda_align", 5.0),
+            lambda_pose=loss_cfg.get("lambda_pose", 0.5),
+            lambda_recon=loss_cfg.get("lambda_recon", 1.0),
+            lambda_coverage=loss_cfg.get("lambda_coverage", 1.0),
+            lambda_gt=loss_cfg.get("lambda_gt", 0.0),
+            lambda_overlap=loss_cfg.get("lambda_overlap", 0.1),
+            matching_radius=loss_cfg.get("matching_radius", 0.04),
+            pos_margin=loss_cfg.get("circle_pos_margin", 0.1),
+            neg_margin=loss_cfg.get("circle_neg_margin", 1.4),
+            log_scale=loss_cfg.get("circle_log_scale", 24.0),
+            overlap_threshold=loss_cfg.get("overlap_threshold", 0.03),
+            min_fragment_extent=loss_cfg.get("min_fragment_extent", 0.0),
+            fragment_size_softness=loss_cfg.get("fragment_size_softness", 0.0),
+        )
     if architecture == "direct_regression":
         return DirectRegressionPoseLoss(
             lambda_pose=loss_cfg.get("lambda_pose", 8.0),

@@ -46,6 +46,7 @@ def _split_objects(
     train_split: float,
     val_split: float,
     seed: int,
+    allow_missing_categories: bool = False,
 ) -> Tuple[List[Tuple[str, str]], Dict[str, List[str]]]:
     meta_path = data_root / "metadata.json"
     if not meta_path.exists():
@@ -60,12 +61,17 @@ def _split_objects(
     rng = np.random.RandomState(seed)
     objects: List[Tuple[str, str]] = []
     by_synset: Dict[str, List[str]] = {}
+    total_by_synset: Dict[str, int] = {}
+    missing: List[str] = []
 
     for synset in categories:
         obj_ids = list(metadata.get(synset, []))
         obj_ids.sort()
         rng.shuffle(obj_ids)
         n = len(obj_ids)
+        total_by_synset[synset] = n
+        if n == 0:
+            missing.append(synset)
         n_train = int(n * train_split)
         n_val = int(n * val_split)
 
@@ -80,6 +86,21 @@ def _split_objects(
 
         by_synset[synset] = chosen
         objects.extend((synset, obj_id) for obj_id in chosen)
+
+    # Report what actually loaded, so a silently single-category dataset can't
+    # masquerade as the full 10-category config (which is what happened before).
+    print(
+        f"[data] split={split} categories loaded: "
+        + ", ".join(f"{s}:{total_by_synset[s]}" for s in categories)
+    )
+    if missing and not allow_missing_categories:
+        raise RuntimeError(
+            f"{len(missing)} of {len(categories)} configured categories are absent or "
+            f"empty in {meta_path}: {missing}. The dataset would silently train on only "
+            f"the present categories ({[s for s in categories if total_by_synset[s] > 0]}). "
+            "Re-run scripts/get_shapenet_data.py to prepare all categories, or set "
+            "data.allow_missing_categories: true to proceed with a subset intentionally."
+        )
 
     if not objects:
         raise RuntimeError(
@@ -299,6 +320,7 @@ class _ObjectBackedDataset(Dataset):
             train_split=data_cfg.get("train_split", 0.8),
             val_split=data_cfg.get("val_split", 0.1),
             seed=data_cfg.get("seed", 42),
+            allow_missing_categories=data_cfg.get("allow_missing_categories", False),
         )
 
         frag_cfg = cfg.get("fragment", {})
