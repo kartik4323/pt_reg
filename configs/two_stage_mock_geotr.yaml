@@ -97,7 +97,7 @@ loss:
     lambda_coverage: 1.0
     lambda_gt: 0.5
     lambda_overlap: 0.05
-    matching_radius: 0.08
+    matching_radius: 0.30   # mock uses So=64 -> much coarser superpoint spacing
     circle_pos_margin: 0.1
     circle_neg_margin: 1.4
     circle_log_scale: 24.0

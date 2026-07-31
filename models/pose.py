@@ -2064,6 +2064,7 @@ class GeoTransformerPoseEstimator(nn.Module):
         sigma_d: float = 0.15,
         sigma_a: float = 15.0,
         angle_k: int = 3,
+        matching_temperature: float = 0.5,
         dropout: float = 0.0,
         freeze_encoders: bool = True,
     ) -> None:
@@ -2075,6 +2076,9 @@ class GeoTransformerPoseEstimator(nn.Module):
         self.freeze_encoders = freeze_encoders
         self.num_fragment_superpoints = num_fragment_superpoints
         self.num_object_superpoints = num_object_superpoints
+        self.log_matching_temperature = nn.Parameter(
+            torch.log(torch.tensor(float(matching_temperature)))
+        )
 
         self.descriptor = SuperpointDescriptor(embedding_dim, hidden_dim)
         self.geo_embed = GeometricStructureEmbedding(hidden_dim, sigma_d, sigma_a, angle_k)
@@ -2160,13 +2164,19 @@ class GeoTransformerPoseEstimator(nn.Module):
         frag = self.frag_out(frag).reshape(b, num_frag, sf, self.hidden_dim)
         obj = self.obj_out(obj)                                                # (B, So, H)
 
-        # Coarse Gaussian-correlation matching + dual normalization -> soft assignment.
+        # Coarse dual-softmax matching with a LEARNABLE temperature.
+        # A fixed temperature cannot sharpen: at tau=0.5 over So=256 even a perfect
+        # match (cos=1) against mediocre rivals (cos=0.5) holds only ~1% of the row
+        # mass, so the soft-corresponded position collapses to the object centroid
+        # and Kabsch sees a degenerate averaged correspondence. A learnable tau lets
+        # the assignment concentrate (tau~0.05 -> ~99% on the top match).
         fn = F.normalize(frag, dim=-1)
         on = F.normalize(obj, dim=-1)
         sim = torch.einsum("bfsh,boh->bfso", fn, on)                           # cosine in [-1,1]
-        score = torch.exp(2.0 * (sim - 1.0))                                   # ~exp(-||.||^2)
-        row = score / score.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        col = score / score.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        tau = self.log_matching_temperature.exp().clamp(min=0.01, max=1.0)
+        logits = sim / tau
+        row = logits.softmax(dim=-1)                                           # over object superpoints
+        col = logits.softmax(dim=-2)                                           # over fragment superpoints
         assignment = row * col                                                 # (B,F,Sf,So)
         assignment = torch.where(fragment_mask[:, :, None, None], assignment, torch.zeros_like(assignment))
 
@@ -2266,7 +2276,15 @@ class GeoTransformerPoseLoss(nn.Module):
         l_neg = torch.logsumexp(self.log_scale * (self.neg_margin - neg_term) * w_neg + positive * (-1e4), dim=-1)
         row_loss = F.softplus(l_pos + l_neg) / self.log_scale                   # (B,F,Sf)
         row_w = has_pos.to(feat_dist.dtype) * frag_weight[:, :, None]
-        return (row_loss * row_w).sum() / row_w.sum().clamp(min=1.0)
+        loss = (row_loss * row_w).sum() / row_w.sum().clamp(min=1.0)
+        # Diagnostics: if `rows_supervised` is low the circle loss is degenerate
+        # (matching_radius too small for the superpoint spacing) and correspondence
+        # cannot learn -- exactly the failure mode that silently capped the first run.
+        with torch.no_grad():
+            valid_rows = frag_weight[:, :, None].expand_as(has_pos).to(feat_dist.dtype)
+            rows_supervised = (has_pos.to(feat_dist.dtype) * valid_rows).sum() / valid_rows.sum().clamp(min=1.0)
+            pos_per_row = (positive.to(feat_dist.dtype).sum(-1) * valid_rows).sum() / valid_rows.sum().clamp(min=1.0)
+        return loss, rows_supervised, pos_per_row
 
     def forward(
         self,
@@ -2311,7 +2329,9 @@ class GeoTransformerPoseLoss(nn.Module):
         sp_obj = output.object_superpoints                          # (B,So,3)
         if gt_rotations is not None and gt_translations is not None:
             sp_frag_canon = apply_fragment_transforms(sp_frag, gt_rotations, gt_translations)
-            coarse = self._circle_loss(output, sp_frag_canon, sp_obj, fragment_mask, frag_weight)
+            coarse, rows_sup, pos_per_row = self._circle_loss(
+                output, sp_frag_canon, sp_obj, fragment_mask, frag_weight
+            )
             # Row-normalize the (dual-softmax, sub-stochastic) assignment so the
             # soft-corresponded position is a proper convex combination of object
             # points; without this the weighted mean shrinks to the origin and the
@@ -2329,6 +2349,8 @@ class GeoTransformerPoseLoss(nn.Module):
             zero = output.aligned_union.sum() * 0.0
             coarse = zero
             align = zero
+            rows_sup = zero.detach()
+            pos_per_row = zero.detach()
             pose_loss = {"loss": zero, "loss_rotation": zero.detach(),
                          "loss_translation": zero.detach(), "rotation_error_deg": zero.detach(),
                          "translation_error": zero.detach()}
@@ -2381,6 +2403,10 @@ class GeoTransformerPoseLoss(nn.Module):
             "rotation_error_deg": pose_loss["rotation_error_deg"],
             "translation_error": pose_loss["translation_error"],
             "frac_fragments_weighted": (frag_weight.sum() / fragment_mask.to(frag_weight.dtype).sum().clamp(min=1.0)).detach(),
+            # Circle-loss health: rows_supervised near 1.0 means matching_radius is
+            # correctly scaled to the superpoint spacing; near 0 means it is inert.
+            "circle_rows_supervised": rows_sup,
+            "circle_pos_per_row": pos_per_row,
             # correspondence-metric placeholders for the shared log line
             "matching_accuracy": zero,
             "loss_correspondence": zero,
@@ -2411,6 +2437,7 @@ def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> n
             sigma_d=pose_cfg.get("sigma_d", 0.15),
             sigma_a=pose_cfg.get("sigma_a", 15.0),
             angle_k=pose_cfg.get("angle_k", 3),
+            matching_temperature=pose_cfg.get("matching_temperature", 0.5),
             dropout=pose_cfg.get("dropout", enc_cfg.get("dropout", 0.0)),
             freeze_encoders=freeze_encoders,
         )

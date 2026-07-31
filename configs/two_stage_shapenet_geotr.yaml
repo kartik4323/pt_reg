@@ -76,6 +76,12 @@ model:
     sigma_d: 0.15        # normalized-unit scale (objects are unit-normalized)
     sigma_a: 15.0
     angle_k: 3
+    # Learnable dual-softmax temperature, initialized SMOOTH. Measured: starting
+    # sharp (0.1/0.05) saturates the softmax on random init -- it commits to wrong
+    # peaks, gradients vanish and align stays pinned (rot degraded to 21 deg at
+    # 0.05). Starting at 0.5 lets the circle loss sharpen the FEATURES first; the
+    # assignment then concentrates on its own (top-1 mass rose 12x, align 0.77->0.24).
+    matching_temperature: 0.5
     dropout: 0.05
     freeze_encoders: true
 
@@ -108,7 +114,14 @@ loss:
     lambda_coverage: 1.0
     lambda_gt: 1.0
     lambda_overlap: 0.1
-    matching_radius: 0.04
+    # MUST be scaled to the SUPERPOINT spacing, not the point spacing. Measured
+    # at Sf=128/So=256 on unit-normalized objects: object superpoint spacing
+    # median 0.184; GT-placed fragment superpoint -> nearest object superpoint
+    # median 0.088. At the old 0.04 only 12% of superpoint rows had ANY positive
+    # pair, so the circle loss was inert and correspondence never learned.
+    # 0.15 -> ~97% of rows supervised with only ~1.5 positives per 256 (sparse
+    # positives, dominant negatives). Watch circle_rows_supervised in the history.
+    matching_radius: 0.15
     circle_pos_margin: 0.1
     circle_neg_margin: 1.4
     circle_log_scale: 24.0
