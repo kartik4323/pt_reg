@@ -2022,22 +2022,26 @@ class SuperpointDescriptor(nn.Module):
 
     def local_invariants(self, coords: torch.Tensor) -> torch.Tensor:
         b, n, _ = coords.shape
-        with torch.no_grad():
-            dist = torch.cdist(coords, coords)
+        # Force float32 with autocast disabled: under AMP the covariance matmul
+        # would produce a half tensor and torch.linalg.eigvalsh has no half CUDA
+        # kernel. These are detached geometric features, so precision is free.
+        with torch.no_grad(), _autocast_disabled(coords.device.type):
+            cf = coords.float()
+            dist = torch.cdist(cf, cf)
             k = min(self.local_k + 1, n)
             knn_d, knn_i = dist.topk(k=k, dim=-1, largest=False)
             nd = knn_d[..., 1:]                                    # (B,n,k-1)
             if nd.shape[-1] == 0:
-                nd = torch.zeros(b, n, 1, device=coords.device)
+                nd = torch.zeros(b, n, 1, device=cf.device, dtype=cf.dtype)
             stats = torch.stack(
                 [nd.min(-1).values, nd.mean(-1), nd.std(-1, unbiased=False), nd.max(-1).values], dim=-1
             )                                                      # (B,n,4)
-            neigh = _gather_rows(coords, knn_i[..., 1:] if knn_i.shape[-1] > 1 else knn_i)  # (B,n,kk,3)
+            neigh = _gather_rows(cf, knn_i[..., 1:] if knn_i.shape[-1] > 1 else knn_i)  # (B,n,kk,3)
             centered = neigh - neigh.mean(2, keepdim=True)
             cov = centered.transpose(-1, -2) @ centered / max(centered.shape[2], 1)
             eig = torch.linalg.eigvalsh(cov)                       # (B,n,3) ascending, >=0
             eig = eig / (eig.sum(-1, keepdim=True) + 1e-8)
-            feats = torch.cat([stats, eig], dim=-1)                # (B,n,7)
+            feats = torch.cat([stats, eig], dim=-1)                # (B,n,7) float32
         return feats
 
     def forward(self, frozen_feats: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
@@ -2117,6 +2121,18 @@ class GeoTransformerPoseEstimator(nn.Module):
         initial_translations: Optional[torch.Tensor] = None,
     ) -> PoseEstimatorOutput:
         del initial_rotations, initial_translations
+        # Superpoint matching is memory-cheap, so run the whole matcher in fp32
+        # with autocast disabled -- avoids the fp16 linalg / mixed-dtype pitfalls
+        # (eigvalsh, cdist, SVD) that AMP would otherwise introduce on CUDA.
+        with _autocast_disabled(fragments.device.type):
+            return self._forward_impl(fragments.float(), target_object.float(), fragment_mask)
+
+    def _forward_impl(
+        self,
+        fragments: torch.Tensor,
+        target_object: torch.Tensor,
+        fragment_mask: torch.Tensor,
+    ) -> PoseEstimatorOutput:
         if fragments.dim() != 4 or fragments.shape[-1] != 3:
             raise ValueError("fragments must have shape (B, F, N, 3)")
         if target_object.dim() != 3 or target_object.shape[-1] != 3:
@@ -2253,6 +2269,30 @@ class GeoTransformerPoseLoss(nn.Module):
         return (row_loss * row_w).sum() / row_w.sum().clamp(min=1.0)
 
     def forward(
+        self,
+        output: PoseEstimatorOutput,
+        fragments: torch.Tensor,
+        fragment_mask: torch.Tensor,
+        reconstructed_object: torch.Tensor,
+        ground_truth_object: Optional[torch.Tensor] = None,
+        target_fragments: Optional[torch.Tensor] = None,
+        gt_rotations: Optional[torch.Tensor] = None,
+        gt_translations: Optional[torch.Tensor] = None,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        # Match the fp32 estimator path (autocast off) to avoid mixed-dtype ops.
+        with _autocast_disabled(fragments.device.type):
+            return self._forward_impl(
+                output, fragments.float(), fragment_mask,
+                reconstructed_object.float(),
+                None if ground_truth_object is None else ground_truth_object.float(),
+                None if target_fragments is None else target_fragments.float(),
+                None if gt_rotations is None else gt_rotations.float(),
+                None if gt_translations is None else gt_translations.float(),
+                weights,
+            )
+
+    def _forward_impl(
         self,
         output: PoseEstimatorOutput,
         fragments: torch.Tensor,
