@@ -61,8 +61,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pose-mode",
         default="auto",
-        choices=["auto", "learned", "icp", "none"],
-        help="Stage 3 assembly mode. auto uses learned Stage 3 if provided, otherwise ICP.",
+        choices=["auto", "learned", "classical", "icp", "none"],
+        help=(
+            "Stage 3 assembly mode. 'classical' uses training-free FPFH+RANSAC+ICP "
+            "global registration (needs no --stage3-checkpoint; currently the most "
+            "accurate option). auto uses learned Stage 3 if a checkpoint is provided, "
+            "else classical when the config selects it, otherwise plain ICP."
+        ),
     )
     parser.add_argument("--icp-iterations", type=int, default=None)
     parser.add_argument("--prefix", default=None, help="Optional output filename prefix")
@@ -312,11 +317,18 @@ def run_one(
         "compatibility_scores": output.compatibility_scores[0].detach().cpu().numpy(),
         "fragment_mask": fragment_mask[0].detach().cpu().numpy(),
     }
-    if pose_mode == "learned":
+    if pose_mode in {"learned", "classical"}:
         if pose_model is None:
-            raise ValueError("pose_mode='learned' requires --stage3-checkpoint")
-        pose_architecture = getattr(pose_model, "__class__").__name__
-        if icp_iterations > 0 and pose_architecture != "TargetSegmentationPoseEstimator":
+            raise ValueError(f"pose_mode={pose_mode!r} requires a pose model")
+        pose_architecture = type(pose_model).__name__
+        # These architectures ignore an ICP initialization entirely.
+        no_init = {
+            "TargetSegmentationPoseEstimator",
+            "DirectRegressionPoseEstimator",
+            "GeoTransformerPoseEstimator",
+            "ClassicalRegistrationPoseEstimator",
+        }
+        if icp_iterations > 0 and pose_architecture not in no_init:
             init_rotations, init_translations, _ = differentiable_icp_initialization(
                 fragments.to(device),
                 output.point_cloud,
@@ -339,7 +351,7 @@ def run_one(
                 "translations": pose_output.translations[0].detach().cpu().numpy(),
                 "aligned_fragments": pose_output.aligned_fragments[0].detach().cpu().numpy(),
                 "aligned_union": pose_output.aligned_union[0].detach().cpu().numpy(),
-                "pose_mode": "learned",
+                "pose_mode": pose_mode,
             }
         )
     elif pose_mode == "icp":
@@ -374,10 +386,23 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     stage2_checkpoint = resolve_stage2_checkpoint(args)
     model = load_model(cfg, stage2_checkpoint, device)
+    cfg_architecture = cfg.get("model", {}).get("pose", {}).get("architecture", "target_segmentation")
     pose_mode = args.pose_mode
     if pose_mode == "auto":
-        pose_mode = "learned" if args.stage3_checkpoint is not None else "icp"
-    pose_model = load_pose_model(cfg, args.stage3_checkpoint, device) if pose_mode == "learned" else None
+        if args.stage3_checkpoint is not None:
+            pose_mode = "learned"
+        elif cfg_architecture == "classical":
+            pose_mode = "classical"
+        else:
+            pose_mode = "icp"
+    if pose_mode == "classical":
+        # Training-free: build straight from config, no checkpoint.
+        pose_model = build_pose_estimator(cfg).to(device)
+        pose_model.eval()
+    elif pose_mode == "learned":
+        pose_model = load_pose_model(cfg, args.stage3_checkpoint, device)
+    else:
+        pose_model = None
     icp_iterations = args.icp_iterations or cfg.get("stage3", {}).get("icp_iterations", 10)
 
     if args.object_point_cloud is not None:

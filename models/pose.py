@@ -2012,40 +2012,92 @@ class GeometricTransformerBlock(nn.Module):
 
 
 class SuperpointDescriptor(nn.Module):
-    """Invariant superpoint descriptor: projected frozen features + trainable local invariants."""
+    """Invariant superpoint descriptor: projected frozen features + local shape ratios.
 
-    def __init__(self, encoder_dim: int, hidden_dim: int, local_k: int = 8) -> None:
+    The local branch must be comparable ACROSS the fragment/object gap, which the
+    first version was not: it took kNN statistics among *superpoints*, and fragment
+    superpoints are packed ~1.55x denser than object superpoints (measured spacing
+    0.1195 vs 0.1851). That made the same physical surface produce features that
+    differed by 25-42%, so the contrastive matcher could never pull true pairs
+    together and its loss never descended.
+
+    Fix: describe each superpoint from its neighbourhood in the *dense* input cloud
+    and emit only SCALE-FREE ratios -- normalized covariance eigenvalues (shape) and
+    distance-distribution ratios. Ratios cancel both the metric scale and the
+    sampling-density offset, so fragment and object descriptors are comparable.
+    """
+
+    LOCAL_DIM = 5  # 2 independent normalized eigenvalues + 3 distance ratios
+
+    def __init__(
+        self,
+        encoder_dim: int,
+        hidden_dim: int,
+        local_k: int = 64,
+        local_radius: float = 0.10,
+    ) -> None:
         super().__init__()
         self.local_k = local_k
+        self.local_radius = local_radius
         self.proj_frozen = nn.Linear(encoder_dim, hidden_dim)
-        self.proj_local = nn.Linear(7, hidden_dim)  # 4 kNN dist stats + 3 covariance eigvals
+        self.proj_local = nn.Linear(self.LOCAL_DIM, hidden_dim)
 
-    def local_invariants(self, coords: torch.Tensor) -> torch.Tensor:
-        b, n, _ = coords.shape
+    def local_invariants(self, sp_coords: torch.Tensor, dense_coords: torch.Tensor) -> torch.Tensor:
+        """(B,n,3) superpoints + (B,N,3) dense cloud -> (B,n,LOCAL_DIM) scale-free feats.
+
+        The covariance is taken over a FIXED METRIC RADIUS ball (not a fixed
+        neighbour count): the two clouds have different sampling densities, so a
+        fixed-k ball would span a different physical area on each side and the
+        shape ratios would not be comparable.
+        """
         # Force float32 with autocast disabled: under AMP the covariance matmul
         # would produce a half tensor and torch.linalg.eigvalsh has no half CUDA
         # kernel. These are detached geometric features, so precision is free.
-        with torch.no_grad(), _autocast_disabled(coords.device.type):
-            cf = coords.float()
-            dist = torch.cdist(cf, cf)
-            k = min(self.local_k + 1, n)
-            knn_d, knn_i = dist.topk(k=k, dim=-1, largest=False)
-            nd = knn_d[..., 1:]                                    # (B,n,k-1)
-            if nd.shape[-1] == 0:
-                nd = torch.zeros(b, n, 1, device=cf.device, dtype=cf.dtype)
-            stats = torch.stack(
-                [nd.min(-1).values, nd.mean(-1), nd.std(-1, unbiased=False), nd.max(-1).values], dim=-1
-            )                                                      # (B,n,4)
-            neigh = _gather_rows(cf, knn_i[..., 1:] if knn_i.shape[-1] > 1 else knn_i)  # (B,n,kk,3)
-            centered = neigh - neigh.mean(2, keepdim=True)
-            cov = centered.transpose(-1, -2) @ centered / max(centered.shape[2], 1)
-            eig = torch.linalg.eigvalsh(cov)                       # (B,n,3) ascending, >=0
+        with torch.no_grad(), _autocast_disabled(sp_coords.device.type):
+            sp = sp_coords.float()
+            dense = dense_coords.float()
+            k = max(4, min(self.local_k, dense.shape[1]))
+            dist = torch.cdist(sp, dense)                          # (B,n,N)
+            knn_d, knn_i = dist.topk(k=k, dim=-1, largest=False)    # (B,n,k) ascending
+            neigh = _gather_rows(dense, knn_i)                     # (B,n,k,3)
+
+            # Fixed-radius mask; always keep the 4 nearest so the covariance is
+            # never degenerate in sparse regions.
+            w = (knn_d <= self.local_radius).to(neigh.dtype)
+            w[..., :4] = 1.0
+            wsum = w.sum(-1, keepdim=True).clamp(min=1.0)          # (B,n,1)
+            mean = (w.unsqueeze(-1) * neigh).sum(2) / wsum          # (B,n,3)
+            centered = neigh - mean.unsqueeze(2)
+            cov = torch.einsum("bnk,bnki,bnkj->bnij", w, centered, centered) / wsum.unsqueeze(-1)
+            eig = torch.linalg.eigvalsh(cov)                        # (B,n,3) ascending, >=0
             eig = eig / (eig.sum(-1, keepdim=True) + 1e-8)
-            feats = torch.cat([stats, eig], dim=-1)                # (B,n,7) float32
+            # eig sums to 1, so the smallest is redundant AND numerically noisy
+            # (it is ~0 for locally planar patches); keep the two informative ones.
+            eig = eig[..., 1:]                                     # (B,n,2)
+
+            # Distance ratios EXCLUDING the self-point: superpoints are a subset of
+            # the dense cloud, so the nearest "neighbour" is always itself at d=0.
+            nd = knn_d[..., 1:]
+            mean_d = nd.mean(-1, keepdim=True).clamp(min=1e-8)
+            ratios = torch.cat(
+                [
+                    nd.min(-1, keepdim=True).values / mean_d,
+                    nd.std(-1, unbiased=False, keepdim=True) / mean_d,
+                    nd.max(-1, keepdim=True).values / mean_d,
+                ],
+                dim=-1,
+            )                                                      # (B,n,3) scale-free
+            feats = torch.cat([eig, ratios], dim=-1)               # (B,n,5) float32
         return feats
 
-    def forward(self, frozen_feats: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        return self.proj_frozen(frozen_feats) + self.proj_local(self.local_invariants(coords))
+    def forward(
+        self,
+        frozen_feats: torch.Tensor,
+        sp_coords: torch.Tensor,
+        dense_coords: torch.Tensor,
+    ) -> torch.Tensor:
+        local = self.local_invariants(sp_coords, dense_coords)
+        return self.proj_frozen(frozen_feats) + self.proj_local(local)
 
 
 class GeoTransformerPoseEstimator(nn.Module):
@@ -2149,8 +2201,10 @@ class GeoTransformerPoseEstimator(nn.Module):
         obj_pf = self._encode(self.object_encoder, target_object)              # (B, M, C)
         sp_obj_xyz, sp_obj_feat = self._superpoints(target_object, obj_pf, self.num_object_superpoints)
 
-        desc_frag = self.descriptor(sp_frag_feat, sp_frag_xyz)                 # (B*F, Sf, H)
-        desc_obj = self.descriptor(sp_obj_feat, sp_obj_xyz)                    # (B, So, H)
+        # Dense clouds are passed so the local branch measures the same physical
+        # neighbourhood on both sides (superpoint spacing differs by ~1.55x).
+        desc_frag = self.descriptor(sp_frag_feat, sp_frag_xyz, flat)            # (B*F, Sf, H)
+        desc_obj = self.descriptor(sp_obj_feat, sp_obj_xyz, target_object)      # (B, So, H)
 
         rpe_frag = self.geo_embed(sp_frag_xyz)                                 # (B*F, Sf, Sf, H)
         rpe_obj = self.geo_embed(sp_obj_xyz)                                   # (B, So, So, H)
@@ -2414,6 +2468,101 @@ class GeoTransformerPoseLoss(nn.Module):
         }
 
 
+class ClassicalRegistrationPoseEstimator(nn.Module):
+    """Stage-3 pose via classical global registration (FPFH+RANSAC+ICP, or ICP fallback).
+
+    Training-free and non-differentiable: it holds no parameters and is meant for
+    evaluation / inference only. Measured on real ShapeNet against the GT object it
+    reaches rotation p50 ~6 deg overall (0.08 deg on large fragments), which is far
+    better than any learned Stage 3 tried here -- so it is the working default.
+
+    Exposes the same ``PoseEstimatorOutput`` contract as the learned estimators, so
+    ``run_pose_stage`` / ``infer_assembly`` need no special handling beyond building
+    it without a checkpoint.
+    """
+
+    def __init__(
+        self,
+        method: str = "auto",
+        voxel: float = 0.05,
+        icp_inits: int = 30,
+        icp_iters: int = 30,
+        icp_src_points: int = 256,
+        icp_tgt_points: int = 1024,
+    ) -> None:
+        super().__init__()
+        self.method = method
+        self.voxel = voxel
+        self.icp_inits = icp_inits
+        self.icp_iters = icp_iters
+        self.icp_src_points = icp_src_points
+        self.icp_tgt_points = icp_tgt_points
+        # No parameters: keep a dummy buffer so .to(device)/eval() behave normally.
+        self.register_buffer("_unused", torch.zeros(1), persistent=False)
+
+    # Kept for interface parity with the learned estimators (trainer calls these).
+    def freeze_pretrained(self) -> None:
+        return None
+
+    def unfreeze_pretrained(self) -> None:
+        return None
+
+    @torch.no_grad()
+    def forward(
+        self,
+        fragments: torch.Tensor,
+        target_object: torch.Tensor,
+        fragment_mask: torch.Tensor,
+        initial_rotations: Optional[torch.Tensor] = None,
+        initial_translations: Optional[torch.Tensor] = None,
+    ) -> PoseEstimatorOutput:
+        del initial_rotations, initial_translations
+        # Imported lazily: models.classical_registration imports from this module.
+        from models.classical_registration import register_fragment
+
+        if fragments.dim() != 4 or fragments.shape[-1] != 3:
+            raise ValueError("fragments must have shape (B, F, N, 3)")
+        if target_object.dim() != 3 or target_object.shape[-1] != 3:
+            raise ValueError("target_object must have shape (B, M, 3)")
+
+        b, num_frag, n_pts, _ = fragments.shape
+        device, dtype = fragments.device, fragments.dtype
+        rotations = torch.eye(3, device=device, dtype=dtype).repeat(b, num_frag, 1, 1)
+        translations = torch.zeros(b, num_frag, 3, device=device, dtype=dtype)
+
+        for bi in range(b):
+            target = target_object[bi]
+            for fi in range(num_frag):
+                if not bool(fragment_mask[bi, fi]):
+                    continue
+                rot, trans = register_fragment(
+                    fragments[bi, fi], target,
+                    method=self.method, voxel=self.voxel,
+                    icp_inits=self.icp_inits, icp_iters=self.icp_iters,
+                    icp_src_points=self.icp_src_points, icp_tgt_points=self.icp_tgt_points,
+                )
+                rotations[bi, fi] = rot.to(device=device, dtype=dtype)
+                translations[bi, fi] = trans.to(device=device, dtype=dtype)
+
+        aligned = apply_fragment_transforms(fragments, rotations, translations)
+        aligned = torch.where(fragment_mask[:, :, None, None], aligned, torch.zeros_like(aligned))
+        aligned_union = aligned.reshape(b, num_frag * n_pts, 3)
+        placeholder = fragments.new_zeros(b, num_frag, n_pts, 1)
+        feat = fragments.new_zeros(b, num_frag, n_pts, 1)
+        return PoseEstimatorOutput(
+            rotations=rotations,
+            translations=translations,
+            aligned_fragments=aligned,
+            aligned_union=aligned_union,
+            fragment_features=feat,
+            object_features=target_object.new_zeros(b, target_object.shape[1], 1),
+            refined_fragment_features=feat,
+            refined_object_features=target_object.new_zeros(b, target_object.shape[1], 1),
+            matching_logits=placeholder,
+            assignment_matrix=placeholder,
+        )
+
+
 def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> nn.Module:
     model_cfg = cfg.get("model", {})
     enc_cfg = model_cfg.get("encoder", {})
@@ -2421,9 +2570,20 @@ def build_pose_estimator(cfg: dict, freeze_encoders: Optional[bool] = None) -> n
     if freeze_encoders is None:
         freeze_encoders = pose_cfg.get("freeze_encoders", True)
 
+    architecture = pose_cfg.get("architecture", "target_segmentation")
+    if architecture == "classical":
+        # Training-free: needs no encoders and no checkpoint.
+        return ClassicalRegistrationPoseEstimator(
+            method=pose_cfg.get("classical_method", "auto"),
+            voxel=pose_cfg.get("voxel", 0.05),
+            icp_inits=pose_cfg.get("icp_inits", 30),
+            icp_iters=pose_cfg.get("icp_iters", 30),
+            icp_src_points=pose_cfg.get("icp_src_points", 256),
+            icp_tgt_points=pose_cfg.get("icp_tgt_points", 1024),
+        )
+
     fragment_encoder = build_token_encoder(enc_cfg)
     object_encoder = build_token_encoder(enc_cfg)
-    architecture = pose_cfg.get("architecture", "target_segmentation")
     if architecture == "geotransformer":
         return GeoTransformerPoseEstimator(
             fragment_encoder=fragment_encoder,

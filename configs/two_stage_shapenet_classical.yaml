@@ -1,0 +1,134 @@
+# Stage 3 = CLASSICAL global registration (FPFH + RANSAC + ICP).
+#
+# Training-free and currently the best-performing Stage 3 by a wide margin:
+# measured on real ShapeNet vs the GT object, rotation p50 ~6 deg overall
+# (0.08 deg large / 1.06 deg medium fragments), vs 82 deg for the learned matcher.
+#
+# There is NO Stage-3 training step for this architecture. Reuse the Stage 1/2
+# checkpoints and go straight to evaluation / inference:
+#   --mode stage3-gt    (register against the ground-truth object)
+#   --mode stage3-eval  (register against the Stage-2 reconstruction)
+# Comparing those two eval reports quantifies what reconstruction quality costs.
+#
+# NOTE on runtime: RANSAC costs ~seconds per fragment on CPU, so stage3.epoch_size
+# is deliberately modest (256 samples ~= 1150 fragments, which is what the
+# baseline measurement used). Raise it only if you want tighter error bars.
+
+mock_data:
+  enabled: false
+
+data:
+  shapenet_root: "./shape_processed"
+  allow_missing_categories: false
+  categories:
+    - "02691156" # airplane
+    - "02828884" # bench
+    - "02933112" # cabinet
+    - "02958343" # car
+    - "03001627" # chair
+    - "03211117" # display
+    - "03636649" # lamp
+    - "03691459" # speaker
+    - "04256520" # sofa
+    - "04379243" # table
+  num_points_per_object: 4096
+  num_points_per_fragment: 1024
+  train_split: 0.80
+  val_split: 0.10
+  test_split: 0.10
+  seed: 42
+
+fragment:
+  min_fragments: 3
+  max_fragments: 6
+  strategies: ["plane", "voronoi", "irregular"]
+  boundary_eps: 0.04
+  irregular_noise_scale: 0.05
+
+pairs:
+  positive_ratio: 0.5
+  easy_negative_ratio: 0.2
+  hard_negative_ratio: 0.2
+  perturbed_positive_ratio: 0.1
+  perturb_jitter_std: 0.03
+  perturb_anisotropic_scale: 0.12
+
+augmentation:
+  random_fragment_rotation: true
+  fragment_pose_translation: 0.7
+
+model:
+  encoder:
+    type: "se3_invariant"
+    embedding_dim: 128
+    hidden_dim: 192
+    num_tokens: 32
+    num_neighbors: 16
+    dropout: 0.05
+  compatibility:
+    hidden_dims: [256, 192]
+    edge_dim: 128
+    dropout: 0.05
+  assembly:
+    gnn_hidden_dim: 256
+    gnn_layers: 3
+    transformer_layers: 2
+    transformer_heads: 4
+    decoder_layers: 4
+    output_points: 4096
+    dropout: 0.05
+  pose:
+    architecture: "classical"
+    classical_method: "auto"   # FPFH+RANSAC when open3d is installed, else multi-init ICP
+    voxel: 0.05                # open3d voxel size (objects are unit-normalized)
+    icp_inits: 30              # fallback only
+    icp_iters: 30              # fallback only
+    icp_src_points: 256
+    icp_tgt_points: 1024
+
+loss:
+  stage1:
+    lambda_contrast: 0.5
+    temperature: 0.07
+    pos_weight: 1.0
+    lambda_boundary: 0.0
+  stage2:
+    lambda_boundary: 2.0
+    lambda_coverage: 1.0
+    lambda_dropout: 0.5
+    lambda_consistency: 0.3
+    lambda_compat: 0.1
+    boundary_weight: 2.0
+    dropout_margin: 0.01
+  stage3: {}                   # no Stage-3 loss: nothing is trained
+
+stage1:
+  epochs: 50
+  epoch_size: 20000
+  batch_size: 16
+  num_workers: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage2:
+  epochs: 80
+  epoch_size: 10000
+  batch_size: 4
+  num_workers: 4
+  learning_rate: 0.0001
+  pretrained_learning_rate: 0.00001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  freeze_pretrained: true
+  unfreeze_pretrained_epoch: 20
+
+stage3:
+  epoch_size: 256              # RANSAC is ~seconds/fragment; 256 samples ~= 1150 fragments
+  batch_size: 1
+  num_workers: 0
+  initialization_icp_iterations: 0
+  icp_iterations: 0
+
+output:
+  dir: "./outputs_classical"

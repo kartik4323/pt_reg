@@ -395,6 +395,13 @@ class Stage3PoseTrainer:
         if target_source not in {"reconstruction", "ground_truth"}:
             raise ValueError("target_source must be 'reconstruction' or 'ground_truth'")
         self.target_source = target_source
+        if cfg.get("model", {}).get("pose", {}).get("architecture") == "classical":
+            raise ValueError(
+                "model.pose.architecture='classical' is training-free (no parameters). "
+                "Skip Stage-3 training and evaluate/infer directly, e.g. "
+                "--mode stage3-gt / --mode stage3-eval, or scripts/infer_assembly.py "
+                "--pose-mode classical."
+            )
 
         # Build and load the stage-2 checkpoint on CPU first to reduce peak GPU
         # memory usage, then move the model to the target device once.
@@ -715,13 +722,18 @@ def run_pose_stage(
 
     pose_model = None
     stage_cfg = cfg.get("stage3", {})
+    architecture = cfg.get("model", {}).get("pose", {}).get("architecture", "target_segmentation")
     initialization_icp_iterations = stage_cfg.get(
         "initialization_icp_iterations",
         min(3, stage_cfg.get("icp_iterations", icp_iterations)),
     )
-    if cfg.get("model", {}).get("pose", {}).get("architecture", "target_segmentation") == "target_segmentation":
+    if architecture in {"target_segmentation", "direct_regression", "geotransformer", "classical"}:
         initialization_icp_iterations = 0
-    if stage3_checkpoint is not None:
+    if architecture == "classical":
+        # Training-free Stage 3: no checkpoint exists or is needed.
+        pose_model = build_pose_estimator(cfg).to(device)
+        pose_model.eval()
+    elif stage3_checkpoint is not None:
         pose_model = build_pose_estimator(cfg).to(device)
         pose_checkpoint = torch.load(stage3_checkpoint, map_location=device)
         state_dict = pose_checkpoint["model"] if "model" in pose_checkpoint else pose_checkpoint

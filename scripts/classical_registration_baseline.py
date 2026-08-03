@@ -37,14 +37,16 @@ import yaml
 from torch.utils.data import DataLoader
 
 from data.assembly_dataset import AssemblyObjectDataset
+from models.classical_registration import (
+    HAS_OPEN3D as _HAS_O3D,
+    chamfer as _chamfer,
+    register_fpfh,
+    register_multi_icp,
+    resolve_method,
+    subsample as _subsample,
+)
 from models.pose import apply_fragment_transforms, kabsch_align, rotation_geodesic_error
 from utils.run_artifacts import build_results_markdown, summarize_distribution
-
-try:
-    import open3d as o3d  # type: ignore
-    _HAS_O3D = True
-except Exception:  # pragma: no cover - optional dependency
-    _HAS_O3D = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,91 +72,6 @@ def parse_args() -> argparse.Namespace:
 def load_cfg(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-def _chamfer(a: torch.Tensor, b: torch.Tensor) -> float:
-    d = torch.cdist(a.unsqueeze(0), b.unsqueeze(0)).squeeze(0)
-    return float(d.min(dim=1).values.mean() + d.min(dim=0).values.mean())
-
-
-def _subsample(points: torch.Tensor, n: int) -> torch.Tensor:
-    if points.shape[0] <= n:
-        return points
-    idx = torch.randperm(points.shape[0])[:n]
-    return points[idx]
-
-
-def _icp_once(src: torch.Tensor, tgt: torch.Tensor, iters: int):
-    """Point-to-point ICP from the current frame. Returns (R, t) with aligned = src @ R.T + t."""
-    rotation = torch.eye(3, dtype=src.dtype)
-    translation = torch.zeros(3, dtype=src.dtype)
-    current = src
-    for _ in range(iters):
-        dist = torch.cdist(current, tgt)
-        matched = tgt[dist.argmin(dim=1)]
-        step_r, step_t = kabsch_align(current.unsqueeze(0), matched.unsqueeze(0))
-        step_r, step_t = step_r[0], step_t[0]
-        current = current @ step_r.transpose(-1, -2) + step_t
-        rotation = step_r @ rotation
-        translation = step_r @ translation + step_t
-    return rotation, translation, current
-
-
-def register_multi_icp(src: torch.Tensor, tgt: torch.Tensor, inits: int, iters: int):
-    """Multi-init ICP: try `inits` random initial rotations, keep lowest-Chamfer."""
-    best = None
-    best_cd = float("inf")
-    for k in range(inits):
-        if k == 0:
-            r0 = torch.eye(3, dtype=src.dtype)
-        else:
-            q = torch.randn(4)
-            q = q / q.norm()
-            w, x, y, z = q
-            r0 = torch.tensor([
-                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-            ], dtype=src.dtype)
-        src0 = src @ r0.transpose(-1, -2)
-        r_icp, t_icp, current = _icp_once(src0, tgt, iters)
-        cd = _chamfer(current, tgt)
-        if cd < best_cd:
-            best_cd = cd
-            best = (r_icp @ r0, t_icp)
-    return best[0], best[1]
-
-
-def register_fpfh(src_np: np.ndarray, tgt_np: np.ndarray, voxel: float):
-    """Open3D FPFH + RANSAC + ICP. Returns (R (3,3), t (3,)) with aligned = src @ R.T + t."""
-    src = o3d.geometry.PointCloud()
-    src.points = o3d.utility.Vector3dVector(src_np.astype(np.float64))
-    tgt = o3d.geometry.PointCloud()
-    tgt.points = o3d.utility.Vector3dVector(tgt_np.astype(np.float64))
-    src_d = src.voxel_down_sample(voxel)
-    tgt_d = tgt.voxel_down_sample(voxel)
-    normal_r = voxel * 2.0
-    feat_r = voxel * 5.0
-    for pcd in (src_d, tgt_d):
-        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=normal_r, max_nn=30))
-    src_f = o3d.pipelines.registration.compute_fpfh_feature(
-        src_d, o3d.geometry.KDTreeSearchParamHybrid(radius=feat_r, max_nn=100)
-    )
-    tgt_f = o3d.pipelines.registration.compute_fpfh_feature(
-        tgt_d, o3d.geometry.KDTreeSearchParamHybrid(radius=feat_r, max_nn=100)
-    )
-    ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        src_d, tgt_d, src_f, tgt_f, True, voxel * 1.5,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 3,
-        [o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel * 1.5)],
-        o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
-    )
-    icp = o3d.pipelines.registration.registration_icp(
-        src, tgt, voxel * 1.0, ransac.transformation,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-    )
-    m = np.asarray(icp.transformation)
-    return torch.from_numpy(m[:3, :3]).float(), torch.from_numpy(m[:3, 3]).float()
 
 
 def main() -> None:
