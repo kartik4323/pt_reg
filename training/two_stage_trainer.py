@@ -14,8 +14,9 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.assembly_dataset import AssemblyObjectDataset, CompatibilityPairDataset
+from data.assembly_dataset import build_object_dataset, build_pair_dataset
 from losses.assembly_losses import build_assembly_loss
+from losses.occupancy_losses import build_occupancy_loss, sample_occupancy_queries
 from losses.stage1_losses import build_stage1_loss
 from models.assembly import FragmentAssemblyModel, build_assembly_model
 from models.compatibility_three import Stage1CompatibilityModel, build_stage1_model
@@ -70,12 +71,7 @@ class Stage1Trainer:
             weight_decay=stage_cfg.get("weight_decay", 1.0e-4),
         )
 
-        dataset = CompatibilityPairDataset(
-            data_root=cfg["data"]["shapenet_root"],
-            split="train",
-            cfg=cfg,
-            epoch_size=stage_cfg.get("epoch_size"),
-        )
+        dataset = build_pair_dataset(cfg, "train", stage_cfg.get("epoch_size"))
         self.loader = DataLoader(
             dataset,
             batch_size=stage_cfg.get("batch_size", 8),
@@ -193,17 +189,17 @@ class Stage2Trainer:
         if freeze_pretrained:
             self.model.freeze_pretrained()
 
-        self.criterion = build_assembly_loss(cfg).to(device)
+        assembly_cfg = cfg.get("model", {}).get("assembly", {})
+        self.occupancy_mode = assembly_cfg.get("decoder", "points") == "occupancy"
+        self.occupancy_queries = int(assembly_cfg.get("occupancy_train_queries", 4096))
+        self.criterion = (
+            build_occupancy_loss(cfg) if self.occupancy_mode else build_assembly_loss(cfg)
+        ).to(device)
         stage_cfg = cfg.get("stage2", {})
         self.stage_cfg = stage_cfg
         self.freeze_pretrained = freeze_pretrained
         self.optimizer = self._build_optimizer()
-        dataset = AssemblyObjectDataset(
-            data_root=cfg["data"]["shapenet_root"],
-            split="train",
-            cfg=cfg,
-            epoch_size=stage_cfg.get("epoch_size"),
-        )
+        dataset = build_object_dataset(cfg, "train", stage_cfg.get("epoch_size"))
         self.loader = DataLoader(
             dataset,
             batch_size=stage_cfg.get("batch_size", 4),
@@ -254,13 +250,25 @@ class Stage2Trainer:
             history.append(
                 {"epoch": epoch + 1, "seconds": elapsed, "lr": _current_lrs(self.optimizer), **metrics}
             )
-            logger.log(
-                "Stage 2 "
-                f"epoch={epoch + 1}/{self.epochs} "
-                f"loss={metrics['loss']:.4f} "
-                f"cd={metrics['loss_cd']:.4f} "
-                f"cov={metrics['loss_coverage']:.4f}"
-            )
+            if self.occupancy_mode:
+                logger.log(
+                    "Stage 2 "
+                    f"epoch={epoch + 1}/{self.epochs} "
+                    f"loss={metrics['loss']:.4f} "
+                    f"bce={metrics.get('occupancy_bce', 0.0):.4f} "
+                    f"IoU={metrics.get('occupancy_iou', 0.0):.4f} "
+                    f"acc={metrics.get('occupancy_accuracy', 0.0):.4f} "
+                    f"conf={metrics.get('loss_confidence', 0.0):.4f} "
+                    f"occ_frac={metrics.get('occupancy_target_frac', 0.0):.3f}"
+                )
+            else:
+                logger.log(
+                    "Stage 2 "
+                    f"epoch={epoch + 1}/{self.epochs} "
+                    f"loss={metrics['loss']:.4f} "
+                    f"cd={metrics['loss_cd']:.4f} "
+                    f"cov={metrics['loss_coverage']:.4f}"
+                )
 
         ckpt_path = self.out_dir / "stage2_assembly.pt"
         torch.save(
@@ -312,7 +320,15 @@ class Stage2Trainer:
             batch = _move_to_device(batch, self.device)
             self.optimizer.zero_grad(set_to_none=True)
 
-            output = self.model(batch["fragments"], batch["fragment_mask"])
+            if self.occupancy_mode:
+                # Sample query points once and reuse them for the full / subset /
+                # dropout passes so the three predictions are directly comparable.
+                query_xyz, occ_labels = sample_occupancy_queries(
+                    batch["occupancy"], num_queries=self.occupancy_queries
+                )
+                output = self.model(batch["fragments"], batch["fragment_mask"], query_xyz=query_xyz)
+            else:
+                output = self.model(batch["fragments"], batch["fragment_mask"])
             with torch.no_grad():
                 if self.reference_model is not None:
                     reference_scores = self.reference_model.compatibility_scores_only(
@@ -324,26 +340,46 @@ class Stage2Trainer:
             subset_pred = None
             if self.use_subset:
                 subset_mask = self._random_subset_mask(batch["fragment_mask"])
-                subset_output = self.model(batch["fragments"], subset_mask)
-                subset_pred = subset_output.point_cloud
+                if self.occupancy_mode:
+                    subset_pred = self.model(
+                        batch["fragments"], subset_mask, query_xyz=query_xyz
+                    ).occupancy_logits
+                else:
+                    subset_pred = self.model(batch["fragments"], subset_mask).point_cloud
 
             dropout_pred = None
             if self.use_dropout:
                 dropout_mask = self._drop_one_mask(batch["fragment_mask"])
-                dropout_output = self.model(batch["fragments"], dropout_mask)
-                dropout_pred = dropout_output.point_cloud
+                if self.occupancy_mode:
+                    dropout_pred = self.model(
+                        batch["fragments"], dropout_mask, query_xyz=query_xyz
+                    ).occupancy_logits
+                else:
+                    dropout_pred = self.model(batch["fragments"], dropout_mask).point_cloud
 
-            losses = self.criterion(
-                pred=output.point_cloud,
-                target=batch["target"],
-                target_boundary=batch["target_boundary"],
-                canonical_fragments=batch["canonical_fragments"],
-                fragment_mask=batch["fragment_mask"],
-                current_scores=output.compatibility_scores,
-                reference_scores=reference_scores,
-                subset_pred=subset_pred,
-                dropout_pred=dropout_pred,
-            )
+            if self.occupancy_mode:
+                losses = self.criterion(
+                    occupancy_logits=output.occupancy_logits,
+                    occupancy_labels=occ_labels,
+                    occupancy_confidence=output.occupancy_confidence,
+                    current_scores=output.compatibility_scores,
+                    reference_scores=reference_scores,
+                    fragment_mask=batch["fragment_mask"],
+                    subset_logits=subset_pred,
+                    dropout_logits=dropout_pred,
+                )
+            else:
+                losses = self.criterion(
+                    pred=output.point_cloud,
+                    target=batch["target"],
+                    target_boundary=batch["target_boundary"],
+                    canonical_fragments=batch["canonical_fragments"],
+                    fragment_mask=batch["fragment_mask"],
+                    current_scores=output.compatibility_scores,
+                    reference_scores=reference_scores,
+                    subset_pred=subset_pred,
+                    dropout_pred=dropout_pred,
+                )
             losses["loss"].backward()
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -427,12 +463,7 @@ class Stage3PoseTrainer:
         self.use_amp = device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
-        dataset = AssemblyObjectDataset(
-            data_root=cfg["data"]["shapenet_root"],
-            split="train",
-            cfg=cfg,
-            epoch_size=self.stage_cfg.get("epoch_size", 512),
-        )
+        dataset = build_object_dataset(cfg, "train", self.stage_cfg.get("epoch_size", 512))
         self.loader = DataLoader(
             dataset,
             batch_size=self.stage_cfg.get("batch_size", 2),
@@ -740,12 +771,7 @@ def run_pose_stage(
         pose_model.load_state_dict(state_dict, strict=True)
         pose_model.eval()
 
-    dataset = AssemblyObjectDataset(
-        data_root=cfg["data"]["shapenet_root"],
-        split=split,
-        cfg=cfg,
-        epoch_size=cfg.get("stage3", {}).get("epoch_size", 8),
-    )
+    dataset = build_object_dataset(cfg, split, cfg.get("stage3", {}).get("epoch_size", 8))
     loader = DataLoader(
         dataset,
         batch_size=cfg.get("stage3", {}).get("batch_size", 2),

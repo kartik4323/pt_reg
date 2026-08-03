@@ -34,6 +34,32 @@ from utils.point_cloud_utils import (
 )
 
 
+def build_object_dataset(cfg: dict, split: str, epoch_size: Optional[int] = None) -> Dataset:
+    """Object-level dataset selected by ``data.dataset`` ('shapenet' | 'breaking_bad').
+
+    Both classes emit the same ``__getitem__`` schema, so every trainer/script works
+    against either without further branching.
+    """
+    data_cfg = cfg["data"]
+    root = data_cfg["shapenet_root"]
+    if data_cfg.get("dataset", "shapenet") == "breaking_bad":
+        from data.breaking_bad_dataset import BreakingBadAssemblyDataset
+
+        return BreakingBadAssemblyDataset(root, split, cfg, epoch_size)
+    return AssemblyObjectDataset(root, split, cfg, epoch_size)
+
+
+def build_pair_dataset(cfg: dict, split: str, epoch_size: Optional[int] = None) -> Dataset:
+    """Stage-1 pair dataset selected by ``data.dataset``."""
+    data_cfg = cfg["data"]
+    root = data_cfg["shapenet_root"]
+    if data_cfg.get("dataset", "shapenet") == "breaking_bad":
+        from data.breaking_bad_dataset import BreakingBadPairDataset
+
+        return BreakingBadPairDataset(root, split, cfg, epoch_size)
+    return CompatibilityPairDataset(root, split, cfg, epoch_size)
+
+
 def _load_point_cloud(path: Path) -> np.ndarray:
     pts = np.load(str(path)).astype(np.float32)
     return normalize_point_cloud_np(pts)
@@ -189,8 +215,11 @@ class MultiFragmentGenerator:
     ) -> None:
         if min_fragments < 2:
             raise ValueError("min_fragments must be at least 2")
-        if max_fragments >= 10:
-            raise ValueError("max_fragments must be < 10")
+        # Breaking Bad's everyday multi-part protocol goes up to 20 pieces, so the
+        # old "< 10" ceiling is gone. Cost scales as F^2 in the pairwise-edge tensor
+        # and the overlap term, so keep an eye on memory above ~20.
+        if max_fragments > 64:
+            raise ValueError("max_fragments must be <= 64")
         self.num_points_per_fragment = num_points_per_fragment
         self.num_target_points = num_target_points
         self.min_fragments = min_fragments

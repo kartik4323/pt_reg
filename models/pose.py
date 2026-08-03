@@ -853,26 +853,46 @@ def overlap_loss(
     aligned_fragments: torch.Tensor,
     fragment_mask: torch.Tensor,
     threshold: float = 0.03,
+    max_points: int = 256,
 ) -> torch.Tensor:
-    """Penalize different fragments occupying nearly identical regions."""
-    _, max_fragments, _, _ = aligned_fragments.shape
-    losses = []
-    for i in range(max_fragments):
-        for j in range(i + 1, max_fragments):
-            valid = fragment_mask[:, i] & fragment_mask[:, j]
-            if not valid.any():
-                continue
-            dist = torch.cdist(aligned_fragments[valid, i], aligned_fragments[valid, j])
-            nearest_i = dist.min(dim=2).values
-            nearest_j = dist.min(dim=1).values
-            penalty = 0.5 * (
-                F.relu(threshold - nearest_i).mean(dim=1)
-                + F.relu(threshold - nearest_j).mean(dim=1)
-            )
-            losses.append(penalty)
-    if not losses:
+    """Penalize different fragments occupying nearly identical regions.
+
+    Vectorized over fragment pairs. The previous implementation ran an O(F^2)
+    Python loop with a separate ``cdist`` per pair, which is fine at F=6 but
+    dominates runtime at Breaking Bad's F=20 (190 pairs per batch element).
+    Points are subsampled to ``max_points`` per fragment because this term only
+    needs a coarse occupancy signal, which keeps the pairwise distance tensor
+    bounded. Note the subsampling makes the loss *magnitude* smaller than the
+    full-resolution value (fewer candidate neighbours -> larger min-distances), so
+    ``lambda_overlap`` should be re-tuned rather than carried over; the term is a
+    regularizer, not a reported metric. Set ``max_points >= num_points`` to recover
+    the exact original value.
+    """
+    batch, max_fragments, num_points, _ = aligned_fragments.shape
+    if max_fragments < 2:
         return aligned_fragments.sum() * 0.0
-    return torch.cat(losses, dim=0).mean()
+
+    idx_i, idx_j = torch.triu_indices(max_fragments, max_fragments, offset=1)
+    pair_valid = fragment_mask[:, idx_i] & fragment_mask[:, idx_j]        # (B, P)
+    if not pair_valid.any():
+        return aligned_fragments.sum() * 0.0
+
+    pts = aligned_fragments
+    if num_points > max_points:
+        sel = torch.randperm(num_points, device=pts.device)[:max_points]
+        pts = pts[:, :, sel, :]
+
+    a = pts[:, idx_i]                                                    # (B, P, n, 3)
+    b = pts[:, idx_j]
+    dist = torch.cdist(a.flatten(0, 1), b.flatten(0, 1))                 # (B*P, n, n)
+    near_a = dist.min(dim=2).values
+    near_b = dist.min(dim=1).values
+    penalty = 0.5 * (
+        F.relu(threshold - near_a).mean(dim=1) + F.relu(threshold - near_b).mean(dim=1)
+    ).reshape(batch, -1)                                                 # (B, P)
+
+    weights = pair_valid.to(penalty.dtype)
+    return (penalty * weights).sum() / weights.sum().clamp(min=1.0)
 
 
 class PoseAssemblyLoss(nn.Module):

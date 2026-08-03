@@ -132,7 +132,11 @@ class RunLogger:
 # ── Distribution summaries ────────────────────────────────────────────────────
 
 def summarize_distribution(values: Sequence[float]) -> dict:
-    """mean / std / min / p50 / p90 / p95 / max over a 1-D sequence."""
+    """rmse / mean / std / min / p50 / p90 / p95 / max over a 1-D sequence.
+
+    ``rmse`` is included because the Breaking Bad benchmark reports RMSE(R)/RMSE(T)
+    rather than means; having it here means every existing report gains it for free.
+    """
     values = [float(v) for v in values]
     if not values:
         return {"count": 0}
@@ -142,6 +146,7 @@ def summarize_distribution(values: Sequence[float]) -> dict:
     ).tolist()
     return {
         "count": int(tensor.numel()),
+        "rmse": float(tensor.pow(2).mean().sqrt()),
         "mean": float(tensor.mean()),
         "std": float(tensor.std(unbiased=False)),
         "min": float(tensor.min()),

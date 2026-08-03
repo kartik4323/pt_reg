@@ -124,6 +124,121 @@ def dropout_points(pts: np.ndarray, prob: float = 0.05,
     return pts[keep]
 
 
+# ── Occupancy / voxel helpers ─────────────────────────────────────────────────
+#
+# Used for the coarse shape prior: a fixed-resolution occupancy grid over the
+# canonical [-1, 1]^3 frame. Deliberately low resolution -- the prior only has to
+# be coarsely right, so it is generated and consumed as a volume, and sampled to
+# points when a point-cloud consumer needs one.
+
+def grid_centers(resolution: int, dtype=np.float32) -> np.ndarray:
+    """Centers of an R^3 voxel grid over [-1,1]^3, shape (R^3, 3), C-order (x,y,z)."""
+    lin = ((np.arange(resolution) + 0.5) / resolution * 2.0 - 1.0).astype(dtype)
+    gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
+    return np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
+
+
+def points_to_occupancy(pts: np.ndarray, resolution: int = 32) -> np.ndarray:
+    """Rasterize points into a boolean R^3 occupancy grid over [-1,1]^3.
+
+    Surface-only (a cell is occupied iff a point falls in it). Use for shells or
+    as the fallback when a mesh is not watertight.
+    """
+    pitch = 2.0 / resolution
+    idx = np.floor((np.asarray(pts) + 1.0) / pitch).astype(np.int64)
+    keep = ((idx >= 0) & (idx < resolution)).all(axis=1)
+    grid = np.zeros((resolution,) * 3, dtype=bool)
+    idx = idx[keep]
+    if len(idx):
+        grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    return grid
+
+
+def occupancy_from_mesh(mesh, resolution: int = 32, surface_samples: int = 50000) -> np.ndarray:
+    """Solid occupancy on a fixed R^3 grid over [-1,1]^3 for a (normalized) mesh.
+
+    Uses trimesh voxelization + interior fill, which needs no ``rtree`` (unlike
+    ``mesh.contains``). Falls back to surface-point rasterization when the mesh is
+    not watertight -- common for Breaking Bad fragments.
+    """
+    import trimesh  # local import: keeps this module importable without trimesh
+
+    pitch = 2.0 / resolution
+    try:
+        vox = mesh.voxelized(pitch=pitch)
+        if getattr(mesh, "is_watertight", False):
+            try:
+                vox = vox.fill()
+            except Exception:
+                pass
+        return points_to_occupancy(np.asarray(vox.points), resolution)
+    except Exception:
+        pts, _ = trimesh.sample.sample_surface(mesh, surface_samples)
+        return points_to_occupancy(np.asarray(pts), resolution)
+
+
+def occupancy_surface(grid: np.ndarray) -> np.ndarray:
+    """Boundary cells of an occupancy grid: occupied cells with an empty 6-neighbour.
+
+    The *filled* interior of a solid grid contains no real surface, so sampling it
+    produces points that lie nowhere on the object. Anything that consumes the prior
+    as geometry -- registration, FPFH/normals, Chamfer against a surface point cloud
+    -- must use this boundary instead.
+    """
+    occ = grid.astype(bool)
+    if not occ.any():
+        return occ
+    empty_neighbour = np.zeros_like(occ)
+    for axis in range(3):
+        for shift in (-1, 1):
+            rolled = np.roll(occ, shift, axis=axis)
+            # cells rolled in from outside the volume count as empty
+            idx = [slice(None)] * 3
+            idx[axis] = 0 if shift == 1 else occ.shape[axis] - 1
+            rolled[tuple(idx)] = False
+            empty_neighbour |= ~rolled
+    return occ & empty_neighbour
+
+
+def occupancy_to_points(
+    grid: np.ndarray,
+    num_points: int,
+    jitter: bool = True,
+    surface_only: bool = True,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Sample ``num_points`` from an occupancy grid -> (num_points, 3).
+
+    This is the bridge that lets every existing point-cloud consumer (the Stage-3
+    estimators, the classical registration baseline, chamfer metrics) keep working
+    against a volumetric prior without any change.
+
+    ``surface_only=True`` (the default) samples the occupancy *boundary*, which is
+    the analogue of the object's surface and the only sensible input for
+    registration; set it False to sample the solid interior (e.g. for volumetric
+    containment scoring).
+    """
+    resolution = grid.shape[0]
+    pitch = 2.0 / resolution
+    source = occupancy_surface(grid) if surface_only else grid.astype(bool)
+    occ = np.argwhere(source)
+    if len(occ) == 0:
+        return np.zeros((num_points, 3), dtype=np.float32)
+    rng = rng or np.random.default_rng()
+    pick = rng.integers(0, len(occ), size=num_points)
+    centers = (occ[pick].astype(np.float32) + 0.5) * pitch - 1.0
+    if jitter:
+        centers = centers + rng.uniform(-0.5, 0.5, size=centers.shape).astype(np.float32) * pitch
+    return centers.astype(np.float32)
+
+
+def occupancy_iou(pred: np.ndarray, target: np.ndarray) -> float:
+    """Intersection-over-union between two boolean occupancy grids."""
+    inter = np.logical_and(pred, target).sum()
+    union = np.logical_or(pred, target).sum()
+    return float(inter / union) if union else 1.0
+
+
 # ── Plane helpers ─────────────────────────────────────────────────────────────
 
 def signed_distance_to_plane(pts: np.ndarray,
