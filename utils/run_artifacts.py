@@ -91,15 +91,15 @@ def write_manifest(
 class HistoryWriter:
     """Append-only per-epoch metrics history as JSON Lines.
 
-    Truncates any existing file on construction so each fresh run starts clean;
-    each ``append`` flushes immediately so a crashed remote run still leaves a
-    usable partial history.
+    Creates an append-only file.  Experiment runs use immutable output
+    directories, and append semantics ensure a resumed interrupted run retains
+    the metrics already flushed to disk.
     """
 
     def __init__(self, out_dir, stage: str) -> None:
         self.path = Path(out_dir) / f"{stage}_history.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("", encoding="utf-8")
+        self.path.touch(exist_ok=True)
 
     def append(self, row: dict) -> None:
         clean = {key: _jsonable(value) for key, value in row.items()}

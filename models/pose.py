@@ -1503,7 +1503,7 @@ class DirectRegressionPoseEstimator(nn.Module):
         )
 
 
-def target_segmentation_labels(
+def derive_target_segmentation_labels(
     target_object: torch.Tensor,
     target_fragments: torch.Tensor,
     fragment_mask: torch.Tensor,
@@ -1569,6 +1569,7 @@ class TargetSegmentationPoseLoss(nn.Module):
         target_fragments: Optional[torch.Tensor] = None,
         gt_rotations: Optional[torch.Tensor] = None,
         gt_translations: Optional[torch.Tensor] = None,
+        target_segmentation_labels: Optional[torch.Tensor] = None,
         weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, torch.Tensor]:
         if output.target_logits is None:
@@ -1578,12 +1579,16 @@ class TargetSegmentationPoseLoss(nn.Module):
                 raise ValueError("target_fragments or ground-truth transforms are required")
             target_fragments = apply_fragment_transforms(fragments, gt_rotations, gt_translations)
 
-        labels = target_segmentation_labels(
-            reconstructed_object,
-            target_fragments,
-            fragment_mask,
-            outlier_threshold=self.segmentation_outlier_threshold,
-        )
+        labels = target_segmentation_labels
+        if labels is None:
+            labels = derive_target_segmentation_labels(
+                reconstructed_object,
+                target_fragments,
+                fragment_mask,
+                outlier_threshold=self.segmentation_outlier_threshold,
+            )
+        elif labels.shape != output.target_logits.shape[:2]:
+            raise ValueError("target_segmentation_labels must align with the target feature cloud")
         segmentation_loss = F.cross_entropy(
             output.target_logits.reshape(-1, output.target_logits.shape[-1]),
             labels.reshape(-1),

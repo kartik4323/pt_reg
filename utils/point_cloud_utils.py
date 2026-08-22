@@ -78,6 +78,40 @@ def ensure_n_points(pts: np.ndarray, n: int) -> np.ndarray:
     return np.concatenate([pts, pts[idx]], axis=0)
 
 
+def deterministic_fps_indices(points: torch.Tensor, count: int) -> torch.Tensor:
+    """Deterministic batched farthest-point indices for ``(B,N,3)`` tensors.
+
+    The first point is the one farthest from the cloud centroid, rather than a
+    random seed.  It is therefore stable across restarts and suitable for a
+    recorded experiment protocol.  The routine is intentionally simple because
+    it runs only on Stage-3 target clouds (at most 5,000 points).
+    """
+    if points.dim() != 3 or points.shape[-1] != 3:
+        raise ValueError("points must have shape (B,N,3)")
+    batch, total, _ = points.shape
+    if count <= 0 or count >= total:
+        return torch.arange(total, device=points.device).unsqueeze(0).expand(batch, -1)
+    indices = torch.empty((batch, count), dtype=torch.long, device=points.device)
+    centroid = points.mean(dim=1, keepdim=True)
+    current = ((points - centroid).square().sum(dim=-1)).argmax(dim=1)
+    minimum_distance = torch.full((batch, total), float("inf"), device=points.device, dtype=points.dtype)
+    batch_index = torch.arange(batch, device=points.device)
+    for step in range(count):
+        indices[:, step] = current
+        selected = points[batch_index, current].unsqueeze(1)
+        distance = (points - selected).square().sum(dim=-1)
+        minimum_distance = torch.minimum(minimum_distance, distance)
+        current = minimum_distance.argmax(dim=1)
+    return indices
+
+
+def gather_points(points: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Gather batched point indices, preserving ``(B,K,3)`` layout."""
+    if points.shape[0] != indices.shape[0]:
+        raise ValueError("points and indices must have equal batch size")
+    return torch.gather(points, 1, indices[..., None].expand(-1, -1, points.shape[-1]))
+
+
 # ── Geometric transforms ──────────────────────────────────────────────────────
 
 def random_rotation_matrix() -> np.ndarray:

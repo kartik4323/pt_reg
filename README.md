@@ -17,6 +17,15 @@ An optional `type: "se3_transformer"` backend is available for experiments with
 `e3nn` and `torch-geometric`; those dependencies are intentionally not required
 for the default lightweight install.
 
+## PartNet / GPAT benchmark
+
+The research benchmark uses PartNet and the official GPAT interchange format,
+not the legacy ShapeNet generator.  It is designed for a Linux/CUDA VM and
+never downloads PartNet into this workspace.  See
+[the VM runbook](docs/PARTNET_GPAT_VM.md) for the pilot, official GPAT
+reproduction, Stage-1 ablation matrix, Stage-3 gauge-aware study, noise suite,
+and portable result-bundle commands.
+
 ## Quick Mock Run
 
 ```powershell

@@ -1,0 +1,137 @@
+# Integration-only PartNet/GPAT pilot.  Data is prepared on the GPU VM with
+# scripts/prepare_partnet_gpat.py and is intentionally ignored by git.
+mock_data:
+  enabled: false
+
+data:
+  dataset: "gpat_partnet"
+  shapenet_root: "./partnet_gpat_processed"
+  manifest: "manifest.json"
+  categories: ["chair", "lamp", "faucet", "table", "display"]
+  num_points_per_object: 5000
+  num_points_per_fragment: 1000
+  contact_threshold: 0.01
+  seed: 42
+
+fragment:
+  min_fragments: 2
+  max_fragments: 20
+
+pairs:
+  positive_ratio: 0.50
+  easy_negative_ratio: 0.25
+  hard_negative_ratio: 0.25
+
+augmentation:
+  random_fragment_rotation: true
+  fragment_pose_translation: 0.7
+
+model:
+  encoder:
+    type: "se3_invariant"
+    embedding_dim: 128
+    hidden_dim: 192
+    num_tokens: 16
+    num_neighbors: 16
+    dropout: 0.05
+  compatibility:
+    hidden_dims: [256, 192]
+    edge_dim: 128
+    dropout: 0.05
+  assembly:
+    gnn_hidden_dim: 256
+    gnn_layers: 3
+    transformer_layers: 2
+    transformer_heads: 4
+    decoder_layers: 2
+    output_points: 5000
+    dropout: 0.05
+    disable_compatibility: false
+  pose:
+    architecture: "target_segmentation"
+    hidden_dim: 256
+    num_heads: 4
+    cross_attention_layers: 2
+    transformer_layers: 2
+    dropout: 0.05
+    freeze_encoders: true
+
+loss:
+  stage1:
+    lambda_contrast: 0.5
+    temperature: 0.07
+    pos_weight: 1.0
+    lambda_boundary: 1.0
+  stage2:
+    lambda_boundary: 2.0
+    lambda_coverage: 1.0
+    lambda_dropout: 0.5
+    lambda_consistency: 0.3
+    lambda_compat: 0.1
+    boundary_weight: 2.0
+    dropout_margin: 0.01
+  stage3:
+    lambda_segmentation: 2.0
+    lambda_matching: 2.0
+    lambda_align: 5.0
+    lambda_correspondence: 1.0
+    lambda_recon: 1.0
+    lambda_coverage: 1.0
+    lambda_gt: 1.0
+    lambda_overlap: 0.1
+    lambda_pose: 2.0
+    overlap_threshold: 0.03
+    segmentation_outlier_threshold: 0.08
+
+stage1:
+  epochs: 1
+  epoch_size: 12
+  batch_size: 2
+  num_workers: 0
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+
+stage2:
+  epochs: 1
+  epoch_size: 8
+  batch_size: 1
+  num_workers: 0
+  learning_rate: 0.0001
+  pretrained_learning_rate: 0.00001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  freeze_pretrained: true
+  unfreeze_pretrained_epoch: 1
+  validation_interval: 1
+  validation_max_samples: 4
+
+stage3:
+  epochs: 1
+  epoch_size: 2
+  batch_size: 1
+  grad_accum_steps: 1
+  num_workers: 0
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  pose_only_epochs: 0
+  geometry_epochs: 0
+  initialization_icp_iterations: 0
+  target_feature_points: 512
+  geometry_loss_points: 2048
+  gauge_aware: false
+  registration_max_residual: 0.02
+  global_registration:
+    method: "auto"
+    voxel: 0.05
+    icp_inits: 8
+    icp_iterations: 12
+    source_points: 512
+    target_points: 1024
+
+evaluation:
+  max_samples: 8
+
+output:
+  dir: "./outputs_partnet_gpat_pilot"

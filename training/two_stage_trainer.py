@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import numpy as np
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -21,12 +22,16 @@ from losses.stage1_losses import build_stage1_loss
 from models.assembly import FragmentAssemblyModel, build_assembly_model
 from models.compatibility_three import Stage1CompatibilityModel, build_stage1_model
 from models.pose import (
+    apply_transform,
     build_pose_estimator,
     build_pose_loss,
     differentiable_icp_initialization,
     pose_supervised_loss,
     rotation_geodesic_error,
 )
+from models.classical_registration import register_fragment
+from utils.point_cloud_utils import deterministic_fps_indices, gather_points
+from utils.experiment_metrics import equivalent_part_pose_metrics, symmetric_chamfer
 from utils.run_artifacts import (
     HistoryWriter,
     RunLogger,
@@ -51,6 +56,100 @@ def _save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def _mean_ci95(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {"mean": float("nan"), "ci95": float("nan"), "count": 0}
+    tensor = torch.as_tensor(values, dtype=torch.float64)
+    ci = 0.0 if len(tensor) < 2 else float(1.96 * tensor.std(unbiased=True) / math.sqrt(len(tensor)))
+    return {"mean": float(tensor.mean()), "ci95": ci, "count": int(len(tensor))}
+
+
+def _subsample_points(points: torch.Tensor, count: int) -> torch.Tensor:
+    """Deterministic FPS used by the memory-bounded Stage-3 protocol."""
+    if count <= 0 or points.shape[1] <= count:
+        return points
+    return gather_points(points, deterministic_fps_indices(points, count))
+
+
+def _subsample_indices(points: torch.Tensor, count: int) -> Optional[torch.Tensor]:
+    if count <= 0 or points.shape[1] <= count:
+        return None
+    return deterministic_fps_indices(points, count)
+
+
+@torch.no_grad()
+def estimate_reconstruction_to_gt_frame(
+    reconstruction: torch.Tensor,
+    ground_truth: torch.Tensor,
+    *,
+    method: str = "auto",
+    voxel: float = 0.05,
+    icp_inits: int = 8,
+    icp_iterations: int = 12,
+    source_points: int = 512,
+    target_points: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Register a Stage-2 target to GT, returning ``G: reconstruction -> GT``.
+
+    Registration is intentionally detached: it establishes a coordinate gauge
+    for supervision, not a path through which Stage 3 can optimise Stage 2.
+    The existing FPFH+RANSAC implementation is used when Open3D is available;
+    otherwise its multi-start ICP fallback is used.
+    """
+    rotations, translations, residuals = [], [], []
+    for source, target in zip(reconstruction, ground_truth):
+        try:
+            rotation, translation = register_fragment(
+                source,
+                target,
+                method=method,
+                voxel=voxel,
+                icp_inits=icp_inits,
+                icp_iters=icp_iterations,
+                icp_src_points=source_points,
+                icp_tgt_points=target_points,
+            )
+            rotation = rotation.to(reconstruction.device, reconstruction.dtype)
+            translation = translation.to(reconstruction.device, reconstruction.dtype)
+            aligned = apply_transform(source.unsqueeze(0), rotation.unsqueeze(0), translation.unsqueeze(0))[0]
+            # Symmetric mean Euclidean Chamfer in the normalised object frame.
+            dist = torch.cdist(aligned.unsqueeze(0), target.unsqueeze(0))[0]
+            residual = 0.5 * (dist.min(dim=1).values.mean() + dist.min(dim=0).values.mean())
+        except Exception:
+            rotation = torch.eye(3, device=reconstruction.device, dtype=reconstruction.dtype)
+            translation = torch.zeros(3, device=reconstruction.device, dtype=reconstruction.dtype)
+            residual = torch.tensor(float("inf"), device=reconstruction.device, dtype=reconstruction.dtype)
+        rotations.append(rotation)
+        translations.append(translation)
+        residuals.append(residual)
+    return torch.stack(rotations), torch.stack(translations), torch.stack(residuals)
+
+
+def labels_in_reconstruction_frame(
+    canonical_fragments: torch.Tensor,
+    gt_rotations: torch.Tensor,
+    gt_translations: torch.Tensor,
+    reconstruction_to_gt_rotation: torch.Tensor,
+    reconstruction_to_gt_translation: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Express every GT-derived label in Stage 2's target coordinate frame.
+
+    If ``x_gt = R_g x_recon + t_g``, then canonical points and poses are
+    transformed by ``G^-1`` before they are compared to a reconstructed target.
+    This fixes the gauge error where an otherwise correct global Stage-2 pose
+    produced contradictory segmentation, correspondence, and RT supervision.
+    """
+    r_global = reconstruction_to_gt_rotation
+    t_global = reconstruction_to_gt_translation
+    r_inverse = r_global.transpose(-1, -2)
+    t_inverse = -torch.einsum("bd,bdc->bc", t_global, r_global)
+    canonical = torch.einsum("bfnd,bdc->bfnc", canonical_fragments, r_global)
+    canonical = canonical + t_inverse[:, None, None, :]
+    rotations = r_inverse[:, None] @ gt_rotations
+    translations = torch.einsum("bfd,bdc->bfc", gt_translations - t_global[:, None, :], r_global)
+    return canonical, rotations, translations
 
 
 class Stage1Trainer:
@@ -212,6 +311,9 @@ class Stage2Trainer:
         self.use_subset = cfg.get("loss", {}).get("stage2", {}).get("lambda_consistency", 0.0) > 0
         self.use_dropout = cfg.get("loss", {}).get("stage2", {}).get("lambda_dropout", 0.0) > 0
         self.unfreeze_epoch = stage_cfg.get("unfreeze_pretrained_epoch")
+        requested_validation = int(stage_cfg.get("validation_max_samples", 0))
+        self.validation_dataset = build_object_dataset(cfg, "val", requested_validation or None)
+        self.validation_interval = max(1, int(stage_cfg.get("validation_interval", 1)))
 
     def load_stage1(self, checkpoint_path: str) -> None:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -234,6 +336,8 @@ class Stage2Trainer:
             },
         )
         metrics: Dict[str, float] = {}
+        best_validation = float("inf")
+        validation_history: List[dict] = []
         for epoch in range(self.epochs):
             if (
                 self.freeze_pretrained
@@ -247,6 +351,26 @@ class Stage2Trainer:
             start = time.perf_counter()
             metrics = self._train_epoch(epoch)
             elapsed = time.perf_counter() - start
+            if (epoch + 1) % self.validation_interval == 0 or epoch + 1 == self.epochs:
+                from utils.experiment_metrics import evaluate_stage2
+
+                validation = evaluate_stage2(
+                    self.model, self.validation_dataset, self.device, batch_size=1
+                )
+                validation_score = validation["aligned_reconstruction_chamfer"]
+                validation_history.append({"epoch": epoch + 1, **validation})
+                metrics["val_aligned_reconstruction_chamfer"] = validation_score
+                if validation_score < best_validation:
+                    best_validation = validation_score
+                    torch.save(
+                        {
+                            "model": self.model.state_dict(),
+                            "metrics": metrics,
+                            "validation": validation,
+                            "cfg": self.cfg,
+                        },
+                        self.out_dir / "stage2_best_validation.pt",
+                    )
             history.append(
                 {"epoch": epoch + 1, "seconds": elapsed, "lr": _current_lrs(self.optimizer), **metrics}
             )
@@ -280,6 +404,14 @@ class Stage2Trainer:
             ckpt_path,
         )
         _save_json(self.out_dir / "stage2_metrics.json", metrics)
+        _save_json(
+            self.out_dir / "stage2_validation.json",
+            {
+                "selection_metric": "aligned_reconstruction_chamfer",
+                "best": best_validation,
+                "history": validation_history,
+            },
+        )
         build_results_markdown(self.out_dir)
         return ckpt_path
 
@@ -477,6 +609,12 @@ class Stage3PoseTrainer:
         # batch_size=1 (memory-bound by the dense object attention) while still
         # taking optimizer steps over several fragments' worth of gradient.
         self.grad_accum_steps = max(1, int(self.stage_cfg.get("grad_accum_steps", 1)))
+        self.target_feature_points = int(self.stage_cfg.get("target_feature_points", 0))
+        self.geometry_loss_points = int(self.stage_cfg.get("geometry_loss_points", 0))
+        self.gauge_aware = bool(self.stage_cfg.get("gauge_aware", False))
+        self.registration_max_residual = float(self.stage_cfg.get("registration_max_residual", 0.02))
+        self.registration_cfg = self.stage_cfg.get("global_registration", {})
+        self.registration_records: List[dict] = []
         self.initialization_icp_iterations = self.stage_cfg.get(
             "initialization_icp_iterations",
             min(3, self.stage_cfg.get("icp_iterations", 3)),
@@ -513,6 +651,9 @@ class Stage3PoseTrainer:
                 "target_source": self.target_source,
                 "freeze_reconstruction": self.freeze_reconstruction,
                 "pose_architecture": self.cfg.get("model", {}).get("pose", {}).get("architecture"),
+                "target_feature_points": self.target_feature_points,
+                "geometry_loss_points": self.geometry_loss_points,
+                "gauge_aware": self.gauge_aware,
             },
         )
         metrics: Dict[str, float] = {}
@@ -544,6 +685,12 @@ class Stage3PoseTrainer:
                 f"trans={metrics.get('translation_error', 0.0):.4f} "
                 f"overlap={metrics.get('loss_overlap', 0.0):.4f}"
             )
+            if self.registration_records:
+                diagnostics_path = self.out_dir / "stage3_registration_diagnostics.jsonl"
+                with open(diagnostics_path, "a", encoding="utf-8") as handle:
+                    for record in self.registration_records:
+                        handle.write(json.dumps(record) + "\n")
+                self.registration_records.clear()
 
         ckpt_name = "stage3_pose_gt_target.pt" if self.target_source == "ground_truth" else "stage3_pose.pt"
         ckpt_path = self.out_dir / ckpt_name
@@ -599,9 +746,83 @@ class Stage3PoseTrainer:
                     ).point_cloud
 
                 if self.target_source == "ground_truth":
-                    target_object = batch["target"]
+                    target_object_full = batch["target"]
                 else:
-                    target_object = reconstruction
+                    target_object_full = reconstruction
+                target_indices = _subsample_indices(target_object_full, self.target_feature_points)
+                target_object = target_object_full if target_indices is None else gather_points(target_object_full, target_indices)
+
+                target_fragments = batch["canonical_fragments"]
+                gt_rotations = batch["align_rotations"]
+                gt_translations = batch["align_translations"]
+                target_segmentation_labels = None
+                if self.target_source == "ground_truth" and "target_labels" in batch:
+                    target_segmentation_labels = batch["target_labels"]
+                    if target_indices is not None:
+                        target_segmentation_labels = torch.gather(target_segmentation_labels, 1, target_indices)
+                ground_truth_for_loss = batch["target"]
+                loss_weights = self._loss_weights_for_epoch(epoch)
+                registration_residual = target_object.new_zeros(target_object.shape[0])
+                registration_reliable = torch.ones_like(registration_residual, dtype=torch.bool)
+                if self.target_source == "reconstruction" and self.gauge_aware:
+                    global_rotation, global_translation, registration_residual = estimate_reconstruction_to_gt_frame(
+                        reconstruction.detach(),
+                        batch["target"].detach(),
+                        method=self.registration_cfg.get("method", "auto"),
+                        voxel=float(self.registration_cfg.get("voxel", 0.05)),
+                        icp_inits=int(self.registration_cfg.get("icp_inits", 8)),
+                        icp_iterations=int(self.registration_cfg.get("icp_iterations", 12)),
+                        source_points=int(self.registration_cfg.get("source_points", 512)),
+                        target_points=int(self.registration_cfg.get("target_points", 1024)),
+                    )
+                    target_fragments, gt_rotations, gt_translations = labels_in_reconstruction_frame(
+                        batch["canonical_fragments"],
+                        batch["align_rotations"],
+                        batch["align_translations"],
+                        global_rotation,
+                        global_translation,
+                    )
+                    # Reconstructed target points have no index-preserving
+                    # correspondence to GPAT's target cloud.  The loss derives
+                    # their labels from the gauge-transformed canonical parts,
+                    # which is the correctly transformed dense supervision.
+                    target_segmentation_labels = None
+                    inverse_rotation = global_rotation.transpose(-1, -2)
+                    inverse_translation = -torch.einsum(
+                        "bd,bdc->bc", global_translation, global_rotation
+                    )
+                    ground_truth_for_loss = apply_transform(
+                        batch["target"], inverse_rotation, inverse_translation
+                    )
+                    registration_reliable = registration_residual <= self.registration_max_residual
+                    object_ids = batch.get("object_id", [f"batch_{batch_idx}_{idx}" for idx in range(target_object.shape[0])])
+                    for record_idx, object_id in enumerate(object_ids):
+                        self.registration_records.append(
+                            {
+                                "epoch": epoch + 1,
+                                "object_id": str(object_id),
+                                "rotation": global_rotation[record_idx].detach().float().cpu().tolist(),
+                                "translation": global_translation[record_idx].detach().float().cpu().tolist(),
+                                "residual": float(registration_residual[record_idx].detach().cpu()),
+                                "reliable": bool(registration_reliable[record_idx].detach().cpu()),
+                                "threshold": self.registration_max_residual,
+                            }
+                        )
+                    # With batch size 1 (the enforced 24-GB configuration), a
+                    # failed registration must not inject invalid GT labels. The
+                    # reconstruction-frame geometry terms continue training.
+                    if not bool(registration_reliable.all()):
+                        loss_weights = dict(loss_weights)
+                        loss_weights.update(
+                            {
+                                "lambda_matching": 0.0,
+                                "lambda_segmentation": 0.0,
+                                "lambda_pose": 0.0,
+                                "lambda_correspondence": 0.0,
+                                "lambda_align": 0.0,
+                                "lambda_gt": 0.0,
+                            }
+                        )
 
                 if self.initialization_icp_iterations > 0:
                     init_rotations, init_translations, _ = differentiable_icp_initialization(
@@ -621,17 +842,23 @@ class Stage3PoseTrainer:
                     initial_rotations=init_rotations,
                     initial_translations=init_translations,
                 )
-                losses = self.criterion(
+                criterion_kwargs = dict(
                     output=output,
                     fragments=batch["fragments"],
                     fragment_mask=batch["fragment_mask"],
                     reconstructed_object=target_object.detach() if self.freeze_reconstruction else target_object,
-                    ground_truth_object=batch["target"],
-                    target_fragments=batch["canonical_fragments"],
-                    gt_rotations=batch["align_rotations"],
-                    gt_translations=batch["align_translations"],
-                    weights=self._loss_weights_for_epoch(epoch),
+                    ground_truth_object=_subsample_points(ground_truth_for_loss, self.geometry_loss_points),
+                    target_fragments=target_fragments,
+                    gt_rotations=gt_rotations,
+                    gt_translations=gt_translations,
+                    weights=loss_weights,
                 )
+                if target_segmentation_labels is not None and self.cfg.get("model", {}).get("pose", {}).get("architecture", "target_segmentation") == "target_segmentation":
+                    criterion_kwargs["target_segmentation_labels"] = target_segmentation_labels
+                losses = self.criterion(**criterion_kwargs)
+
+            losses["registration_residual"] = registration_residual.mean().detach()
+            losses["registration_reliable_frac"] = registration_reliable.to(target_object.dtype).mean().detach()
 
             # Scale the loss so accumulated gradients average over the micro-batches.
             loss = losses["loss"] / accum
@@ -742,10 +969,16 @@ def run_pose_stage(
     split: str = "test",
     icp_iterations: int = 5,
     target_source: str = "reconstruction",
+    prediction_dir: Optional[Path] = None,
 ) -> Dict[str, float]:
-    """Evaluate Stage 3 learned pose estimation, or ICP if no pose checkpoint is supplied."""
-    if target_source not in {"reconstruction", "ground_truth"}:
-        raise ValueError("target_source must be 'reconstruction' or 'ground_truth'")
+    """Evaluate a Stage-3 checkpoint in GT, raw-reconstruction, or oracle frame.
+
+    ``oracle_reconstruction`` only changes the *test target* by registering the
+    Stage-2 cloud to the PartNet target.  It is never used for training and
+    therefore separates target fidelity from global-frame ambiguity.
+    """
+    if target_source not in {"reconstruction", "ground_truth", "oracle_reconstruction"}:
+        raise ValueError("target_source must be reconstruction, ground_truth, or oracle_reconstruction")
     model = build_assembly_model(cfg).to(device)
     checkpoint = torch.load(stage2_checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -771,7 +1004,8 @@ def run_pose_stage(
         pose_model.load_state_dict(state_dict, strict=True)
         pose_model.eval()
 
-    dataset = build_object_dataset(cfg, split, cfg.get("stage3", {}).get("epoch_size", 8))
+    requested = cfg.get("evaluation", {}).get("max_samples", 0)
+    dataset = build_object_dataset(cfg, split, requested or None)
     loader = DataLoader(
         dataset,
         batch_size=cfg.get("stage3", {}).get("batch_size", 2),
@@ -783,10 +1017,67 @@ def run_pose_stage(
     steps = 0
     rot_deg_all: List[float] = []
     trans_all: List[float] = []
+    global_rot_deg_all: List[float] = []
+    global_trans_all: List[float] = []
+    equivalent_rot_deg_all: List[float] = []
+    equivalent_trans_all: List[float] = []
+    part_chamfers: List[float] = []
+    successes: List[float] = []
+    target_chamfers: List[float] = []
+    gt_chamfers: List[float] = []
+    registrations: List[float] = []
+    saved_predictions: List[dict] = []
+    if prediction_dir is not None:
+        prediction_dir.mkdir(parents=True, exist_ok=True)
     for batch in tqdm(loader, desc="Stage3 pose", leave=False):
         batch = _move_to_device(batch, device)
         output = model(batch["fragments"], batch["fragment_mask"])
-        target_object = batch["target"] if target_source == "ground_truth" else output.point_cloud
+        batch_size = batch["fragments"].shape[0]
+        global_rotation = torch.eye(3, device=device, dtype=output.point_cloud.dtype)[None].repeat(batch_size, 1, 1)
+        global_translation = torch.zeros(batch_size, 3, device=device, dtype=output.point_cloud.dtype)
+        prediction_to_gt_rotation = global_rotation
+        prediction_to_gt_translation = global_translation
+        registration_residual = torch.zeros(batch_size, device=device, dtype=output.point_cloud.dtype)
+        if target_source == "ground_truth":
+            target_object = batch["target"]
+            expected_rotations = batch["align_rotations"]
+            expected_translations = batch["align_translations"]
+        else:
+            if target_source == "oracle_reconstruction":
+                global_rotation, global_translation, registration_residual = estimate_reconstruction_to_gt_frame(
+                    output.point_cloud,
+                    batch["target"],
+                    method=stage_cfg.get("global_registration", {}).get("method", "auto"),
+                    voxel=float(stage_cfg.get("global_registration", {}).get("voxel", 0.05)),
+                    icp_inits=int(stage_cfg.get("global_registration", {}).get("icp_inits", 8)),
+                    icp_iterations=int(stage_cfg.get("global_registration", {}).get("icp_iterations", 12)),
+                    source_points=int(stage_cfg.get("global_registration", {}).get("source_points", 512)),
+                    target_points=int(stage_cfg.get("global_registration", {}).get("target_points", 1024)),
+                )
+                target_object = apply_transform(output.point_cloud, global_rotation, global_translation)
+                expected_rotations = batch["align_rotations"]
+                expected_translations = batch["align_translations"]
+            else:
+                target_object = output.point_cloud
+                global_rotation, global_translation, registration_residual = estimate_reconstruction_to_gt_frame(
+                    output.point_cloud,
+                    batch["target"],
+                    method=stage_cfg.get("global_registration", {}).get("method", "auto"),
+                    voxel=float(stage_cfg.get("global_registration", {}).get("voxel", 0.05)),
+                    icp_inits=int(stage_cfg.get("global_registration", {}).get("icp_inits", 8)),
+                    icp_iterations=int(stage_cfg.get("global_registration", {}).get("icp_iterations", 12)),
+                    source_points=int(stage_cfg.get("global_registration", {}).get("source_points", 512)),
+                    target_points=int(stage_cfg.get("global_registration", {}).get("target_points", 1024)),
+                )
+                _, expected_rotations, expected_translations = labels_in_reconstruction_frame(
+                    batch["canonical_fragments"],
+                    batch["align_rotations"],
+                    batch["align_translations"],
+                    global_rotation,
+                    global_translation,
+                )
+                prediction_to_gt_rotation = global_rotation
+                prediction_to_gt_translation = global_translation
         if pose_model is not None:
             if initialization_icp_iterations > 0:
                 init_rotations, init_translations, _ = differentiable_icp_initialization(
@@ -814,6 +1105,9 @@ def run_pose_stage(
                 batch["fragment_mask"],
                 iterations=icp_iterations,
             )
+        # "Raw" preserves the historical target-frame comparison.  For a raw
+        # Stage-2 target it exposes global-frame error; the global metric below
+        # composes the oracle transform before comparing to PartNet GT.
         losses = pose_supervised_loss(
             rotations,
             translations,
@@ -824,6 +1118,46 @@ def run_pose_stage(
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
         steps += 1
+
+        global_rotations = prediction_to_gt_rotation[:, None] @ rotations
+        global_translations = torch.einsum("bfd,bcd->bfc", translations, prediction_to_gt_rotation) + prediction_to_gt_translation[:, None, :]
+        global_losses = pose_supervised_loss(
+            global_rotations,
+            global_translations,
+            batch["align_rotations"],
+            batch["align_translations"],
+            batch["fragment_mask"],
+        )
+        for key, value in global_losses.items():
+            totals[f"global_{key}"] = totals.get(f"global_{key}", 0.0) + float(value.detach().cpu())
+        # Place each predicted fragment in the PartNet frame for an invariant
+        # object-level comparison.  ``pose_output`` is available for learned
+        # methods; ICP falls back to the explicitly transformed fragments.
+        aligned_fragments = (
+            pose_output.aligned_fragments
+            if pose_model is not None
+            else torch.einsum("bfnd,bfcd->bfnc", batch["fragments"], rotations) + translations[:, :, None, :]
+        )
+        aligned_union = aligned_fragments.reshape(batch_size, -1, 3)
+        target_chamfers.extend(symmetric_chamfer(aligned_union, target_object).detach().cpu().tolist())
+        aligned_union_global = apply_transform(
+            aligned_union,
+            prediction_to_gt_rotation,
+            prediction_to_gt_translation,
+        )
+        gt_chamfers.extend(symmetric_chamfer(aligned_union_global, batch["target"]).detach().cpu().tolist())
+
+        equivalent = equivalent_part_pose_metrics(
+            batch["fragments"], rotations, translations,
+            expected_rotations, expected_translations,
+            batch.get("equivalence_classes", torch.arange(rotations.shape[1], device=device)[None].expand(batch_size, -1)),
+            batch["fragment_mask"],
+        )
+        part_chamfers.extend(equivalent["part_chamfers"])
+        equivalent_rot_deg_all.extend(equivalent["rotation_degrees"])
+        equivalent_trans_all.extend(equivalent["translation_errors"])
+        successes.append(float(equivalent["assembly_success_rate"]))
+        registrations.extend(registration_residual.detach().cpu().tolist())
 
         # Per-fragment errors over the valid fragments, for distribution stats.
         mask = batch["fragment_mask"].reshape(-1).bool()
@@ -837,6 +1171,33 @@ def run_pose_stage(
         ).reshape(-1)
         rot_deg_all.extend(rot_deg[mask].detach().cpu().tolist())
         trans_all.extend(trans[mask].detach().cpu().tolist())
+        global_rot_deg = (
+            rotation_geodesic_error(global_rotations, batch["align_rotations"]).reshape(-1)
+            * 180.0 / math.pi
+        )
+        global_trans = torch.linalg.vector_norm(
+            global_translations - batch["align_translations"], dim=-1
+        ).reshape(-1)
+        global_rot_deg_all.extend(global_rot_deg[mask].detach().cpu().tolist())
+        global_trans_all.extend(global_trans[mask].detach().cpu().tolist())
+
+        if prediction_dir is not None:
+            object_ids = batch.get("object_id", [str(steps)] * batch_size)
+            for item_idx, object_id in enumerate(object_ids):
+                safe_id = str(object_id).replace("/", "_").replace("\\", "_")
+                file_name = f"{safe_id}_{steps}_{item_idx}.npz"
+                np.savez_compressed(
+                    prediction_dir / file_name,
+                    object_id=np.asarray(str(object_id)),
+                    rotations=rotations[item_idx].detach().cpu().numpy(),
+                    translations=translations[item_idx].detach().cpu().numpy(),
+                    aligned_fragments=aligned_fragments[item_idx].detach().cpu().numpy(),
+                    target=target_object[item_idx].detach().cpu().numpy(),
+                    registration_rotation=global_rotation[item_idx].detach().cpu().numpy(),
+                    registration_translation=global_translation[item_idx].detach().cpu().numpy(),
+                    registration_residual=np.asarray(float(registration_residual[item_idx].cpu())),
+                )
+                saved_predictions.append({"object_id": str(object_id), "file": file_name, "registration_residual": float(registration_residual[item_idx].cpu())})
 
     metrics = {key: value / max(steps, 1) for key, value in totals.items()}
     out_dir = Path(cfg["output"]["dir"])
@@ -853,6 +1214,25 @@ def run_pose_stage(
         "means": metrics,
         "rotation_error_deg": summarize_distribution(rot_deg_all),
         "translation_error": summarize_distribution(trans_all),
+        "global_rotation_error_deg": summarize_distribution(global_rot_deg_all),
+        "global_translation_error": summarize_distribution(global_trans_all),
+        "equivalent_part_rotation_error_deg": summarize_distribution(equivalent_rot_deg_all),
+        "equivalent_part_translation_error": summarize_distribution(equivalent_trans_all),
+        "gpat_compatible_chamfer": summarize_distribution(target_chamfers),
+        "gt_frame_chamfer": summarize_distribution(gt_chamfers),
+        "part_accuracy_at_0.01": float(sum(value <= 0.01 for value in part_chamfers) / max(1, len(part_chamfers))),
+        "assembly_success_rate": float(sum(successes) / max(1, len(successes))),
+        "registration_residual": summarize_distribution(registrations),
+        "registration_exclusion_rate": float(sum(value > float(stage_cfg.get("registration_max_residual", 0.02)) for value in registrations) / max(1, len(registrations))),
+        "confidence_intervals": {
+            "gpat_compatible_chamfer": _mean_ci95(target_chamfers),
+            "gt_frame_chamfer": _mean_ci95(gt_chamfers),
+            "part_accuracy_at_0.01": _mean_ci95([float(value <= 0.01) for value in part_chamfers]),
+            "assembly_success_rate": _mean_ci95(successes),
+            "global_rotation_error_deg": _mean_ci95(global_rot_deg_all),
+            "global_translation_error": _mean_ci95(global_trans_all),
+        },
+        "predictions": saved_predictions,
     }
     _save_json(out_dir / f"stage3_eval_{target_source}.json", report)
     build_results_markdown(out_dir)

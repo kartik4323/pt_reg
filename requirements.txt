@@ -5,6 +5,7 @@ tqdm
 trimesh
 huggingface_hub
 matplotlib
+zstandard>=0.22
 # Optional (visualization only): install open3d for the richer viewer in
 # scripts/visualize_inference.py; it falls back to matplotlib if open3d is absent.
 # open3d

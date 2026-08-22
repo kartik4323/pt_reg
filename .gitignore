@@ -39,6 +39,12 @@ Thumbs.db
 # Dataset downloads and generated ShapeNet point clouds
 downloads/
 shape_processed/
+partnet_raw/
+partnet_meta/
+partnet_gpat_processed/
+partnet-pilot-v1/
+partnet-full/
+*.tar.zst
 
 # Training outputs, checkpoints, and experiment trackers
 outputs/

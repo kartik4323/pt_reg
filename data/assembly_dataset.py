@@ -35,7 +35,7 @@ from utils.point_cloud_utils import (
 
 
 def build_object_dataset(cfg: dict, split: str, epoch_size: Optional[int] = None) -> Dataset:
-    """Object-level dataset selected by ``data.dataset`` ('shapenet' | 'breaking_bad').
+    """Object-level dataset selected by ``data.dataset``.
 
     Both classes emit the same ``__getitem__`` schema, so every trainer/script works
     against either without further branching.
@@ -46,6 +46,10 @@ def build_object_dataset(cfg: dict, split: str, epoch_size: Optional[int] = None
         from data.breaking_bad_dataset import BreakingBadAssemblyDataset
 
         return BreakingBadAssemblyDataset(root, split, cfg, epoch_size)
+    if data_cfg.get("dataset") == "gpat_partnet":
+        from data.gpat_partnet_dataset import GpatPartNetAssemblyDataset
+
+        return GpatPartNetAssemblyDataset(root, split, cfg, epoch_size)
     return AssemblyObjectDataset(root, split, cfg, epoch_size)
 
 
@@ -57,6 +61,10 @@ def build_pair_dataset(cfg: dict, split: str, epoch_size: Optional[int] = None) 
         from data.breaking_bad_dataset import BreakingBadPairDataset
 
         return BreakingBadPairDataset(root, split, cfg, epoch_size)
+    if data_cfg.get("dataset") == "gpat_partnet":
+        from data.gpat_partnet_dataset import GpatPartNetPairDataset
+
+        return GpatPartNetPairDataset(root, split, cfg, epoch_size)
     return CompatibilityPairDataset(root, split, cfg, epoch_size)
 
 

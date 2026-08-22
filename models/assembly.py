@@ -294,6 +294,7 @@ class FragmentAssemblyModel(nn.Module):
         decoder: str = "points",
         occupancy_resolution: int = 32,
         occupancy_num_freqs: int = 6,
+        disable_compatibility: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -301,6 +302,11 @@ class FragmentAssemblyModel(nn.Module):
         self.num_tokens = num_tokens
         self.embedding_dim = embedding_dim
         self.edge_dim = edge_dim
+        # An explicit architecture ablation.  Keeping the modules in the state
+        # dict makes checkpoints load-compatible, while the forward path below
+        # proves that no compatibility score, edge embedding, or GNN message is
+        # consumed when this switch is enabled.
+        self.disable_compatibility = bool(disable_compatibility)
         self.interaction_fusion = nn.Sequential(
             nn.Linear(embedding_dim + edge_dim, gnn_hidden_dim),
             nn.LayerNorm(gnn_hidden_dim),
@@ -414,13 +420,23 @@ class FragmentAssemblyModel(nn.Module):
             flat, batch_size, max_fragments
         )
 
-        scores, edges = self._pairwise_compatibility(embeddings, fragment_mask)
-        interaction_features = self._aggregate_interactions(edges, scores, fragment_mask)
-        fused_features = self.interaction_fusion(
-            torch.cat([embeddings, interaction_features], dim=-1)
-        )
-        fused_features = torch.where(fragment_mask.unsqueeze(-1), fused_features, embeddings)
-        node_features = self.gnn(fused_features, edges, scores, fragment_mask)
+        if self.disable_compatibility:
+            scores = embeddings.new_zeros(batch_size, max_fragments, max_fragments)
+            edges = embeddings.new_zeros(batch_size, max_fragments, max_fragments, self.edge_dim)
+            interaction_features = embeddings.new_zeros(batch_size, max_fragments, self.edge_dim)
+            # Do not pass zero tensors through trainable compatibility fusion or
+            # GNN layers: that would still let their biases carry graph-path
+            # information in the supposedly disabled condition.
+            fused_features = embeddings
+            node_features = embeddings
+        else:
+            scores, edges = self._pairwise_compatibility(embeddings, fragment_mask)
+            interaction_features = self._aggregate_interactions(edges, scores, fragment_mask)
+            fused_features = self.interaction_fusion(
+                torch.cat([embeddings, interaction_features], dim=-1)
+            )
+            fused_features = torch.where(fragment_mask.unsqueeze(-1), fused_features, embeddings)
+            node_features = self.gnn(fused_features, edges, scores, fragment_mask)
         refined = self.refinement(
             node_features,
             src_key_padding_mask=~fragment_mask,
@@ -612,4 +628,5 @@ def build_assembly_model(cfg: dict) -> FragmentAssemblyModel:
         decoder=assembly_cfg.get("decoder", "points"),
         occupancy_resolution=assembly_cfg.get("occupancy_resolution", 32),
         occupancy_num_freqs=assembly_cfg.get("occupancy_num_freqs", 6),
+        disable_compatibility=assembly_cfg.get("disable_compatibility", False),
     )
