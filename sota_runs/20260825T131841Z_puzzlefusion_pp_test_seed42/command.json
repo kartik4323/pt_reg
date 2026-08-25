@@ -1,0 +1,17 @@
+{
+  "commands": [
+    [
+      "conda",
+      "run",
+      "--no-capture-output",
+      "-n",
+      "sota-puzzlefusion-pp",
+      "python",
+      "test.py",
+      "denoiser.ckpt_path=C:\\Users\\KARTIK PANDEY\\OneDrive\\Desktop\\fragment_compact\\pt_reg\\denoiser.ckpt",
+      "verifier.ckpt_path=C:\\Users\\KARTIK PANDEY\\OneDrive\\Desktop\\fragment_compact\\pt_reg\\verifier.ckpt"
+    ]
+  ],
+  "cwd": "C:\\Users\\KARTIK PANDEY\\OneDrive\\Desktop\\fragment_compact\\pt_reg\\sota_repro\\models\\puzzlefusion_pp\\upstream",
+  "native_view": null
+}

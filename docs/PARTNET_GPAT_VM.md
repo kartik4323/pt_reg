@@ -7,14 +7,14 @@ The raw archive remains under `$DATA_ROOT` and run bundles exclude it.
 ## 1. Set up isolated environments
 
 ```bash
-export OUR_ROOT=/path/to/fragment_compact/pt_reg
-export GPAT_ROOT=/path/to/gpat                 # untouched official clone
-export DATA_ROOT=/mnt/partnet_data
-export RUN_ROOT=/mnt/partnet_runs
+export OUR_ROOT="$HOME/Kartik_23CS30026/pt_reg"
+export GPAT_ROOT="$HOME/Kartik_23CS30026/gpat"  # untouched official clone
+export DATA_ROOT="$HOME/Kartik_23CS30026/partnet_data"
+export RUN_ROOT="$HOME/Kartik_23CS30026/partnet_runs"
 
 cd "$OUR_ROOT"
-conda env create -f env.yml -n fragment-assembly
-conda activate fragment-assembly
+# You are already using this environment.
+conda activate kartik_pt_env
 pip install -r requirements.txt
 # Recommended for robust FPFH + ICP gauge registration:
 pip install open3d
@@ -23,7 +23,44 @@ git clone https://github.com/real-stanford/gpat "$GPAT_ROOT"
 cd "$GPAT_ROOT"
 conda env create -f environment.yml -n gpat
 conda activate gpat
-pip install -e .
+# The current official repository is not an installable Python package.
+# Keep its root on the import path instead.
+export PYTHONPATH="$GPAT_ROOT:${PYTHONPATH:-}"
+# Prefer the cuBLAS shipped by the Conda environment over a system CUDA copy.
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# PyTorch3D has no remaining pre-built wheel for Python 3.6 / Torch 1.10 / CUDA
+# 11.1.  Build the pinned release from source.  GPAT itself uses its transforms.
+conda install -y -c conda-forge ninja
+pip install --no-build-isolation --no-cache-dir fvcore
+pip install --no-build-isolation --no-cache-dir \
+  "git+https://github.com/facebookresearch/pytorch3d.git@v0.6.2"
+# GPAT's unpinned environment can otherwise resolve a recent trimesh that
+# requires numpy.typing (absent from the required NumPy 1.19 / Python 3.6).
+pip install --no-cache-dir "trimesh==3.9.29"
+# Keep TensorBoard and its flags dependency compatible with Python 3.6.
+pip install --no-cache-dir "tensorboard==2.6.0" "absl-py==0.15.0"
+# v0.6.2's datatypes module has a Python-3.7-only typing guard, although its
+# stated requirements include Python 3.6.  This changes only the fallback
+# typing helpers; it does not alter the GPAT checkout or PyTorch3D algorithms.
+python - <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.prefix) / "lib" / "python3.6" / "site-packages" / "pytorch3d" / "common" / "datatypes.py"
+old = 'else:\n    raise ImportError("This module requires Python 3.7+")\n'
+new = '''else:
+    def get_origin(cls):
+        return getattr(cls, "__origin__", None)
+
+    def get_args(cls):
+        return getattr(cls, "__args__", None)
+'''
+text = path.read_text()
+if text.count(old) != 1:
+    raise RuntimeError(f"Unexpected PyTorch3D datatypes.py contents: {path}")
+path.write_text(text.replace(old, new))
+PY
+python -c "import torch, pytorch3d; from pytorch3d import transforms; print('PyTorch3D OK:', torch.__version__, torch.version.cuda, pytorch3d.__version__)"
 cd utils/chamfer && python setup.py install
 cd ../pointops && python setup.py install
 ```
@@ -34,10 +71,40 @@ Git revision and complete command output separately from this project.
 ## 2. Obtain and prepare PartNet on the VM
 
 Request PartNet v0 access with the ShapeNet account required by the PartNet
-portal, then place the downloaded archive and metadata only here:
+portal.  The official GPAT preprocessor iterates the public splits, so it
+needs the complete PartNet v0 *annotation* archive.  Download only the
+`data_v0_chunk` archive and its ten split volumes: GPAT does not need the
+semantic- or instance-segmentation HDF5 archives.
 
 ```bash
-mkdir -p "$DATA_ROOT/partnet_raw" "$DATA_ROOT/partnet_meta"
+pip install -U huggingface_hub
+hf auth login
+hf download --repo-type dataset ShapeNet/PartNet-archive \
+  --include "data_v0_chunk.*" \
+  --local-dir "$DATA_ROOT/PartNet-archive"
+
+# Reassemble the split zip and extract it only on the VM.  The result must
+# contain $DATA_ROOT/partnet_extracted/data_v0/<numeric-id>/result_after_merging.json.
+zip -s 0 "$DATA_ROOT/PartNet-archive/data_v0_chunk.zip" \
+  --out "$DATA_ROOT/data_v0.zip"
+mkdir -p "$DATA_ROOT/partnet_extracted"
+unzip -q "$DATA_ROOT/data_v0.zip" -d "$DATA_ROOT/partnet_extracted"
+find "$DATA_ROOT/partnet_extracted" -maxdepth 3 \
+  -name result_after_merging.json -print -quit
+```
+
+The existing `$DATA_ROOT/partnet_raw` directory is deliberately replaced only
+when it is confirmed empty.  This keeps GPAT's expected numeric-ID layout
+without moving or duplicating the raw data:
+
+```bash
+mkdir -p "$DATA_ROOT/partnet_raw"
+[ -z "$(find "$DATA_ROOT/partnet_raw" -mindepth 1 -print -quit)" ] \
+  || { echo "partnet_raw is not empty; inspect it before changing it"; exit 1; }
+rmdir "$DATA_ROOT/partnet_raw"
+ln -s "$DATA_ROOT/partnet_extracted/data_v0" "$DATA_ROOT/partnet_raw"
+# This provides stats/after_merging_label_ids/*-hier.txt required by GPAT.
+git clone https://github.com/daerduoCarey/partnet_dataset.git "$DATA_ROOT/partnet_meta"
 ln -s "$DATA_ROOT/partnet_raw" "$GPAT_ROOT/dataset/partnet_raw"
 ln -s "$DATA_ROOT/partnet_meta" "$GPAT_ROOT/dataset/partnet_dataset"
 cd "$GPAT_ROOT"
@@ -55,7 +122,7 @@ Prepare a portable *processed* pilot without copying raw data into the repo:
 
 ```bash
 cd "$OUR_ROOT"
-conda activate fragment-assembly
+conda activate kartik_pt_env
 python scripts/prepare_partnet_gpat.py \
   --raw-root "$DATA_ROOT/partnet_raw" \
   --metadata-root "$DATA_ROOT/partnet_meta" \
@@ -90,7 +157,7 @@ choice in `stage3_preflight.json` and the resolved config.
 
 ```bash
 cd "$OUR_ROOT"
-conda activate fragment-assembly
+conda activate kartik_pt_env
 
 python scripts/run_experiment.py --suite pilot \
   --config configs/partnet_gpat_pilot.yaml \

@@ -1,0 +1,161 @@
+version: 1
+audit_date: "2026-08-25"
+models:
+  jigsaw:
+    source_status: released
+    tracks: [breaking_bad]
+    repository: https://github.com/Jiaxin-Lu/Jigsaw.git
+    revision: 41713e196f1b6b294913665945cd22240127c80b
+    paper: "Jigsaw: Learning to Assemble Multiple Fractured Objects (NeurIPS 2023)"
+    license: MIT
+    checkpoint_url: https://drive.google.com/drive/folders/1HtrKEnpSTY87uis_i63Pas9P2xOiyOOW?usp=sharing
+    environment: {manager: conda, name: sota-jigsaw, python: "3.8", cuda: "11.0", file: environment.yaml}
+    config_template: experiments/jigsaw_250e_cosine.yaml
+    commands:
+      setup: [[conda, env, create, -f, "{source}/environment.yaml", -n, "{env}"]]
+      train: [[python, train_matching.py, --cfg, "{config}"]]
+      test: [[python, eval_matching.py, --cfg, "{config}"]]
+      smoke: [[python, train_matching.py, --help]]
+  diffassemble:
+    source_status: released
+    tracks: [breaking_bad]
+    repository: https://github.com/IIT-PAVIS/DiffAssemble.git
+    revision: 256df64d4e5465e690b5b84e6024c60e21c3f3c8
+    paper: "DiffAssemble: A Unified Graph-Diffusion Model for 2D and 3D Reassembly (CVPR 2024)"
+    license: Apache-2.0
+    checkpoint_url: null
+    checkpoint_note: "No official checkpoint link was verified; use a checkpoint produced by the native Lightning run."
+    environment: {manager: conda, name: sota-diffassemble, python: "3.9", cuda: "11.3", file: singularity/build/conda_env.yaml}
+    resume_args: {train: [--checkpoint_path, "{resume}"]}
+    commands:
+      setup: [[conda, env, create, -f, "{source}/singularity/build/conda_env.yaml", -n, "{env}"]]
+      train: [[python, puzzle_diff/train_3d.py, --gpus, 1, --min_num_part, 2, --max_num_part, 20]]
+      test: [[python, puzzle_diff/train_3d.py, --gpus, 1, --min_num_part, 2, --max_num_part, 20, --evaluate, "True", --checkpoint_path, "{checkpoint}"]]
+      smoke: [[python, puzzle_diff/train_3d.py, --help]]
+  ccs:
+    source_status: released
+    tracks: [breaking_bad, partnet]
+    repository: https://github.com/Ruiyuan-Zhang/CCS.git
+    revision: bf286c93e758bcc5ac2b5a782944d267f89a5e4b
+    paper: "Scalable Geometric Fracture Assembly via Co-creation Space among Assemblers (AAAI 2024)"
+    license: MIT
+    checkpoint_url: null
+    checkpoint_note: "The official README documents --weight; retain checkpoints emitted by scripts/train.py."
+    environment: {manager: conda, name: sota-ccs, python: "3.8", cuda: "11.3"}
+    config_template: configs/wx_transformer/wx_transformer/topk/partnet/FF-top10-partnet_chair.py
+    resume_args: {train: [--weight, "{resume}"]}
+    commands:
+      setup:
+        - [conda, create, -y, -n, "{env}", python=3.8.5]
+        - [conda, install, -y, -n, "{env}", pytorch=1.10, torchvision, torchaudio, cudatoolkit=11.3, -c, pytorch]
+        - [conda, install, -y, -n, "{env}", pytorch-lightning=1.6.2]
+        - [conda, install, -y, -n, "{env}", -c, fvcore, -c, iopath, -c, conda-forge, fvcore, iopath]
+        - [conda, run, -n, "{env}", python, -m, pip, install, --no-index, --no-cache-dir, pytorch3d, -f, https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py38_cu113_pyt1110/download.html]
+        - [conda, run, -n, "{env}", python, -m, pip, install, setuptools==59.5.0, setproctitle, trimesh, wandb, scipy, pyntcloud, matplotlib, ninja]
+        - [conda, run, -n, "{env}", python, -m, pip, install, -e, .]
+        - [conda, run, -n, "{env}", python, -m, pip, install, -e, multi_part_assembly/utils/chamfer]
+        - [conda, run, -n, "{env}", python, -m, pip, install, -e, multi_part_assembly/models/modules/encoder/pointnet2/pointnet2_ops_lib]
+      train: [[python, scripts/train.py, --project_name, "{run_name}", --gpus, "{gpu}", --cfg_file, "{config}"]]
+      test: [[python, scripts/test.py, --gpus, "{gpu}", --cfg_file, "{config}"]]
+      smoke: [[python, scripts/train.py, --help]]
+  pmtr:
+    source_status: released
+    tracks: [breaking_bad]
+    repository: https://github.com/NahyukLEE/pmtr.git
+    revision: 9dd3379ff4bc15069052d0949a15237d2161fba1
+    paper: "3D Geometric Shape Assembly via Efficient Point Cloud Matching (ICML 2024)"
+    license: research-only
+    checkpoint_url: https://drive.google.com/drive/folders/1N7uXu0xR1O9cpPnJTP7d6susR6hDj5nn?usp=sharing
+    environment: {manager: conda, name: sota-pmtr, python: "3.8", cuda: "11.1", torch: "1.10.1"}
+    resume_args: {train: [--load, "{resume}"]}
+    commands:
+      setup:
+        - [conda, create, -y, -n, "{env}", python=3.8]
+        - [conda, run, -n, "{env}", python, -m, pip, install, torch==1.10.1+cu111, torchvision==0.11.2+cu111, torchaudio==0.10.1, -f, https://download.pytorch.org/whl/cu111/torch_stable.html]
+        - [conda, run, -n, "{env}", python, -m, pip, install, pytorch-lightning==1.9, einops, trimesh, wandb, open3d, gtsam]
+        - [conda, run, -n, "{env}", python, setup.py, build, install]
+        - [conda, run, -n, "{env}", python, -m, pip, install, "git+https://github.com/KinglittleQ/torch-batch-svd"]
+        - [conda, run, -n, "{env}", python, -m, pip, install, "git+https://github.com/otaheri/chamfer_distance"]
+        - [conda, run, -n, "{env}", python, -m, pip, install, "git+https://github.com/facebookresearch/pytorch3d.git@stable"]
+      train: [[python, main.py, --datapath, "{data}/breaking_bad", --data_category, "{data_category}", --fine_matcher, pmt, --logpath, "{run_name}", --mpa]]
+      test: [[python, test_mpa.py, --datapath, "{data}/breaking_bad", --data_category, "{data_category}", --fine_matcher, pmt, --load, "{checkpoint}"]]
+      smoke: [[python, main.py, --help]]
+  puzzlefusion_pp:
+    source_status: released
+    tracks: [breaking_bad]
+    repository: https://github.com/eric-zqwang/puzzlefusion-plusplus.git
+    revision: 7eedadb1198bbc908c19689837c8b3590af689d0
+    paper: "PuzzleFusion++: Auto-agglomerative 3D Fracture Assembly by Denoise and Verify (ICLR 2025)"
+    license: GPL-3.0-research-only
+    checkpoint_url: https://drive.google.com/file/d/1oj2t7nwRJMizGveBANR21ssF4o3TNJ8Q/view?usp=sharing
+    environment: {manager: conda, name: sota-puzzlefusion-pp, python: "3.10", cuda: "11.8"}
+    commands:
+      setup: [[conda, create, -y, -n, "{env}", python=3.10], [conda, run, -n, "{env}", python, -m, pip, install, -r, requirements.txt]]
+      train:
+        - [python, generate_pc_data.py, "data.mesh_data_dir={data}/breaking_bad", "+data.save_pc_data_path={data}/pc_data/everyday"]
+        - [python, train_vqvae.py, "data.data_dir={data}/pc_data/everyday/train/", "data.data_val_dir={data}/pc_data/everyday/val/"]
+        - [python, train_denoiser.py, "data.data_dir={data}/pc_data/everyday/train/", "data.data_val_dir={data}/pc_data/everyday/val/"]
+        - [python, train_verifier.py, "data.verifier_data_path={data}/verifier_data/"]
+      test: [[python, test.py, "denoiser.ckpt_path={checkpoint}", "verifier.ckpt_path={verifier_checkpoint}", "denoiser.data.data_dir={data}/pc_data/everyday/train/", "denoiser.data.data_val_dir={data}/pc_data/everyday/val/", "denoiser.data.matching_data_path={data}/matching_data/"]]
+      smoke: [[python, test.py, --help]]
+  garf:
+    source_status: released
+    tracks: [breaking_bad]
+    repository: https://github.com/ai4ce/GARF.git
+    revision: 2d489c0b7b58de8af774aa1657c86c638e4744c2
+    paper: "GARF: Learning Generalizable 3D Reassembly for Real-World Fractures (ICCV 2025)"
+    license: GPL-3.0
+    checkpoint_url: https://drive.google.com/file/d/1dBc7QRjOXIuYm-ssZo59vSlMD29xF5eM/view?usp=drive_link
+    environment: {manager: uv, name: sota-garf, python: "3.12.3", cuda: "12.8", torch: "2.8.0"}
+    resume_args: {train: ["ckpt_path={resume}"]}
+    commands:
+      setup: [[uv, sync], [uv, sync, --extra, post]]
+      train: [[python, train.py, "experiment=denoiser_flow_matching", "data.data_root={data}"]]
+      test: [[python, eval.py, "data.data_root={data}", "ckpt_path={checkpoint}"]]
+      smoke: [[python, eval.py, --help]]
+  cmnet:
+    source_status: released
+    tracks: [breaking_bad]
+    repository: https://github.com/NahyukLEE/cmnet.git
+    revision: e548417cb99924bc294e8a1dae2d59a9453acd29
+    paper: "Combinative Matching for Geometric Shape Assembly (ICCV 2025)"
+    license: research-only
+    checkpoint_url: https://drive.google.com/drive/folders/1nxX5dAAH2ijyPqTAWJ2E7Sn-DuMiBflt?usp=share_link
+    environment: {manager: conda, name: sota-cmnet, python: "3.8", cuda: "11.1", torch: "1.10.1"}
+    resume_args: {train: [--load, "{resume}"]}
+    commands:
+      setup:
+        - [conda, create, -y, -n, "{env}", python=3.8]
+        - [conda, run, -n, "{env}", python, -m, pip, install, torch==1.10.1+cu111, torchvision==0.11.2+cu111, torchaudio==0.10.1, -f, https://download.pytorch.org/whl/cu111/torch_stable.html]
+        - [conda, run, -n, "{env}", python, -m, pip, install, pytorch-lightning==1.9, einops, trimesh, wandb, open3d, gtsam]
+        - [conda, run, -n, "{env}", python, -m, pip, install, "git+https://github.com/KinglittleQ/torch-batch-svd"]
+        - [conda, run, -n, "{env}", python, -m, pip, install, "git+https://github.com/otaheri/chamfer_distance"]
+        - [conda, run, -n, "{env}", python, -m, pip, install, "git+https://github.com/facebookresearch/pytorch3d.git@stable"]
+        - [conda, run, -n, "{env}", python, lib/pointops/setup.py, install]
+      train: [[python, main.py, --datapath, "{data}/breaking_bad", --data_category, "{data_category}", --logpath, "{run_name}", --mpa]]
+      test: [[python, multi_part_assembly.py, --datapath, "{data}/breaking_bad", --data_category, "{data_category}", --load, "{checkpoint}"]]
+      smoke: [[python, main.py, --help]]
+  gpat:
+    source_status: released
+    tracks: [partnet]
+    repository: https://github.com/real-stanford/gpat.git
+    revision: 42809f6ba058c42cdb13e798b17b3f393a22967d
+    paper: "Rearrangement Planning for General Part Assembly (CoRL 2023)"
+    license: MIT
+    checkpoint_url: https://drive.google.com/file/d/1VO6JP2SlAmul6Q4Bmw0SlPwoHt0tZ_el/view?usp=share_link
+    environment: {manager: conda, name: sota-gpat, python: "3.6", cuda: "11.1", file: environment.yml}
+    commands:
+      setup: [[conda, env, create, -f, "{source}/environment.yml", -n, "{env}"], [conda, run, -n, "{env}", python, -m, pip, install, -e, .]]
+      train: [[python, learning/gpat/run.py, --mode=train, --ratio=0.7, --rand, "--exp={run_name}", "--cuda={gpu}"]]
+      test: [[python, learning/assembler.py, --eval, "--cat={category}", "--exp={run_name}", "--cuda={gpu}"]]
+      smoke: [[python, learning/assembler.py, --help]]
+  jigsaw_pp:
+    source_status: unavailable
+    tracks: [breaking_bad, partnet]
+    paper: "Jigsaw++: Imagining Complete Shape Priors for Object Reassembly (ICCV 2025)"
+    audit_note: "Paper located; no maintained official source verified during 2026-08-25 audit."
+  fragmentdiff:
+    source_status: unavailable
+    tracks: [breaking_bad]
+    paper: "FragmentDiff: A Diffusion Model for Fractured Object Assembly (SIGGRAPH Asia 2024)"
+    audit_note: "Paper located; no maintained official source verified during 2026-08-25 audit."

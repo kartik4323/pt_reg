@@ -1,0 +1,25 @@
+version: common_v1
+seed: 42
+retained_cap_gib: 20
+tracks:
+  breaking_bad_everyday:
+    cap_gib: 13
+    subset: everyday
+    allowed_splits: [train, val]
+    min_parts: 2
+    max_parts: 20
+    category_balanced: true
+  breaking_bad_artifact:
+    cap_gib: 3
+    subset: artifact
+    allowed_splits: [val]
+    min_parts: 2
+    max_parts: 20
+    category_balanced: false
+  partnet_gpat:
+    cap_gib: 4
+    seen_categories: [chair, lamp, faucet]
+    unseen_categories: [table, display]
+    min_parts: 2
+    max_parts: 20
+convention: row_vector_xprime_eq_x_at_R_transpose_plus_t
