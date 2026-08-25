@@ -108,6 +108,7 @@ class SuiteTests(unittest.TestCase):
             scratch = root / "scratch"
             materialize_breaking_bad(manifest_path, compressed, official, output, scratch, subsets=("everyday",))
             self.assertTrue((output / "breaking_bad_everyday" / relative).is_dir())
+            self.assertTrue((output / "common_v1_manifest.json").is_file())
             self.assertFalse((output / "breaking_bad_everyday" / "everyday" / "Bottle" / "skipped").exists())
             self.assertEqual(list(scratch.iterdir()), [])
 

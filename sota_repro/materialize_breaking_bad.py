@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .subset import _hash_tree
-from .utils import copytree_or_link, read_json, require_relative, safe_rmtree
+from .utils import byte_size, copytree_or_link, read_json, require_relative, safe_rmtree, write_json
 
 
 def _selected_objects(manifest: dict, subset: str) -> tuple[set[str], list[dict]]:
@@ -104,6 +104,16 @@ def materialize_breaking_bad(
                 safe_rmtree(stage / f"{subset}_compressed", stage)
         if not dry_run and (stage / "data_split").exists():
             copytree_or_link(stage / "data_split", output / "data_split", link=False)
+        if not dry_run:
+            # Keep the selected-only manifest beside the retained data.  Model
+            # runners use it for split lists and immutable run provenance.
+            retained_manifest = dict(manifest)
+            retained_manifest["sources"] = {"materialized_root": str(output)}
+            retained_manifest["materialized_bytes"] = byte_size(output)
+            cap = retained_manifest.get("retained_cap_bytes")
+            if cap is not None and retained_manifest["materialized_bytes"] > int(cap):
+                raise RuntimeError("Materialized corpus exceeds configured retained-data cap")
+            write_json(output / "common_v1_manifest.json", retained_manifest)
         return {"output": str(output), "copied_bytes": copied, "stage": str(stage)}
     finally:
         if not keep_staging:

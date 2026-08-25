@@ -15,6 +15,8 @@ python -m sota_repro test --model cmnet --track breaking_bad_artifact --data-roo
 
 Each `models/<model>/` directory contains a source clone created by `bootstrap`, non-invasive configuration/output folders, and direct `setup_env.sh`, `smoke.sh`, `train.sh`, and `test.sh` wrappers. See [data instructions](docs/DATA.md) before downloading data.
 
+Without the gated PartNet archive, add `--without-partnet` to `data plan` and run the seven Breaking Bad models only; GPAT is unavailable for that Breaking Bad-only protocol.
+
 Native data views are created in scratch per model and removed automatically after model execution. Each train, test, or smoke command runs from a per-run source copy under its immutable run directory, so native log/checkpoint/cache behavior cannot alter the pinned `upstream/` clone. Use `--keep-native-view` only when debugging a native loader.
 
 See [the audited model list](docs/MODELS.md) for model-specific native entry points and checkpoint guidance. After native evaluation, normalize its transform export before scoring:

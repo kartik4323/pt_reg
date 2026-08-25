@@ -37,11 +37,24 @@ python -m sota_repro data breaking-bad-materialize \
 
 `--python` must be the authors' Python 3.8 decompressor environment (NumPy, SciPy, tqdm, libigl, and gpytoolbox). The official decompressor supports `--subset everyday --category CATEGORY`; the suite supplies one category at a time. Once `data materialize` has copied the selected PartNet records and verified the 20 GiB cap, remove `$SOTA_SCRATCH/breaking_bad` archives and temporary raw expansion. The source manifest reports exact object IDs and pattern IDs, source content hashes, split, byte count, and preprocessing version; retain it with results.
 
+`breaking-bad-materialize` writes the verified selected-only manifest to `$SOTA_DATA_ROOT/common_v1_manifest.json`; do not replace it with the pre-materialization source manifest.
+
 ## PartNet / GPAT
 
 PartNet is gated. Accept its license using the required ShapeNet account, authenticate with Hugging Face, download the PartNet v0 annotation archive into scratch, and run the official GPAT preprocessor there. Follow `../docs/PARTNET_GPAT_VM.md` for the compatible Python 3.6/Torch 1.10/PyTorch3D environment.
 
 After preprocessing, pass the generated `dataset/partnet` directory to `sota_repro data plan`. The selected GPAT point clouds retain `parts.npy`, `target.npy`, `poses.npy`, labels, and equivalence classes. Delete the raw archive and unselected preprocessed tree once materialization verifies the 20 GiB retained-data cap.
+
+### Breaking Bad-only option (no PartNet archive)
+
+If the gated PartNet v0 archive cannot be staged, create a manifest for the seven Breaking Bad models only. This deliberately excludes GPAT and is labelled `common_v1_breaking_bad_only` in the output so it cannot be mistaken for the full two-track protocol:
+
+```bash
+python -m sota_repro data plan \
+  --breaking-bad-root "$SOTA_SCRATCH/breaking_bad" \
+  --without-partnet \
+  --output "$SOTA_SCRATCH/breaking_bad_only_source_manifest.json"
+```
 
 ## Native views
 

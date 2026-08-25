@@ -62,7 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     data_sub = data.add_subparsers(dest="data_command", required=True)
     plan = data_sub.add_parser("plan")
     plan.add_argument("--breaking-bad-root", required=True)
-    plan.add_argument("--partnet-gpat-root", required=True)
+    plan.add_argument("--partnet-gpat-root",
+                      help="GPAT-preprocessed PartNet root. Required unless --without-partnet is used.")
+    plan.add_argument("--without-partnet", action="store_true",
+                      help="Create a Breaking Bad-only manifest and omit the gated PartNet/GPAT track.")
     plan.add_argument("--output", required=True)
     plan.add_argument("--config")
     materialize = data_sub.add_parser("materialize")
@@ -116,7 +119,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "data":
         if args.data_command == "plan":
-            manifest = build_manifest(args.breaking_bad_root, args.partnet_gpat_root, args.output, args.config)
+            manifest = build_manifest(
+                args.breaking_bad_root, args.partnet_gpat_root, args.output, args.config,
+                include_partnet=not args.without_partnet,
+            )
             print(f"Selected {len(manifest['samples'])} samples / {manifest['selected_bytes']} bytes")
         elif args.data_command == "materialize":
             print(materialize_common(args.manifest, args.output, args.link))

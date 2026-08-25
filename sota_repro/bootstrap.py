@@ -43,8 +43,19 @@ def bootstrap(suite_root: Path, names: Iterable[str] | None = None) -> list[dict
             raise ValueError(f"{name}: {spec.data.get('audit_note', 'source unavailable')}")
         destination = source_dir(suite_root, name)
         if destination.exists():
-            results.append({"model": name, **validate_source(spec, destination)})
-            continue
+            if (destination / ".git").exists():
+                results.append({"model": name, **validate_source(spec, destination)})
+                continue
+            # Directory skeletons can be present when the suite is copied without
+            # its intentionally untracked official source clones. Remove only an
+            # empty placeholder; never overwrite a non-Git directory with files.
+            if destination.is_dir() and not any(destination.iterdir()):
+                destination.rmdir()
+            else:
+                raise RuntimeError(
+                    f"{name}: {destination} exists but is not an official Git clone. "
+                    "Move it aside or empty it before bootstrapping."
+                )
         destination.parent.mkdir(parents=True, exist_ok=True)
         clone_env = os.environ.copy()
         # Official repositories sometimes place multi-gigabyte checkpoints in LFS.

@@ -42,7 +42,7 @@ models:
     checkpoint_url: null
     checkpoint_note: "The official README documents --weight; retain checkpoints emitted by scripts/train.py."
     environment: {manager: conda, name: sota-ccs, python: "3.8", cuda: "11.3"}
-    config_template: configs/wx_transformer/wx_transformer/topk/partnet/FF-top10-partnet_chair.py
+    config_template: configs/wx_transformer/wx_transformer/topk/everyday/top10-everyday.py
     resume_args: {train: [--weight, "{resume}"]}
     commands:
       setup:

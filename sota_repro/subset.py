@@ -150,21 +150,34 @@ def select_object_disjoint(candidates: Iterable[Candidate], cap_bytes: int, seed
 
 def build_manifest(
     breaking_bad_root: str | Path,
-    partnet_gpat_root: str | Path,
+    partnet_gpat_root: str | Path | None,
     output: str | Path,
     config_path: str | Path | None = None,
+    *,
+    include_partnet: bool = True,
 ) -> dict[str, Any]:
+    """Build the deterministic common manifest.
+
+    ``include_partnet=False`` intentionally creates a Breaking Bad-only
+    comparative protocol for hosts that cannot stage the gated PartNet v0
+    archive.  GPAT must not be run against that manifest.
+    """
     config = load_subset_config(config_path)
     seed = int(config["seed"])
     bb_root = Path(breaking_bad_root).resolve()
-    partnet_root = Path(partnet_gpat_root).resolve()
+    if include_partnet and partnet_gpat_root is None:
+        raise ValueError("--partnet-gpat-root is required unless --without-partnet is supplied")
+    partnet_root = Path(partnet_gpat_root).resolve() if partnet_gpat_root is not None else None
     selected: list[Candidate] = []
     for track, data in config["tracks"].items():
+        if track == "partnet_gpat" and not include_partnet:
+            continue
         cap = int(float(data["cap_gib"]) * 1024**3)
         if track.startswith("breaking_bad_"):
             candidates = scan_breaking_bad(bb_root, str(data["subset"]), int(data["min_parts"]), int(data["max_parts"]))
             chosen = select_object_disjoint(candidates, cap, seed, set(data["allowed_splits"]), bool(data["category_balanced"]))
         else:
+            assert partnet_root is not None
             candidates = scan_partnet_gpat(partnet_root, int(data["min_parts"]), int(data["max_parts"]))
             allowed = {"train", "val", "test"}
             seen, unseen = set(data["seen_categories"]), set(data["unseen_categories"])
@@ -180,8 +193,10 @@ def build_manifest(
     if total > max_total:
         raise RuntimeError(f"Selected {total} bytes, above retained cap {max_total}")
     document = {
-        "version": config["version"], "seed": seed, "convention": config["convention"],
-        "sources": {"breaking_bad_root": str(bb_root), "partnet_gpat_root": str(partnet_root)},
+        "version": config["version"] if include_partnet else f"{config['version']}_breaking_bad_only",
+        "seed": seed, "convention": config["convention"],
+        "sources": {"breaking_bad_root": str(bb_root), **({"partnet_gpat_root": str(partnet_root)} if partnet_root else {})},
+        "track_scope": "common" if include_partnet else "breaking_bad_only",
         "retained_cap_bytes": max_total, "selected_bytes": total,
         "samples": [item.to_dict() for item in selected],
     }
