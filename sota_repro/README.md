@@ -29,3 +29,5 @@ The generated result report intentionally labels metrics as **reduced-subset com
 PuzzleFusion++ uses two learned stages at inference; its test command requires both `--checkpoint DENOISER.ckpt` and `--verifier-checkpoint VERIFIER.ckpt`.
 
 Use `--track breaking_bad_artifact` for a model's artifact zero-shot protocol and `--track partnet_gpat` for its semantic protocol. Checkpoint resume is passed through for DiffAssemble, CCS, PMTR, GARF, and CMNet via `--resume`; Jigsaw, PuzzleFusion++, and GPAT retain their upstream configuration-specific resume mechanisms.
+
+For a model-specific prepared representation (for example, GARF's HDF5), pass `--native-data "$SOTA_DATA_ROOT/garf/breaking_bad_vol.hdf5"`; the common retained corpus remains the source of record.

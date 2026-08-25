@@ -41,6 +41,10 @@ def _invoke(action: str, args: argparse.Namespace) -> int:
             command += ["--resume", args.resume]
         if args.track:
             command += ["--track", args.track]
+        if args.category:
+            command += ["--category", args.category]
+        if args.native_data:
+            command += ["--native-data", args.native_data]
         if args.keep_native_view:
             command.append("--keep-native-view")
         if args.dry_run:
@@ -99,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--verifier-checkpoint")
         child.add_argument("--resume")
         child.add_argument("--track")
+        child.add_argument("--category", default="chair")
+        child.add_argument("--native-data")
         child.add_argument("--seed", type=int, default=42)
         child.add_argument("--gpu", default="0")
         child.add_argument("--keep-native-view", action="store_true")

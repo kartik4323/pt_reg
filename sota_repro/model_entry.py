@@ -46,7 +46,7 @@ def _attach_model_data(model: str, worktree: Path, native_view: Path | None) -> 
     if native_view is None:
         return
     breaking_bad = native_view / "breaking_bad"
-    if model == "jigsaw" and breaking_bad.exists():
+    if model in {"jigsaw", "ccs"} and breaking_bad.exists():
         _replace_with_link(worktree / "data" / "breaking_bad", breaking_bad, worktree)
     elif model == "diffassemble" and breaking_bad.exists():
         _replace_with_link(worktree / "datasets" / "breaking-bad", breaking_bad, worktree)
@@ -76,6 +76,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--category", default="chair")
     parser.add_argument("--track", default=None,
                         help="Common protocol track, e.g. breaking_bad_everyday, breaking_bad_artifact, or partnet_gpat.")
+    parser.add_argument("--native-data", default=None,
+                        help="Model-native prepared data path, such as a GARF HDF5 cache, stored under SOTA_DATA_ROOT.")
     parser.add_argument("--scratch-root", default=os.environ.get("SOTA_SCRATCH_ROOT"))
     parser.add_argument("--keep-native-view", action="store_true",
                         help="Keep the disposable per-model native view after the run for diagnosis.")
@@ -158,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     _attach_model_data(spec.name, native_source, native_view)
     if native_view:
         variables["data"] = str(native_view)
+    if args.native_data:
+        variables["data"] = str(Path(args.native_data).resolve())
     variables["source"] = str(native_source)
     if not args.config and template:
         variables["config"] = str(native_source / template)

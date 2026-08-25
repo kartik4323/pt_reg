@@ -56,7 +56,7 @@ models:
         - [conda, run, -n, "{env}", python, -m, pip, install, -e, multi_part_assembly/utils/chamfer]
         - [conda, run, -n, "{env}", python, -m, pip, install, -e, multi_part_assembly/models/modules/encoder/pointnet2/pointnet2_ops_lib]
       train: [[python, scripts/train.py, --project_name, "{run_name}", --gpus, "{gpu}", --cfg_file, "{config}"]]
-      test: [[python, scripts/test.py, --gpus, "{gpu}", --cfg_file, "{config}"]]
+      test: [[python, scripts/test.py, --gpus, "{gpu}", --cfg_file, "{config}", --weight, "{checkpoint}"]]
       smoke: [[python, scripts/train.py, --help]]
   pmtr:
     source_status: released
@@ -93,9 +93,9 @@ models:
       setup: [[conda, create, -y, -n, "{env}", python=3.10], [conda, run, -n, "{env}", python, -m, pip, install, -r, requirements.txt]]
       train:
         - [python, generate_pc_data.py, "data.mesh_data_dir={data}/breaking_bad", "+data.save_pc_data_path={data}/pc_data/everyday"]
-        - [python, train_vqvae.py, "data.data_dir={data}/pc_data/everyday/train/", "data.data_val_dir={data}/pc_data/everyday/val/"]
-        - [python, train_denoiser.py, "data.data_dir={data}/pc_data/everyday/train/", "data.data_val_dir={data}/pc_data/everyday/val/"]
-        - [python, train_verifier.py, "data.verifier_data_path={data}/verifier_data/"]
+        - [python, train_vqvae.py, "experiment_name={run_name}_vqvae", "data.data_dir={data}/pc_data/everyday/train/", "data.data_val_dir={data}/pc_data/everyday/val/"]
+        - [python, train_denoiser.py, "experiment_name={run_name}_denoiser", "model.encoder_weights_path=output/autoencoder/{run_name}_vqvae/training/last.ckpt", "data.data_dir={data}/pc_data/everyday/train/", "data.data_val_dir={data}/pc_data/everyday/val/"]
+        - [python, train_verifier.py, "experiment_name={run_name}_verifier", "data.verifier_data_path={data}/verifier_data/"]
       test: [[python, test.py, "denoiser.ckpt_path={checkpoint}", "verifier.ckpt_path={verifier_checkpoint}", "denoiser.data.data_dir={data}/pc_data/everyday/train/", "denoiser.data.data_val_dir={data}/pc_data/everyday/val/", "denoiser.data.matching_data_path={data}/matching_data/"]]
       smoke: [[python, test.py, --help]]
   garf:
@@ -147,7 +147,7 @@ models:
     commands:
       setup: [[conda, env, create, -f, "{source}/environment.yml", -n, "{env}"], [conda, run, -n, "{env}", python, -m, pip, install, -e, .]]
       train: [[python, learning/gpat/run.py, --mode=train, --ratio=0.7, --rand, "--exp={run_name}", "--cuda={gpu}"]]
-      test: [[python, learning/assembler.py, --eval, "--cat={category}", "--exp={run_name}", "--cuda={gpu}"]]
+      test: [[python, learning/assembler.py, --eval, "--cat={category}", "--exp={run_name}", "--cuda={gpu}", --model_path, "{checkpoint}"]]
       smoke: [[python, learning/assembler.py, --help]]
   jigsaw_pp:
     source_status: unavailable
