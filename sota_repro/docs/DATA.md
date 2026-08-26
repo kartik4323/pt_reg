@@ -35,7 +35,7 @@ python -m sota_repro data breaking-bad-materialize \
   --python /opt/conda/envs/breaking-bad/bin/python
 ```
 
-`--python` must be the authors' Python 3.8 decompressor environment (NumPy, SciPy, tqdm, libigl, and gpytoolbox). The official decompressor supports `--subset everyday --category CATEGORY`; the suite supplies one category at a time. Once `data materialize` has copied the selected PartNet records and verified the 20 GiB cap, remove `$SOTA_SCRATCH/breaking_bad` archives and temporary raw expansion. The source manifest reports exact object IDs and pattern IDs, source content hashes, split, byte count, and preprocessing version; retain it with results.
+`--python` must be the authors' Python 3.8 decompressor environment (NumPy, SciPy, tqdm, libigl, and gpytoolbox). The official decompressor supports `--subset everyday --category CATEGORY`; the suite stages, decompresses, verifies, copies, and deletes **one category at a time**. This avoids holding a second full everyday expansion in staging. Once materialization has verified the retained-data cap, remove `$SOTA_SCRATCH/breaking_bad` archives and temporary raw expansion. The source manifest reports exact object IDs and pattern IDs, source content hashes, split, byte count, and preprocessing version; retain it with results.
 
 `breaking-bad-materialize` writes the verified selected-only manifest to `$SOTA_DATA_ROOT/common_v1_manifest.json`; do not replace it with the pre-materialization source manifest.
 

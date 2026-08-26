@@ -86,22 +86,31 @@ def materialize_breaking_bad(
         copied = 0
         for subset in subsets:
             object_ids, rows = _selected_objects(manifest, subset)
-            _stage_objects(compressed, stage, subset, object_ids)
             command = [decompressor_python, str(decompressor), "--data_root", str(stage), "--subset", subset]
             if subset == "everyday":
+                # Stage, decompress, verify/copy, and remove one category at a
+                # time.  Keeping all decompressed categories until the final
+                # copy doubles the retained-data footprint and defeats the
+                # low-space materialization protocol.
                 for category in sorted({Path(object_id).parts[0] for object_id in object_ids}):
+                    category_ids = {item for item in object_ids if Path(item).parts[0] == category}
+                    category_rows = [row for row in rows if Path(str(row["object_id"])).parts[0] == category]
+                    _stage_objects(compressed, stage, subset, category_ids)
                     category_command = [*command, "--category", category]
                     print("[decompress]", " ".join(category_command))
                     if not dry_run:
                         subprocess.run(category_command, cwd=official, check=True)
+                        copied += _copy_selected(category_rows, stage, output)
+                        safe_rmtree(stage / subset / category, stage)
+                        safe_rmtree(stage / f"{subset}_compressed" / category, stage)
             else:
+                _stage_objects(compressed, stage, subset, object_ids)
                 print("[decompress]", " ".join(command))
                 if not dry_run:
                     subprocess.run(command, cwd=official, check=True)
-            if not dry_run:
-                copied += _copy_selected(rows, stage, output)
-                safe_rmtree(stage / subset, stage)
-                safe_rmtree(stage / f"{subset}_compressed", stage)
+                    copied += _copy_selected(rows, stage, output)
+                    safe_rmtree(stage / subset, stage)
+                    safe_rmtree(stage / f"{subset}_compressed", stage)
         if not dry_run and (stage / "data_split").exists():
             copytree_or_link(stage / "data_split", output / "data_split", link=False)
         if not dry_run:
