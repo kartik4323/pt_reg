@@ -43,7 +43,20 @@ def _split_lookup(split_root: Path, subset: str) -> set[str]:
 
 
 def _belongs(relative: str, entries: set[str]) -> bool:
-    return any(relative == value or relative.startswith(value.rstrip("/") + "/") or value in relative for value in entries)
+    """Match an object path against the official split lists.
+
+    Breaking Bad's artifact lists are published in both ``<object-id>`` and
+    ``artifact/<object-id>`` forms.  The decompressed artifact root removes
+    that leading directory, so compare both canonical spellings rather than
+    defaulting every unmatched artifact to the training split.
+    """
+    relative = relative.replace("\\", "/").strip("/")
+    candidates = {relative, *(f"{subset}/{relative}" for subset in ("everyday", "artifact"))}
+    for entry in entries:
+        value = entry.replace("\\", "/").strip("/")
+        if any(candidate == value or candidate.startswith(value + "/") for candidate in candidates):
+            return True
+    return False
 
 
 def _hash_tree(path: Path) -> str:

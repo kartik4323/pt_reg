@@ -45,7 +45,10 @@ class SuiteTests(unittest.TestCase):
             (bb / "data_split" / "everyday.train.txt").write_text("Bottle/a\n", encoding="utf-8")
             (bb / "data_split" / "everyday.val.txt").write_text("Bottle/b\n", encoding="utf-8")
             (bb / "data_split" / "artifact.train.txt").write_text("a\n", encoding="utf-8")
-            (bb / "data_split" / "artifact.val.txt").write_text("b\n", encoding="utf-8")
+            # Official artifact split lists may include the subset prefix even
+            # though decompression places object directories directly under
+            # ``artifact/``.
+            (bb / "data_split" / "artifact.val.txt").write_text("artifact/b\n", encoding="utf-8")
             for relative in ("everyday/Bottle/a/fractured_0", "everyday/Bottle/b/fractured_0", "artifact/a/fractured_0", "artifact/b/fractured_0"):
                 folder = bb / relative
                 folder.mkdir(parents=True)
@@ -59,6 +62,7 @@ class SuiteTests(unittest.TestCase):
             manifest_path = root / "source_manifest.json"
             manifest = build_manifest(bb, root / "partnet", manifest_path)
             self.assertGreaterEqual(len(manifest["samples"]), 3)
+            self.assertTrue(any(row["track"] == "breaking_bad_artifact" and row["split"] == "val" for row in manifest["samples"]))
             materialized = root / "retained"
             result = materialize_common(manifest_path, materialized)
             self.assertLessEqual(result["bytes"], manifest["retained_cap_bytes"])
@@ -66,6 +70,14 @@ class SuiteTests(unittest.TestCase):
             view = create_native_view("jigsaw", materialized, root / "views")
             self.assertTrue((view / "breaking_bad" / "data_split" / "everyday.train.txt").exists())
             self.assertTrue((view / "data_lists" / "everyday_train.txt").exists())
+            # Simulate an interrupted build with existing data links but no
+            # completion marker or selected indexes; retry must repair it.
+            (view / "view_manifest.json").unlink()
+            index = view / "data_lists" / "everyday_train.txt"
+            index.unlink()
+            create_native_view("jigsaw", materialized, root / "views")
+            self.assertEqual(index.read_text(encoding="utf-8"), "002 everyday/Bottle/a/fractured_0\n")
+            self.assertTrue((view / "view_manifest.json").is_file())
 
     def test_ground_truth_and_symmetric_equivalence_score_perfectly(self) -> None:
         identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]

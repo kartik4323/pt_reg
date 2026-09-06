@@ -55,7 +55,7 @@ def _write_breaking_bad_indexes(data_root: Path, view: Path) -> None:
     for row in manifest["samples"]:
         if not str(row["track"]).startswith("breaking_bad_"):
             continue
-        subset = str(row["track"]).removeprefix("breaking_bad_")
+        subset = str(row["track"])[len("breaking_bad_"):]
         split = str(row["split"])
         split_lists.setdefault((subset, split), set()).add(str(row["object_id"]))
         relative = str(row["relative_path"])
@@ -79,9 +79,11 @@ def create_native_view(model: str, data_root: str | Path, scratch_root: str | Pa
     data_root = Path(data_root).resolve()
     scratch_root = Path(scratch_root).resolve()
     view = scratch_root / model / "data"
-    if view.exists():
+    if (view / "view_manifest.json").is_file():
         return view
-    view.mkdir(parents=True)
+    # A failed index build can leave links and directories behind. Finish the
+    # view on retry; only the manifest written at the end marks it complete.
+    view.mkdir(parents=True, exist_ok=True)
     breaking_bad = data_root / "breaking_bad_everyday" / "everyday"
     artifact = data_root / "breaking_bad_artifact" / "artifact"
     partnet = data_root / "partnet_gpat"
