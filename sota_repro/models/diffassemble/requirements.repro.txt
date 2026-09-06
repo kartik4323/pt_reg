@@ -1,0 +1,36 @@
+# Runtime pins for the full train_3d.py import chain at 256df64.
+# Conda owns Torch, torchvision, PyTorch3D, NumPy and SciPy (constraints below).
+-c constraints.repro.txt
+-c constraints.resolved.txt
+--find-links https://data.pyg.org/whl/torch-1.12.0+cu113.html
+--only-binary torch-scatter,torch-sparse,torch-cluster,torch-spline-conv
+torch-scatter==2.1.0+pt112cu113
+torch-sparse==0.6.16+pt112cu113
+torch-cluster==1.6.0+pt112cu113
+torch-spline-conv==1.2.1+pt112cu113
+torch-geometric==2.2.0
+pytorch-lightning==1.7.7
+torchmetrics==0.9.2
+einops==0.6.0
+timm==0.6.12
+kornia==0.6.9
+transformers==4.25.1
+huggingface-hub==0.12.1
+tokenizers==0.13.3
+matplotlib==3.6.3
+trimesh==3.20.0
+networkx==2.8.8
+wandb==0.13.10
+tensorboard==2.11.2
+protobuf==3.20.3
+yacs==0.1.8
+pandas==1.5.3
+scikit-learn==1.2.2
+rich==12.6.0
+requests==2.31.0
+fsspec[http]==2022.8.2
+packaging==23.0
+PyYAML==6.0.1
+tqdm==4.64.1
+pyDeprecate==0.3.2
+patchelf==0.19.1.0

@@ -25,13 +25,14 @@ models:
     license: Apache-2.0
     checkpoint_url: null
     checkpoint_note: "No official checkpoint link was verified; use a checkpoint produced by the native Lightning run."
-    environment: {manager: conda, name: sota-diffassemble, python: "3.9", cuda: "11.3", file: singularity/build/conda_env.yaml}
+    environment: {manager: conda, name: sota-diffassemble-repro-v1, python: "3.10.13", cuda: "11.3", torch: "1.12.1", file: models/diffassemble/environment.repro.yaml}
+    compatibility_audit: "2026-09-06; pinned legacy binary stack; see models/diffassemble/README.md for validation scope"
     resume_args: {train: [--checkpoint_path, "{resume}"]}
     commands:
-      setup: [[conda, env, create, -f, "{source}/singularity/build/conda_env.yaml", -n, "{env}"]]
-      train: [[python, puzzle_diff/train_3d.py, --gpus, 1, --min_num_part, 2, --max_num_part, 20]]
-      test: [[python, puzzle_diff/train_3d.py, --gpus, 1, --min_num_part, 2, --max_num_part, 20, --evaluate, "True", --checkpoint_path, "{checkpoint}"]]
-      smoke: [[python, puzzle_diff/train_3d.py, --help]]
+      setup: [[python, "{model_dir}/setup_repro.py", --env, "{env}", --source, "{source}", --output, "{run}"]]
+      train: [[python, "{model_dir}/native_entry.py", --gpus, 1, --min_num_part, 2, --max_num_part, 20, --offline]]
+      test: [[python, "{model_dir}/native_entry.py", --gpus, 1, --min_num_part, 2, --max_num_part, 20, --offline, --evaluate, "True", --checkpoint_path, "{checkpoint}"]]
+      smoke: [[python, "{model_dir}/doctor.py", --source, "{source}", --report, "{run}/doctor.json"]]
   ccs:
     source_status: released
     tracks: [breaking_bad, partnet]

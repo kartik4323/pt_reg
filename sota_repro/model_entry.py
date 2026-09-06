@@ -4,17 +4,58 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .bootstrap import source_dir, validate_source
 from .materialize import clean_native_view, create_native_view
 from .registry import load_registry
-from .runs import create_run, finish_run, record_checkpoint_hashes
+from .runs import create_run, environment_lock, finish_run, record_checkpoint_hashes
 from .utils import copytree_or_link, flatten_command, write_json
 
 
 def suite_root() -> Path:
     return Path(__file__).resolve().parent
+
+
+def _visible_gpu(index: str, visible: str | None) -> str:
+    if not index.isdigit():
+        raise ValueError("DiffAssemble --gpu must be a nonnegative logical device index")
+    if visible is None:
+        return index
+    if visible.strip() in {"", "-1"}:
+        return visible  # Respect an explicitly disabled GPU allocation.
+    devices = [value.strip() for value in visible.split(",")]
+    if int(index) >= len(devices):
+        raise ValueError(f"--gpu {index} is outside CUDA_VISIBLE_DEVICES={visible!r}")
+    return devices[int(index)]
+
+
+def _run_logged(commands, cwd: Path, environment: dict, log_path: Path) -> None:
+    """Tee native diagnostics to the terminal and the persistent run log."""
+    print(f"Native log: {log_path}", flush=True)
+    with log_path.open("w", encoding="utf-8") as output:
+        for command in commands:
+            header = "$ " + " ".join(command) + "\n"
+            print(header, end="", flush=True)
+            output.write(header)
+            output.flush()
+            try:
+                with subprocess.Popen(command, cwd=cwd, env=environment, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                      errors="replace", bufsize=1) as process:
+                    for line in process.stdout:
+                        print(line, end="", flush=True)
+                        output.write(line)
+                        output.flush()
+                    code = process.wait()
+                if code:
+                    raise subprocess.CalledProcessError(code, command)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                message = f"Command failed: {exc}\nFull native output: {log_path}\n"
+                output.write(message)
+                print(message, file=sys.stderr, flush=True)
+                raise
 
 
 def _native_worktree(source: Path, run: Path) -> Path:
@@ -94,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
         required_track = "breaking_bad" if args.track.startswith("breaking_bad_") else "partnet" if args.track == "partnet_gpat" else args.track
         if required_track not in spec.data.get("tracks", []):
             raise ValueError(f"{spec.name} is not registered for track {args.track}")
+    if spec.name == "diffassemble" and args.track not in {None, "breaking_bad_everyday"}:
+        raise ValueError("DiffAssemble's audited native entry supports everyday only; artifact evaluation is not wired up.")
+    if spec.name == "diffassemble" and args.action == "test" and not args.checkpoint:
+        raise ValueError("DiffAssemble test requires --checkpoint /absolute/path/model.ckpt")
     source = source_dir(suite_root(), spec.name)
     validate_source(spec, source)
     model_dir = suite_root() / "models" / spec.name
@@ -114,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         "checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else "", "resume": args.resume or "",
         "verifier_checkpoint": str(Path(args.verifier_checkpoint).resolve()) if args.verifier_checkpoint else "",
         "gpu": str(args.gpu), "category": args.category, "track": track, "data_category": data_category,
-        "env": env_name, "run_name": f"sota_{spec.name}",
+        "env": env_name, "run_name": f"sota_{spec.name}", "model_dir": str(model_dir),
     }
     commands = spec.data["commands"].get(args.action)
     if not commands:
@@ -125,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.config and template:
             variables["config"] = str(setup_source / template)
         run = create_run(spec, source, Path(args.run_root).resolve(), args.action, args.seed, None, track)
+        variables["run"] = str(run)
         record_checkpoint_hashes(run, checkpoint=args.checkpoint, verifier_checkpoint=args.verifier_checkpoint, resume=args.resume)
         resolved_commands = [flatten_command(raw, variables) for raw in commands]
         write_json(run / "command.json", {"commands": resolved_commands, "cwd": str(setup_source), "native_source": str(setup_source)})
@@ -134,29 +180,31 @@ def main(argv: list[str] | None = None) -> int:
             finish_run(run, "dry_run")
             return 0
         setup_environment = os.environ.copy()
-        setup_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        setup_environment.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
         try:
-            with (run / "native.stdout.log").open("w", encoding="utf-8") as output:
-                for command in resolved_commands:
-                    output.write("$ " + " ".join(command) + "\n")
-                    output.flush()
-                    subprocess.run(command, cwd=setup_source, env=setup_environment, check=True,
-                                   stdout=output, stderr=subprocess.STDOUT)
-        except subprocess.CalledProcessError as exc:
-            finish_run(run, "failed", returncode=exc.returncode)
+            _run_logged(resolved_commands, setup_source, setup_environment, run / "native.stdout.log")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            finish_run(run, "failed", returncode=getattr(exc, "returncode", 1))
             raise
         else:
-            finish_run(run, "complete")
+            finish_run(run, "complete", environment_lock=environment_lock(spec, setup_source))
         return 0
     if spec.name == "puzzlefusion_pp" and args.action == "test" and not args.verifier_checkpoint:
         raise ValueError("PuzzleFusion++ test requires --verifier-checkpoint in addition to --checkpoint (denoiser).")
     data_root = Path(args.data_root).resolve()
     manifest = data_root / "common_v1_manifest.json"
+    if spec.name == "diffassemble":
+        if not manifest.is_file() and not args.dry_run:
+            raise FileNotFoundError(f"Missing retained-data manifest: {manifest}. Set --data-root to the materialized corpus.")
+        selected_gpu = _visible_gpu(args.gpu, os.environ.get("CUDA_VISIBLE_DEVICES"))
     run = create_run(spec, source, Path(args.run_root).resolve(), args.action, args.seed, manifest, track)
     record_checkpoint_hashes(run, checkpoint=args.checkpoint, verifier_checkpoint=args.verifier_checkpoint, resume=args.resume)
     scratch_root = Path(args.scratch_root).resolve() if args.scratch_root else run.parent / "native_views"
     native_view = create_native_view(spec.name, data_root, scratch_root) if data_root.exists() else None
     native_source = _native_worktree(source, run)
+    if spec.name == "diffassemble":
+        from .models.diffassemble.apply_native import apply_native
+        apply_native(native_source, run / "native-patches.json")
     _attach_model_data(spec.name, native_source, native_view)
     if native_view:
         variables["data"] = str(native_view)
@@ -166,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.config and template:
         variables["config"] = str(native_source / template)
     variables["run_name"] = run.name
+    variables["run"] = str(run)
     resolved_commands = [flatten_command(raw, variables) for raw in commands]
     resume_args = spec.data.get("resume_args", {}).get(args.action, []) if args.resume else []
     if resume_args:
@@ -183,17 +232,23 @@ def main(argv: list[str] | None = None) -> int:
         native_environment = os.environ.copy()
         native_environment.update({
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
             "SOTA_DATA_ROOT": str(data_root),
             "SOTA_RUN_ROOT": str(run.parent),
             "SOTA_RUN_DIR": str(run),
+            "SOTA_SEED": str(args.seed),
         })
-        with (run / "native.stdout.log").open("w", encoding="utf-8") as output:
-            for command in wrapped_commands:
-                output.write("$ " + " ".join(command) + "\n")
-                output.flush()
-                subprocess.run(command, cwd=native_source, env=native_environment, check=True, stdout=output, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as exc:
-        finish_run(run, "failed", returncode=exc.returncode)
+        if spec.name == "diffassemble":
+            native_environment.pop("PYTHONPATH", None)
+            native_environment.pop("PYTHONHOME", None)
+            native_environment.update(PYTHONNOUSERSITE="1", MPLBACKEND="Agg", WANDB_MODE="offline",
+                                      XDG_CACHE_HOME=str(run / "cache"), HF_HOME=str(run / "cache/huggingface"))
+            # --gpu is a logical index within any scheduler-assigned devices.
+            native_environment["CUDA_VISIBLE_DEVICES"] = selected_gpu
+            print(f"DiffAssemble CUDA_VISIBLE_DEVICES={selected_gpu!r}", flush=True)
+        _run_logged(wrapped_commands, native_source, native_environment, run / "native.stdout.log")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        finish_run(run, "failed", returncode=getattr(exc, "returncode", 1))
         raise
     else:
         finish_run(run, "complete")

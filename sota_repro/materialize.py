@@ -44,7 +44,7 @@ def materialize_common(manifest_path: str | Path, destination: str | Path, link:
     return {"destination": str(destination), "samples": len(copied), "bytes": written["materialized_bytes"], "by_track": Counter(item["track"] for item in manifest["samples"])}
 
 
-def _write_breaking_bad_indexes(data_root: Path, view: Path) -> None:
+def _write_breaking_bad_indexes(data_root: Path, view: Path, model: str = "") -> None:
     """Write selected-only split and pattern lists understood by the official loaders."""
     manifest_path = data_root / "common_v1_manifest.json"
     if not manifest_path.exists():
@@ -57,7 +57,12 @@ def _write_breaking_bad_indexes(data_root: Path, view: Path) -> None:
             continue
         subset = str(row["track"])[len("breaking_bad_"):]
         split = str(row["split"])
-        split_lists.setdefault((subset, split), set()).add(str(row["object_id"]))
+        object_id = str(row["object_id"])
+        # DiffAssemble joins IDs directly to datasets/breaking-bad and reads
+        # category from path component 1. Other adapters use category/object.
+        if model == "diffassemble" and not object_id.startswith(subset + "/"):
+            object_id = subset + "/" + object_id
+        split_lists.setdefault((subset, split), set()).add(object_id)
         relative = str(row["relative_path"])
         pattern_lists.setdefault((subset, split), set()).add(f"{int(row['num_parts']):03d} {relative}")
     split_root = view / "breaking_bad" / "data_split"
@@ -80,6 +85,9 @@ def create_native_view(model: str, data_root: str | Path, scratch_root: str | Pa
     scratch_root = Path(scratch_root).resolve()
     view = scratch_root / model / "data"
     if (view / "view_manifest.json").is_file():
+        if model == "diffassemble":
+            # Refresh legacy cached lists too; do not touch retained meshes.
+            _write_breaking_bad_indexes(data_root, view, model)
         return view
     # A failed index build can leave links and directories behind. Finish the
     # view on retry; only the manifest written at the end marks it complete.
@@ -91,7 +99,7 @@ def create_native_view(model: str, data_root: str | Path, scratch_root: str | Pa
         copytree_or_link(breaking_bad, view / "breaking_bad" / "everyday", link=True)
     if artifact.exists():
         copytree_or_link(artifact, view / "breaking_bad" / "artifact", link=True)
-    _write_breaking_bad_indexes(data_root, view)
+    _write_breaking_bad_indexes(data_root, view, model)
     if (view / "breaking_bad" / "data_split").exists():
         copytree_or_link(view / "breaking_bad" / "data_split", view / "data_split", link=True)
     if partnet.exists():

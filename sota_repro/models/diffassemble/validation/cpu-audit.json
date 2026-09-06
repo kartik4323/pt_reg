@@ -1,0 +1,181 @@
+{
+  "audit_date_utc": "2026-09-06",
+  "source_revision": "256df64d4e5465e690b5b84e6024c60e21c3f3c8",
+  "platform": "Linux x86_64, WSL Ubuntu, glibc 2.43",
+  "python": "3.10.13",
+  "passed": true,
+  "device": "cpu",
+  "gpu_batch_verified": false,
+  "notes": [
+    "Disposable native source uses patches/3d-backbone-imports.patch.",
+    "Host required conditional Torch executable-stack repair.",
+    "Synthetic mesh fixture only; no retained Breaking Bad corpus or NVIDIA GPU on development machine."
+  ],
+  "checks": [
+    {
+      "name": "import pkg_resources",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import numpy",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import scipy",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import PIL.Image",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import networkx",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torchvision",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import pytorch_lightning",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torchmetrics",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch_geometric",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch_scatter",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch_sparse",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch_cluster",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch_spline_conv",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import pytorch3d._C",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import pytorch3d.transforms",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import pytorch3d.ops",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import einops",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import timm",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import kornia",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import transformers.optimization",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import trimesh",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import matplotlib.pyplot",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import wandb",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import yacs.config",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "import torch_geometric.graphgym.register",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "pip dependency consistency",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "native train_3d --help",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "pinned versions",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "native model and optimizer construction",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "native loader synthetic fixture",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "offline point-cloud logger",
+      "passed": true,
+      "returncode": 0
+    },
+    {
+      "name": "compiled operators",
+      "passed": true,
+      "returncode": 0
+    }
+  ]
+}

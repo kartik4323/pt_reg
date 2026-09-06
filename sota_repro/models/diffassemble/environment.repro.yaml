@@ -1,0 +1,21 @@
+name: sota-diffassemble-repro-v1
+channels:
+  - pytorch3d
+  - pytorch
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10.13
+  - pip=24.0
+  - setuptools=65.6.3
+  - wheel=0.38.4
+  - pytorch::pytorch=1.12.1=py3.10_cuda11.3*
+  - pytorch::torchvision=0.13.1=py310_cu113
+  - pytorch3d::pytorch3d=0.7.2=py310_cu113_pyt1121
+  - cudatoolkit=11.3.1
+  - mkl=2024.0.0
+  - numpy=1.23.5
+  - scipy=1.9.3
+  - pillow=9.2.0
+  - fvcore=0.1.5.post20221221
+  - iopath=0.1.9
