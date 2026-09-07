@@ -16,7 +16,7 @@ from unittest.mock import patch
 import yaml
 
 from sota_repro.materialize import create_native_view
-from sota_repro.model_entry import _run_logged, _visible_gpu, main
+from sota_repro.model_entry import _run_logged, _skip_existing_conda_create, _visible_gpu, main
 from sota_repro.models.diffassemble.apply_native import apply_native, RELATIVE
 from sota_repro.registry import load_registry
 from sota_repro.utils import flatten_command
@@ -26,6 +26,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiffAssembleTests(unittest.TestCase):
+    def test_generic_conda_setup_resumes_after_existing_prefix(self):
+        commands = [['conda', 'create', '-n', 'example'],
+                    ['conda', 'env', 'create', '-n', 'example'],
+                    ['conda', 'run', '-n', 'example', 'python', '-m', 'pip', 'install', 'thing']]
+        payload = json.dumps({'envs': ['/envs/example']})
+        with patch('sota_repro.model_entry.subprocess.check_output', return_value=payload), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(_skip_existing_conda_create(commands, 'example', {}), [commands[-1]])
+        with patch('sota_repro.model_entry.subprocess.check_output', return_value=json.dumps({'envs': []})):
+            self.assertEqual(_skip_existing_conda_create(commands, 'example', {}), commands)
+
     def test_native_patch_is_guarded_and_idempotent(self):
         lines = (ROOT / 'models/diffassemble/patches/3d-backbone-imports.patch').read_text().splitlines(keepends=True)
         before = ''.join(line[1:] for line in lines[3:] if line.startswith('-'))

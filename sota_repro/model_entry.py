@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -29,6 +30,29 @@ def _visible_gpu(index: str, visible: str | None) -> str:
     if int(index) >= len(devices):
         raise ValueError(f"--gpu {index} is outside CUDA_VISIBLE_DEVICES={visible!r}")
     return devices[int(index)]
+
+
+def _conda_env_exists(name: str, environment: dict) -> bool:
+    try:
+        payload = subprocess.check_output(
+            ["conda", "env", "list", "--json"], env=environment, text=True
+        )
+        environments = json.loads(payload).get("envs", [])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
+    return any(Path(path).name == name for path in environments)
+
+
+def _skip_existing_conda_create(commands: list[list[str]], env_name: str, environment: dict) -> list[list[str]]:
+    """Let interrupted multi-command setup recipes resume in an existing env."""
+    if not _conda_env_exists(env_name, environment):
+        return commands
+    creation_prefixes = (("conda", "create"), ("conda", "env", "create"))
+    retained = [command for command in commands if not any(tuple(command[:len(prefix)]) == prefix
+                                                            for prefix in creation_prefixes)]
+    if len(retained) != len(commands):
+        print(f"Conda environment {env_name!r} already exists; resuming after its creation step.", flush=True)
+    return retained
 
 
 def _run_logged(commands, cwd: Path, environment: dict, log_path: Path) -> None:
@@ -181,6 +205,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         setup_environment = os.environ.copy()
         setup_environment.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
+        if spec.data["environment"]["manager"] == "conda":
+            original_command_count = len(resolved_commands)
+            resolved_commands = _skip_existing_conda_create(resolved_commands, env_name, setup_environment)
+            write_json(run / "command.json", {"commands": resolved_commands, "cwd": str(setup_source),
+                                               "native_source": str(setup_source),
+                                               "resumed_existing_environment": len(resolved_commands) < original_command_count})
         try:
             _run_logged(resolved_commands, setup_source, setup_environment, run / "native.stdout.log")
         except (OSError, subprocess.CalledProcessError) as exc:
@@ -219,7 +249,11 @@ def main(argv: list[str] | None = None) -> int:
     resume_args = spec.data.get("resume_args", {}).get(args.action, []) if args.resume else []
     if resume_args:
         resolved_commands = [command + flatten_command(resume_args, variables) for command in resolved_commands]
-    wrapped_commands = [(["uv", "run", "--project", str(native_source), *command] if spec.data["environment"]["manager"] == "uv" else ["conda", "run", "--no-capture-output", "-n", env_name, *command]) for command in resolved_commands]
+    # Reuse the environment created by `setup` for uv models. Pointing uv at the
+    # disposable source copy would resolve and store another large environment
+    # inside every smoke/train/test run.
+    uv_project = _native_build_source(source, model_dir) if spec.data["environment"]["manager"] == "uv" else None
+    wrapped_commands = [(["uv", "run", "--project", str(uv_project), *command] if uv_project else ["conda", "run", "--no-capture-output", "-n", env_name, *command]) for command in resolved_commands]
     write_json(run / "command.json", {"commands": wrapped_commands, "cwd": str(native_source), "native_source": str(native_source), "native_view": str(native_view) if native_view else None})
     if args.dry_run:
         for command in wrapped_commands:
