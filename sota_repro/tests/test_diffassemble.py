@@ -26,6 +26,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiffAssembleTests(unittest.TestCase):
+    def test_ccs_profile_pins_the_legacy_binary_stack(self):
+        spec = load_registry()['ccs'].data
+        profile = yaml.safe_load((ROOT / 'models/ccs/environment.repro.yaml').read_text())
+        for pin in ('python=3.8.16', 'mkl=2024.0.0', 'numpy=1.23.5',
+                    'pytorch-lightning=1.6.2', 'torchmetrics=0.9.2'):
+            self.assertIn(pin, profile['dependencies'])
+        self.assertIn('pytorch::pytorch=1.10.2=py3.8_cuda11.3_cudnn8.2.0_0',
+                      profile['dependencies'])
+        self.assertIn('pytorch3d::pytorch3d=0.7.2=py38_cu113_pyt1102',
+                      profile['dependencies'])
+        self.assertEqual(spec['commands']['setup'][0][1], '{model_dir}/setup_repro.py')
+        self.assertEqual(spec['commands']['smoke'][0][1], '{model_dir}/doctor.py')
+        for name in ('setup_repro.py', 'doctor.py'):
+            ast.parse((ROOT / 'models/ccs' / name).read_text(), feature_version=(3, 8))
+
     def test_generic_conda_setup_resumes_after_existing_prefix(self):
         commands = [['conda', 'create', '-n', 'example'],
                     ['conda', 'env', 'create', '-n', 'example'],

@@ -1,0 +1,25 @@
+name: sota-ccs
+channels:
+  - pytorch3d
+  - pytorch
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.8.16
+  - pip=23.3.2
+  - setuptools=59.5.0
+  - wheel=0.38.4
+  - pytorch::pytorch=1.10.2=py3.8_cuda11.3_cudnn8.2.0_0
+  - pytorch::torchvision=0.11.3=py38_cu113
+  - pytorch::torchaudio=0.10.2=py38_cu113
+  - pytorch3d::pytorch3d=0.7.2=py38_cu113_pyt1102
+  - cudatoolkit=11.3.1
+  # MKL 2024.1+ removed the symbol required by this legacy Torch binary.
+  - mkl=2024.0.0
+  - numpy=1.23.5
+  - scipy=1.10.1
+  - pandas=1.5.3
+  - pytorch-lightning=1.6.2
+  - torchmetrics=0.9.2
+  - fvcore=0.1.5.post20221221
+  - iopath=0.1.9

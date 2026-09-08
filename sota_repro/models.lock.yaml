@@ -42,23 +42,15 @@ models:
     license: MIT
     checkpoint_url: null
     checkpoint_note: "The official README documents --weight; retain checkpoints emitted by scripts/train.py."
-    environment: {manager: conda, name: sota-ccs, python: "3.8", cuda: "11.3"}
+    environment: {manager: conda, name: sota-ccs, python: "3.8.16", cuda: "11.3", torch: "1.10.2", file: models/ccs/environment.repro.yaml}
+    compatibility_audit: "2026-09-09; pinned legacy Torch/MKL/Lightning/PyTorch3D stack; setup is resumable"
     config_template: configs/wx_transformer/wx_transformer/topk/everyday/top10-everyday.py
     resume_args: {train: [--weight, "{resume}"]}
     commands:
-      setup:
-        - [conda, create, -y, -n, "{env}", python=3.8.5]
-        - [conda, install, -y, -n, "{env}", pytorch=1.10, torchvision, torchaudio, cudatoolkit=11.3, -c, pytorch]
-        - [conda, install, -y, -n, "{env}", pytorch-lightning=1.6.2]
-        - [conda, install, -y, -n, "{env}", -c, fvcore, -c, iopath, -c, conda-forge, fvcore, iopath]
-        - [conda, run, -n, "{env}", python, -m, pip, install, --no-index, --no-cache-dir, pytorch3d, -f, https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py38_cu113_pyt1110/download.html]
-        - [conda, run, -n, "{env}", python, -m, pip, install, setuptools==59.5.0, setproctitle, trimesh, wandb, scipy, pyntcloud, matplotlib, ninja]
-        - [conda, run, -n, "{env}", python, -m, pip, install, -e, .]
-        - [conda, run, -n, "{env}", python, -m, pip, install, -e, multi_part_assembly/utils/chamfer]
-        - [conda, run, -n, "{env}", python, -m, pip, install, -e, multi_part_assembly/models/modules/encoder/pointnet2/pointnet2_ops_lib]
+      setup: [[python, "{model_dir}/setup_repro.py", --env, "{env}", --source, "{source}", --output, "{run}"]]
       train: [[python, scripts/train.py, --project_name, "{run_name}", --gpus, "{gpu}", --cfg_file, "{config}"]]
       test: [[python, scripts/test.py, --gpus, "{gpu}", --cfg_file, "{config}", --weight, "{checkpoint}"]]
-      smoke: [[python, scripts/train.py, --help]]
+      smoke: [[python, "{model_dir}/doctor.py", --source, "{source}", --report, "{run}/doctor.json"]]
   pmtr:
     source_status: released
     tracks: [breaking_bad]
