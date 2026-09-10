@@ -12,12 +12,14 @@ import numpy as np
 import torch
 
 from .config import load_config
+from .precision import NUMERICS_VERSION
 from .resources import jsonable, make_guard, write_json
 
 
 def profile_signature(cfg: dict) -> str:
     """Bind allocation results to every input/model/solver/loss size and precision."""
     relevant = {key: cfg[key] for key in ('version', 'data', 'model', 'loss', 'solver')}
+    relevant['numerics_version'] = NUMERICS_VERSION
     relevant['train'] = {key: cfg['train'][key] for key in ('batch_size', 'grad_accum_steps', 'amp')}
     return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
 

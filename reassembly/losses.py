@@ -48,6 +48,7 @@ def directional_contact_loss(probabilities: Tensor, positives: Tensor, valid: Te
     Positive and unmatched rows are balanced, so numerous exterior points do
     not make an all-dustbin model appear successful.
     """
+    probabilities = probabilities.float()
     has_match = positives.any(-1)
     mass = (probabilities[..., :-1] * positives.to(probabilities.dtype)).sum(-1)
     matched_loss = -mass.clamp_min(1e-8).log()

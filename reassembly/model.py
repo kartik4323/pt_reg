@@ -98,7 +98,7 @@ class GeometryEncoder(nn.Module):
         full_features = self.propagation(torch.cat([
             interpolate(points.reshape(-1, npoints, 3), coords, feats)
             for coords, feats in hierarchy], -1))
-        descriptors = F.normalize(self.descriptor_head(full_features), dim=-1)
+        descriptors = F.normalize(self.descriptor_head(full_features).float(), dim=-1)
         return {
             "point_features": full_features.reshape(batch, fragments, npoints, -1),
             "descriptor": descriptors.reshape(batch, fragments, npoints, -1),
@@ -180,28 +180,32 @@ class PartialContactMatcher(nn.Module):
             context = self.condition(prior).mean(1)
             gate, shift = self.condition_gate(context).chunk(2, dim=-1)
             features = features * (1 + gate[:, None, None].tanh()) + shift[:, None, None]
-        features = F.normalize(features, dim=-1)
-        fracture = encoded["fracture_logits"].sigmoid().gather(2, indices)
-        temperature = self.log_temperature.exp().clamp(0.02, 1.0)
-        pairs = []
-        for i in range(features.shape[1]):
-            for j in range(i + 1, features.shape[1]):
-                logits = torch.einsum("bkd,bld->bkl", features[:, i], features[:, j]).float() / temperature
-                # Explicit dustbins keep unmatched mass. Neither direction is
-                # renormalized after discarding its dustbin column.
-                source_logits = logits + fracture[:, j, None].clamp_min(1e-6).log()
-                target_logits = logits.transpose(-1, -2) + fracture[:, i, None].clamp_min(1e-6).log()
-                source = torch.cat((source_logits, self.dustbin.expand(*source_logits.shape[:-1], 1)), -1).softmax(-1)
-                target = torch.cat((target_logits, self.dustbin.expand(*target_logits.shape[:-1], 1)), -1).softmax(-1)
-                weights = source[..., :-1] * target[..., :-1].transpose(-1, -2)
-                weights = weights * fracture[:, i, :, None] * fracture[:, j, None, :]
-                valid = encoded["fragment_mask"][:, i].bool() & encoded["fragment_mask"][:, j].bool()
-                weights = weights * valid[:, None, None]
-                pairs.append({"i": i, "j": j, "source_xyz": encoded["token_xyz"][:, i],
-                              "target_xyz": encoded["token_xyz"][:, j],
-                              "source_indices": indices[:, i], "target_indices": indices[:, j],
-                              "weights": weights, "source_prob": source, "target_prob": target,
-                              "valid": valid})
+        # A cast after sigmoid/log or the dot product is too late: AMP may
+        # overflow their intermediate backward values before GradScaler unscales.
+        # Keep this small token matching block in fp32; learned MLPs still use AMP.
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            features = F.normalize(features.float(), dim=-1)
+            fracture = encoded["fracture_logits"].float().sigmoid().gather(2, indices)
+            temperature = self.log_temperature.float().exp().clamp(0.02, 1.0)
+            pairs = []
+            for i in range(features.shape[1]):
+                for j in range(i + 1, features.shape[1]):
+                    logits = torch.einsum("bkd,bld->bkl", features[:, i], features[:, j]) / temperature
+                    # Explicit dustbins keep unmatched mass. Neither direction is
+                    # renormalized after discarding its dustbin column.
+                    source_logits = logits + fracture[:, j, None].clamp_min(1e-6).log()
+                    target_logits = logits.transpose(-1, -2) + fracture[:, i, None].clamp_min(1e-6).log()
+                    source = torch.cat((source_logits, self.dustbin.expand(*source_logits.shape[:-1], 1)), -1).softmax(-1)
+                    target = torch.cat((target_logits, self.dustbin.expand(*target_logits.shape[:-1], 1)), -1).softmax(-1)
+                    weights = source[..., :-1] * target[..., :-1].transpose(-1, -2)
+                    weights = weights * fracture[:, i, :, None] * fracture[:, j, None, :]
+                    valid = encoded["fragment_mask"][:, i].bool() & encoded["fragment_mask"][:, j].bool()
+                    weights = weights * valid[:, None, None]
+                    pairs.append({"i": i, "j": j, "source_xyz": encoded["token_xyz"][:, i],
+                                  "target_xyz": encoded["token_xyz"][:, j],
+                                  "source_indices": indices[:, i], "target_indices": indices[:, j],
+                                  "weights": weights, "source_prob": source, "target_prob": target,
+                                  "valid": valid})
         return pairs
 
 

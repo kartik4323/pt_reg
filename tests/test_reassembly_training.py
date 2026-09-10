@@ -174,6 +174,25 @@ class TrainingLifecycleTests(unittest.TestCase):
         self.assertIsNone(report["attempts"][0]["max_reserved_bytes"])
         self.assertEqual(resolved["data"]["points_per_fragment"], self.cfg["data"]["points_per_fragment"])
 
+    def test_nonfinite_training_loss_persists_failure_report(self):
+        with patch('reassembly.losses.compute_losses', return_value={'loss': torch.tensor(float('nan'))}):
+            with self.assertRaisesRegex(RuntimeError, 'Diagnostics saved'):
+                self.run_stage('numerical-failure')
+        report = json.loads((self.root / 'numerical-failure/training_report.json').read_text())
+        failure = json.loads((self.root / 'numerical-failure/failure.json').read_text())
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['updates'], 0)
+        self.assertEqual(failure['reason'], 'nonfinite_loss')
+        self.assertEqual(failure['update'], 1)
+        self.assertFalse((self.root / 'numerical-failure/latest.pt').exists())
+
+    def test_nonfinite_preflight_returns_failed_diagnostics(self):
+        with patch('reassembly.losses.compute_losses', return_value={'loss': torch.tensor(float('nan'))}):
+            report, _ = preflight(self.cfg, 'cpu')
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['attempts'][0]['diagnostics']['reason'], 'nonfinite_loss')
+        self.assertFalse(report['attempts'][0]['passed'])
+
     def test_runtime_memory_limit_is_strict(self):
         with patch("torch.cuda.max_memory_reserved", return_value=20 * GIB):
             with self.assertRaisesRegex(RuntimeError, "memory cap exceeded"):

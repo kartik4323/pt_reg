@@ -15,6 +15,7 @@ import torch
 from .checkpoints import (finalize_checkpoint_budget, load_checkpoint, require_completed_run,
                           require_resume_config, restore_random_state, save_checkpoint)
 from .resources import GIB, jsonable, seed_all, write_json
+from .precision import NUMERICS_VERSION, NumericalUpdateError, optimizer_update
 
 
 def collate_samples(samples: list[dict], device) -> dict:
@@ -40,9 +41,19 @@ def _autocast(device, enabled):
 
 
 def _scaler(enabled):
-    # torch>=2.1 includes the CUDA namespace; unlike torch.amp.GradScaler,
-    # this spelling also works on the oldest supported torch release.
+    if hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    # Compatibility with older optional environments; the pinned server
+    # environment uses the non-deprecated API above.
     return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _append_event(path, event, guard=None):
+    line = json.dumps(jsonable(event), allow_nan=False) + "\n"
+    if guard:
+        guard.check(additional_bytes=len(line.encode("utf-8")))
+    with Path(path).open("a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
 def _optimizer(model, cfg):
@@ -120,18 +131,23 @@ def preflight(cfg, device, *, sample_batch=None) -> tuple[dict, dict]:
                 optimizer = _optimizer(model, resolved)
                 scaler = _scaler(device.type == "cuda" and cfg["train"]["amp"])
                 batch = synthetic_batch(resolved, batch_size, device) if sample_batch is None else sample_batch(batch_size)
-                optimizer.zero_grad(set_to_none=True)
-                with _autocast(device, scaler.is_enabled()):
-                    losses = compute_losses(model, batch, stage, resolved)
-                if not torch.isfinite(losses["loss"]):
-                    raise RuntimeError(f"Non-finite stage-{stage} preflight loss")
-                scaler.scale(losses["loss"]).backward()
-                scaler.unscale_(optimizer)
-                gradients = [p.grad for p in model.parameters() if p.grad is not None]
-                if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
-                    raise RuntimeError(f"Missing or non-finite stage-{stage} gradients")
-                scaler.step(optimizer)
-                scaler.update()
+                context = {"phase": "preflight", "stage": stage, "update": 1}
+                def backward():
+                    values = {}
+                    accum = int(resolved["train"]["grad_accum_steps"])
+                    for _ in range(accum):
+                        with _autocast(device, scaler.is_enabled()):
+                            losses = compute_losses(model, batch, stage, resolved)
+                        if not torch.isfinite(losses["loss"]):
+                            raise NumericalUpdateError("nonfinite_loss", context, metrics=_loss_numbers(losses))
+                        scaler.scale(losses["loss"] / accum).backward()
+                        for key, value in _loss_numbers(losses).items():
+                            values[key] = values.get(key, 0) + value / accum
+                    return values
+                events = []
+                update = optimizer_update(model, optimizer, scaler, backward,
+                    gradient_clip=resolved["train"]["gradient_clip"], context=context,
+                    on_overflow=events.append)
                 # Include full inference field evaluation, chunked exactly as
                 # the solver, with optimizer state still allocated.
                 if stage == 3:
@@ -145,7 +161,9 @@ def preflight(cfg, device, *, sample_batch=None) -> tuple[dict, dict]:
                         chunk = resolved["solver"]["field_chunk"]
                         for offset in range(0, len(queries), chunk):
                             field = model.scaffold(encoded, queries[offset:offset + chunk][None].expand(batch_size, -1, -1))
-                attempt["stages"].append({"stage": stage, "losses": _loss_numbers(losses)})
+                attempt["stages"].append({"stage": stage, "losses": update["metrics"],
+                    "optimizer_update": {k: v for k, v in update.items() if k != "metrics"},
+                    "numerical_events": events})
                 model = optimizer = scaler = gradients = batch = losses = encoded = field = queries = lin = None
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -161,7 +179,14 @@ def preflight(cfg, device, *, sample_batch=None) -> tuple[dict, dict]:
             if within_limit:
                 return {"status": "passed" if device.type == "cuda" else "cpu_verified_cuda_unmeasured",
                         "attempts": attempts, "fallback_applied": batch_size != initial_batch,
-                        "effective_batch": effective_batch, "max_vram_gib": cfg["resources"]["max_vram_gib"]}, resolved
+                        "effective_batch": effective_batch, "max_vram_gib": cfg["resources"]["max_vram_gib"],
+                        "numerics_version": NUMERICS_VERSION}, resolved
+        except NumericalUpdateError as exc:
+            attempt.update(passed=False, error=str(exc), diagnostics=exc.diagnostics,
+                           numerical_events=events, seconds=time.perf_counter() - start)
+            attempts.append(attempt)
+            return {"status": "failed", "attempts": attempts, "reason": "numerical_update_failed",
+                    "numerics_version": NUMERICS_VERSION}, resolved
         except torch.cuda.OutOfMemoryError as exc:
             attempt.update({"passed": False, "error": str(exc), "seconds": time.perf_counter() - start})
             attempts.append(attempt)
@@ -293,6 +318,7 @@ def train_stage(cfg, manifest, run_dir, stage, device, *, initialize_from=None, 
     write_json(run_dir / "run.json", {"schema_version": 2, "run_id": run_id, "stage": stage, "purpose": purpose,
         "condition": condition, "dataset_fingerprint": fingerprint, "manifest": str(path.resolve()),
         "device": str(device), "torch": torch.__version__, "source_count": source_count,
+        "numerics_version": NUMERICS_VERSION,
         "initialize_from": str(initialize_from) if initialize_from else (previous_metadata or {}).get("initialize_from"),
         "resume": str(resume) if resume else None}, guard)
     write_json(run_dir / "training_report.json", {"kind": "training", "schema_version": 2,
@@ -302,30 +328,55 @@ def train_stage(cfg, manifest, run_dir, stage, device, *, initialize_from=None, 
     bs = int(cfg["train"]["batch_size"])
     start = time.perf_counter()
     last_metrics = {}
+    overflow_retries = checkpoint.get("metrics", {}).get("amp_overflow_retries_total", 0) if resume else 0
+
+    def record_overflow(event):
+        nonlocal overflow_retries
+        overflow_retries += int(event["retry_scheduled"])
+        event = dict(event, run_id=run_id, seconds=time.perf_counter() - start,
+                     numerics_version=NUMERICS_VERSION)
+        _append_event(run_dir / "numerics.jsonl", event, guard)
+        action = "replaying the same accumulated batch" if event["retry_scheduled"] else "stopping after unsuccessful recovery"
+        print(f"stage={stage} update={event['update']} AMP overflow: "
+              f"scale {event['scale_before']:g} -> {event['scale_after']:g}; "
+              f"{action} (attempt {event['attempt']})", flush=True)
+
     for step in range(initial_step, steps):
         dataset.set_step(step)
         model.train()
         configure_stage(model, stage)
-        optimizer.zero_grad(set_to_none=True)
-        train_values = {}
-        for _ in range(accum):
-            indices = np.random.choice(len(dataset), bs, replace=len(dataset) < bs)
-            batch = collate_samples([dataset[int(idx)] for idx in indices], device)
-            with _autocast(device, scaler.is_enabled()):
-                losses = compute_losses(model, batch, stage, cfg)
-            if not torch.isfinite(losses["loss"]):
-                raise RuntimeError(f"Non-finite stage {stage} loss at update {step + 1}")
-            scaler.scale(losses["loss"] / accum).backward()
-            for key, value in _loss_numbers(losses).items():
-                train_values[key] = train_values.get(key, 0) + value / accum
-        scaler.unscale_(optimizer)
-        gradients = [p.grad for p in model.parameters() if p.grad is not None]
-        if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
-            raise RuntimeError(f"Missing/non-finite gradients at stage {stage}, update {step + 1}")
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["gradient_clip"])
-        scaler.step(optimizer)
-        scaler.update()
-        gradients = None
+        context = {"phase": "training", "stage": stage, "update": step + 1}
+        def backward():
+            values, pattern_ids = {}, []
+            for _ in range(accum):
+                indices = np.random.choice(len(dataset), bs, replace=len(dataset) < bs)
+                batch = collate_samples([dataset[int(idx)] for idx in indices], device)
+                pattern_ids.extend(batch.get("pattern_id", []))
+                with _autocast(device, scaler.is_enabled()):
+                    losses = compute_losses(model, batch, stage, cfg)
+                if not torch.isfinite(losses["loss"]):
+                    raise NumericalUpdateError("nonfinite_loss", context, metrics=_loss_numbers(losses),
+                                               pattern_ids=pattern_ids)
+                scaler.scale(losses["loss"] / accum).backward()
+                for key, value in _loss_numbers(losses).items():
+                    values[key] = values.get(key, 0) + value / accum
+            return dict(values, pattern_ids=pattern_ids)
+        try:
+            update = optimizer_update(model, optimizer, scaler, backward,
+                gradient_clip=cfg["train"]["gradient_clip"], context=context,
+                on_overflow=record_overflow)
+        except NumericalUpdateError as exc:
+            failure = dict(exc.diagnostics, kind="numerical_failure", run_id=run_id,
+                           dataset_fingerprint=fingerprint, numerics_version=NUMERICS_VERSION)
+            write_json(run_dir / "failure.json", failure, guard)
+            write_json(run_dir / "training_report.json", {
+                "kind": "training", "schema_version": 2, "status": "failed", "run_id": run_id,
+                "stage": stage, "purpose": purpose, "condition": condition, "updates": step,
+                "planned_updates": steps, "dataset_fingerprint": fingerprint,
+                "numerics_version": NUMERICS_VERSION, "amp_overflow_retries_total": overflow_retries,
+                "failure": failure}, guard)
+            raise RuntimeError(f"{exc}. Diagnostics saved to {run_dir / 'failure.json'}") from exc
+        train_values = {k: v for k, v in update["metrics"].items() if k != "pattern_ids"}
         _check_cuda_memory(device, cfg)
         if (step + 1) % cfg["train"]["validation_interval"] == 0 or step + 1 == steps:
             metrics = _validate(model, validation, stage, cfg, device)
@@ -335,7 +386,9 @@ def train_stage(cfg, manifest, run_dir, stage, device, *, initialize_from=None, 
                 raise RuntimeError("Cannot checkpoint a non-finite validation score")
             improved = score < best
             best = min(best, score)
-            last_metrics = {"train": train_values, "validation": metrics, "best_validation": best}
+            last_metrics = {"train": train_values, "validation": metrics, "best_validation": best,
+                            "optimizer_update": {k: v for k, v in update.items() if k != "metrics"},
+                            "amp_overflow_retries_total": overflow_retries}
             elapsed = time.perf_counter() - start
             record = {"update": step + 1, "seconds": elapsed,
                       "updates_per_second": (step + 1 - initial_step) / max(elapsed, 1e-6), **last_metrics}
@@ -352,6 +405,7 @@ def train_stage(cfg, manifest, run_dir, stage, device, *, initialize_from=None, 
               "updates": steps, "seconds": time.perf_counter() - start, "metrics": last_metrics,
               "kind": "training", "schema_version": 2, "dataset_fingerprint": fingerprint,
               "updates_this_invocation": steps - initial_step,
+              "numerics_version": NUMERICS_VERSION, "amp_overflow_retries_total": overflow_retries,
               "best_checkpoint": str((run_dir / "best.pt").resolve()),
               "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None,
               "long_training_started": False}

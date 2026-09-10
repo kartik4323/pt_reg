@@ -276,6 +276,28 @@ python -u -m reassembly train --config "$CFG" --manifest "$DATA" --device cuda \
 
 For an interrupted fixed overfit stage, add `--overfit` and use its `overfit/sN` directory. Completed budgets are not resumed automatically. Changing data, architecture, loss settings or batch settings requires a fresh experiment and matching preflight.
 
+If an older checkout stopped with `Missing/non-finite gradients at stage 1, update 16`, update the code and repeat CUDA preflight. The revised training loop uses the current GradScaler API, keeps sensitive contact operations in float32, and retries overflowed accumulated batches with a lower scale. Retries preserve sample selection/random views and do not count as successful optimizer updates. Up to eight retries are allowed per update; persistent non-finite gradients, missing gradients and non-finite losses still stop training. This follows [PyTorch's AMP gradient-scaling and clipping procedure](https://docs.pytorch.org/docs/2.11/notes/amp_examples.html).
+
+For the reported early failure (before the first checkpoint at update 100), preserve the failed run and old preflight, then start a fresh overfit run using the existing prepared data:
+
+```bash
+(
+set -euo pipefail
+git pull --ff-only origin main
+export REASSEMBLY_ROOT="${REASSEMBLY_ROOT:-$HOME/reassembly_v2}"
+WORK="$REASSEMBLY_ROOT/bottles498"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+mv -T -- "$WORK/overfit" "$WORK/overfit.failed-$STAMP"
+mv -T -- "$WORK/preflight" "$WORK/preflight.before-amp-fix-$STAMP"
+bash scripts/run_reassembly_v2_pilot.sh preflight
+bash scripts/run_reassembly_v2_pilot.sh overfit
+)
+```
+
+Use the managed root from the failed run's log if it differs from the default. Keep the Python environment active and run this from the repository directory. Prepared geometry is reused. Older preflight signatures are intentionally rejected because numerical operations and their GPU memory use changed.
+
+`numerics.jsonl` records overflow attempts, scales, affected parameter names, sampled pattern IDs and loss components. Validation history includes gradient norm, AMP scale and cumulative retry count. A persistent numerical failure writes `failure.json` and marks `training_report.json` as failed. After the fixed overfit gate passes, continue with the runner's `train`, `evaluate` and `report` commands.
+
 XYZ-only inference accepts two or three `N×3` NumPy arrays in consistent units:
 
 ```bash
