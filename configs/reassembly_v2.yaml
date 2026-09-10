@@ -1,0 +1,44 @@
+# Supported A5000 pilot; no checkpoint discovery or pretrained initialization.
+version: 2
+data:
+  category: "02876657"
+  points_per_fragment: 1024
+  reservoir_points: 4096
+  sdf_queries: 2048
+  sdf_reservoir_queries: 8192
+  target_points: 2048
+  max_sources: 100
+  min_sources: 30
+  patterns_per_source: 8
+  split_ratios: [0.8, 0.1, 0.1]
+  seed: 42
+model:
+  sample_counts: [256, 128, 64]
+  dim: 128
+  neighbors: 16
+  attention_layers: 2
+  heads: 4
+  truncation: 0.1
+train:
+  max_updates: 2000
+  overfit_updates: 2000
+  overfit_patterns: 16
+  batch_size: 2
+  grad_accum_steps: 4
+  validation_interval: 100
+  validation_samples: 32
+  amp: true
+solver:
+  resolution: 32
+  field_chunk: 2048
+  field_extent: 2.25
+  keep_pair_candidates: 4
+  refine_candidates: 4
+  refinement_iterations: 5
+  prior_weight: 0.25
+resources:
+  managed_root: ~/reassembly_v2
+  max_download_gib: 4
+  cap_gib: 40
+  min_free_gib: 50
+  max_vram_gib: 20

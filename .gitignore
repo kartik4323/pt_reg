@@ -46,6 +46,12 @@ partnet-pilot-v1/
 partnet-full/
 *.tar.zst
 
+# Managed v2 data and scratch belong outside the source checkout.
+reassembly_v2/
+reassembly_v2_checks/
+02876657.zip
+02876657.zip.part
+
 # Training outputs, checkpoints, and experiment trackers
 outputs/
 outputs_*/

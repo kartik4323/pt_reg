@@ -1,0 +1,12 @@
+# Direct dependency versions used by the v2 CPU correctness checks.
+# Install the CUDA torch wheel first on the server; see docs/REASSEMBLY_SERVER.md.
+# GPU memory/performance still require the measured CUDA preflight.
+torch==2.11.0
+numpy==2.2.6
+PyYAML==6.0.2
+trimesh==4.12.2
+manifold3d==3.5.3
+rtree==1.4.1
+scipy==1.15.3
+huggingface_hub==0.31.4
+matplotlib==3.10.9
