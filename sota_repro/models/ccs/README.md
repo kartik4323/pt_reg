@@ -14,3 +14,11 @@ removes the mismatched pip PyTorch3D wheel from the upstream recipe when
 present, rebuilds Chamfer and PointNet2 against the pinned Torch ABI, runs
 `pip check`, and performs CPU import checks. `smoke` additionally runs the
 compiled CUDA operators before training.
+
+The Chamfer and PointNet2 builds need a CUDA 11 compiler, not only Conda's
+CUDA runtime. Setup discovers `CUDA_HOME`, `nvcc` on `PATH`, cluster installs
+under `/usr/local/cuda-11*`, and an environment-local toolkit. If none exists,
+load the cluster's CUDA 11 module or install `cudatoolkit-dev=11.3.1` into the
+CCS environment and rerun setup. Cleanup removes generated build artifacts
+directly and does not invoke `setup.py clean`, which itself incorrectly
+requires `CUDA_HOME` in these upstream extensions.

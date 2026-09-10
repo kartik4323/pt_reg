@@ -38,6 +38,9 @@ class DiffAssembleTests(unittest.TestCase):
                       profile['dependencies'])
         self.assertEqual(spec['commands']['setup'][0][1], '{model_dir}/setup_repro.py')
         self.assertEqual(spec['commands']['smoke'][0][1], '{model_dir}/doctor.py')
+        setup_text = (ROOT / 'models/ccs/setup_repro.py').read_text()
+        self.assertIn("environment['CUDA_HOME']", setup_text)
+        self.assertNotIn("'setup.py', 'clean'", setup_text)
         for name in ('setup_repro.py', 'doctor.py'):
             ast.parse((ROOT / 'models/ccs' / name).read_text(), feature_version=(3, 8))
 

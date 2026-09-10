@@ -7,8 +7,41 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
+
+
+def find_cuda_home(env_name, environment):
+    """Find a CUDA 11 compiler; the cudatoolkit runtime alone has no nvcc."""
+    candidates = []
+    configured = environment.get('CUDA_HOME') or environment.get('CUDA_PATH')
+    if configured:
+        candidates.append(Path(configured))
+    nvcc = shutil.which('nvcc', path=environment.get('PATH'))
+    if nvcc:
+        candidates.append(Path(nvcc).resolve().parent.parent)
+    candidates.extend([Path('/usr/local/cuda-11.3'), Path('/usr/local/cuda')])
+    candidates.extend(sorted(Path('/usr/local').glob('cuda-11*'), reverse=True))
+    try:
+        prefix = subprocess.check_output(
+            ['conda', 'run', '-n', env_name, 'python', '-c', 'import sys; print(sys.prefix)'],
+            env=environment, text=True).strip()
+        candidates.append(Path(prefix))
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        compiler = candidate / 'bin/nvcc'
+        if compiler.is_file():
+            output = subprocess.check_output([str(compiler), '--version'], env=environment, text=True)
+            if 'release 11.' in output:
+                return candidate, output.strip()
+    return None, None
 
 
 def main():
@@ -58,6 +91,20 @@ def main():
                   '-c', model_dir / 'constraints.repro.txt',
                   '--report', args.output / 'pip-install-report.json'])
 
+    cuda_home, nvcc_version = find_cuda_home(args.env, environment)
+    if cuda_home is None:
+        raise RuntimeError(
+            'CCS must compile Chamfer and PointNet2, but no CUDA 11 nvcc was found. '
+            'Load your cluster CUDA 11 module or install '
+            '`conda install -n %s -c conda-forge cudatoolkit-dev=11.3.1`, then rerun setup.'
+            % args.env)
+    environment['CUDA_HOME'] = str(cuda_home)
+    environment['CUDA_PATH'] = str(cuda_home)
+    environment['PATH'] = str(cuda_home / 'bin') + os.pathsep + environment.get('PATH', '')
+    environment['LD_LIBRARY_PATH'] = (str(cuda_home / 'lib64') + os.pathsep +
+                                      environment.get('LD_LIBRARY_PATH', ''))
+    print('Using CUDA_HOME=%s\n%s' % (cuda_home, nvcc_version), flush=True)
+
     # Rebuild the two CUDA extensions against the pinned Torch ABI. Remove only
     # generated extension binaries inside the disposable native_build tree.
     extension_roots = [
@@ -69,7 +116,9 @@ def main():
             raise RuntimeError('Extension path escaped the disposable source tree')
         for binary in extension_root.rglob('*.so'):
             binary.unlink()
-        run(prefix + ['python', 'setup.py', 'clean', '--all'], cwd=extension_root)
+        build_dir = extension_root / 'build'
+        if build_dir.exists():
+            shutil.rmtree(str(build_dir))
 
     run(prefix + ['python', '-m', 'pip', 'install', '--no-deps', '-e', '.'], cwd=source)
     run(prefix + ['python', '-m', 'pip', 'install', '--no-deps', '-e', '.'], cwd=extension_roots[0])
