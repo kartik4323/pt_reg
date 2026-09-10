@@ -19,6 +19,8 @@ flowchart LR
 
 Start with [the Linux GPU server training guide](docs/REASSEMBLY_SERVER.md), [the v2 runbook](docs/REASSEMBLY_V2.md), and [data preparation notes](docs/REASSEMBLY_DATA.md). The default configuration is [configs/reassembly_v2.yaml](configs/reassembly_v2.yaml).
 
+For the expanded bottle source pool, use [configs/reassembly_v2_bottles498.yaml](configs/reassembly_v2_bottles498.yaml). After server setup, `bash scripts/run_reassembly_v2_pilot.sh all` runs preparation through evaluation/reporting, saving logs and stopping at failed gates. It uses fresh stage weights and bounded pilot budgets.
+
 ```bash
 python -m pip install -r requirements.txt
 python -m reassembly --help

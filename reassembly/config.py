@@ -95,8 +95,13 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("This workflow is a bounded pilot: train.max_updates must not exceed 2000")
     if not 1 <= cfg["train"]["overfit_updates"] <= 2000 or cfg["train"]["overfit_patterns"] != 16:
         raise ValueError("The fixed pilot check requires exactly 16 patterns and 1–2000 updates")
-    if not 30 <= cfg["data"]["min_sources"] <= 100 or not 1 <= cfg["data"]["max_sources"] <= 100:
-        raise ValueError("The geometry pilot examines at most 100 sources and requires at least 30 for held-out learning")
+    reassessment = cfg["data"].get("source_pool_reassessment", False)
+    if not isinstance(reassessment, bool):
+        raise ValueError("data.source_pool_reassessment must be a boolean")
+    source_cap = 498 if reassessment else 100
+    if not 30 <= cfg["data"]["min_sources"] <= 100 or not 1 <= cfg["data"]["max_sources"] <= source_cap:
+        raise ValueError(f"Source preparation examines at most {source_cap} candidates and requires at least 30 sources; "
+                         "use the explicit bottle source-pool reassessment configuration to expand the initial 100")
     if list(cfg["data"]["split_ratios"]) != [0.8, 0.1, 0.1]:
         raise ValueError("The supported source split is 80/10/10")
     if not 0 < cfg["resources"]["cap_gib"] <= 40 or cfg["resources"]["min_free_gib"] < 50:

@@ -4,7 +4,7 @@ These results verify software correctness and the first real ShapeNet geometry p
 
 ## Completed
 
-- **68 automated tests pass:** 20 data, 9 neural, 20 solver, 10 training lifecycle, and 9 workflow tests. Command: `python -m unittest discover -s tests -p 'test_reassembly*.py' -q`.
+- **73 automated tests pass:** 20 data, 9 neural, 20 solver, 10 training lifecycle, 10 workflow, and 4 Bash-runner tests. Command: `python -m unittest discover -s tests -p 'test_reassembly*.py' -q`. Runner tests simulate CLI outputs to check stage ordering, arguments and early stopping; they do not measure GPU or learning performance.
 - Five production preflight correctness checks pass. Maximum oracle transform error was `1.12e-15`; original-coordinate export error was below `2e-15` on deterministic fixtures, within the required `1e-5` tolerance.
 - The full default configuration completed real forward/loss/backward/optimizer steps in all three stages on CPU, with batch 2, 1,024 points per fragment and chunked 32³ field evaluation. The recorded preflight took about 4 seconds on this host; reserved GPU memory is explicitly null.
 - A separate small end-to-end fixture run exercised eight CLI operations: preparation, prepared-data preflight, three learned stages, evaluation, XYZ inference with scaffold plotting, and reporting. Ten synthetic meshes produced 30 complementary patterns. Only two optimizer updates per stage were run; the unfitted model returned explicit failures and the report correctly denied advancement.
@@ -37,8 +37,26 @@ The accepted-source count is below the required 30, so no learning run was start
 
 Local artifacts: `D:/reassembly_v2/sources/02876657.zip`, `D:/reassembly_v2/prepared_corrected/manifest.json`, and `D:/reassembly_v2/geometry_pilot_summary.json`. The initial rejected run remains separately under `D:/reassembly_v2/prepared` for diagnosis; use the corrected manifest for inspecting accepted examples.
 
+## Expanded source-pool reassessment
+
+After the initial 100-source stop, a read-only audit of all 498 downloaded bottle meshes found 73 passing the same source validation. The explicit `configs/reassembly_v2_bottles498.yaml` configuration expands candidate inspection to 498, pins the audited source revision, and retains the 30-source gate, geometry rules and all model/training/resource limits. The default configuration still examines 100 candidates.
+
+Full preparation with this configuration then completed on CPU:
+
+| Result | Count |
+|---|---:|
+| Accepted sources with valid fracture patterns | 73 |
+| Accepted patterns | 546 |
+| Two-piece / three-piece patterns | 329 / 217 |
+| Easy / intermediate / hard patterns | 183 / 219 / 144 |
+| Train / validation / test / cut-holdout patterns | 418 / 48 / 69 / 11 |
+
+Preparation took 235.7 seconds and reported `learning_ready: true`. All 73 source and 546 pattern hashes verified (73,474,130 payload bytes). Dataset fingerprint: `9e6a9677a1688b579ffe1ab205fddd0e4fa0815ea48332b9c9bfc6417d29b0d1`. Local manifest: `D:/reassembly_v2/bottles498/prepared/manifest.json`. Source split assignment still occurs before fracture generation; after geometry rejection, retained train/validation/test source counts are 56/6/11.
+
+The server runner `scripts/run_reassembly_v2_pilot.sh` now provides preparation, CUDA preflight, fixed overfit, matched pilots, evaluation and report commands. Its 17 guide Bash blocks and embedded Python were syntax-checked. All four orchestration tests passed, including stopping before training after preparation/preflight failure and before held-out training after a failed overfit gate.
+
 ## Not yet measured
 
-The current host has CPU-only PyTorch. The A5000 preflight, fixed 16-pattern learning check, bounded held-out pilots, and four-condition scaffold-benefit comparison remain pending source-pool reassessment and a passing 30-source geometry gate. No previous checkpoints were loaded, and no full training run was launched.
+The current host has CPU-only PyTorch. The expanded dataset passes the 30-source geometry gate. The A5000 preflight, fixed 16-pattern learning check, bounded held-out pilots, and four-condition scaffold-benefit comparison remain pending GPU execution. No previous checkpoints were loaded, and no full training run was launched.
 
 Follow [the runbook](REASSEMBLY_V2.md) for the measured experiment. Treat `advance_eligible: false` as the current research status; numerical fixture accuracy does not establish that the scaffold improves learned assembly.

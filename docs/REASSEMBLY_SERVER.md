@@ -4,7 +4,9 @@ Repository: https://github.com/kartik4323/pt_reg
 
 This guide uses an RTX A5000 (24 GB), Python 3.10, and fresh v2 checkpoints. It covers setup, data acquisition, preflight, three-stage training, evaluation, resume and inference. Run the blocks in order on the server in Bash.
 
-**Current data gate:** the first 100 ShapeNet bottle candidates yielded **14 accepted sources and 102 fracture patterns**. Held-out learning requires **30 accepted sources**. Repeating those same candidates on a server will not solve the geometry yield problem. Setup and data preparation are ready to run; the training commands below are for a dataset that passes the gate after source-pool reassessment. Do not lower `min_sources`, fill cavities, or change rejection rules just to start training. The original 100-source pilot cap remains in the configuration.
+**Expanded source pool:** the first 100 ShapeNet bottle candidates yielded **14 accepted sources and 102 fracture patterns**. A subsequent audit of all **498** bottles found **73** sources passing the same geometry validation. This guide now uses `configs/reassembly_v2_bottles498.yaml`, which explicitly expands the source pool and pins the audited archive revision. Preparation must still retain at least **30 sources with valid complementary fractures** before training. The original 100-source configuration remains available for reproducing the initial pilot.
+
+Expanded preparation has now completed locally: **73 sources and 546 complementary patterns**, with content hashes verified and `learning_ready: true`. Preparation took about **236 seconds on CPU**. GPU memory, overfit success and learned assembly performance still need to be measured on the VM.
 
 ## 1. Clone and create a fresh environment
 
@@ -58,12 +60,14 @@ The example uses your home filesystem, which should have at least 50 GiB free th
 source "$HOME/venvs/ptreg-v2/bin/activate"
 cd "$HOME/pt_reg"  # Adjust if you cloned elsewhere.
 export ROOT="$HOME/reassembly_v2"
-export BASE="$PWD/configs/reassembly_v2.yaml"
-export DATA="$ROOT/prepared/manifest.json"
-export PF="$ROOT/preflight/preflight.json"
-export CFG="$ROOT/preflight/config.resolved.json"
+export WORK="$ROOT/bottles498"
+export REASSEMBLY_ROOT="$ROOT"
+export BASE="$PWD/configs/reassembly_v2_bottles498.yaml"
+export DATA="$WORK/prepared/manifest.json"
+export PF="$WORK/preflight/preflight.json"
+export CFG="$WORK/preflight/config.resolved.json"
 export OMP_NUM_THREADS=8
-mkdir -p "$ROOT/logs"
+mkdir -p "$WORK/logs"
 df -h "$ROOT"
 ```
 
@@ -75,6 +79,25 @@ python -c 'from getpass import getpass; from huggingface_hub import login; login
 
 Use your token at the prompt; no credential belongs in a tracked script, configuration or command example. This Python login works with the pinned Hub client. Authentication is separate from GitHub authentication used to clone a private repository.
 
+The following runner performs acquisition/preparation, CUDA preflight, the fixed overfit check, both fresh training conditions, eight evaluations and the two final reports. It stops at the first failed command or acceptance gate and saves console output in `$WORK/logs`, alongside package versions and the Git commit. All training is bounded to 2,000 updates per stage; reporting does not launch a longer run.
+
+```bash
+bash scripts/run_reassembly_v2_pilot.sh all
+```
+
+For separate invocations, execute the stages in this order, checking each exit status before continuing:
+
+```bash
+bash scripts/run_reassembly_v2_pilot.sh prepare
+bash scripts/run_reassembly_v2_pilot.sh preflight
+bash scripts/run_reassembly_v2_pilot.sh overfit
+bash scripts/run_reassembly_v2_pilot.sh train
+bash scripts/run_reassembly_v2_pilot.sh evaluate
+bash scripts/run_reassembly_v2_pilot.sh report
+```
+
+Choose either the single `all` invocation or the separate stages. Existing runs are preserved and are never automatically resumed. Sections 3–8 below document the underlying CLI calls and explicit resume procedure; they do not need to be repeated after a successful runner invocation. A failed gate is a result to inspect, not a reason to lower the thresholds.
+
 ## 3. Acquire, prepare, and inspect the geometry gate
 
 ```bash
@@ -83,8 +106,8 @@ python -m reassembly acquire --config "$BASE" --managed-root "$ROOT"
 
 set -o pipefail
 python -u -m reassembly prepare --config "$BASE" --managed-root "$ROOT" \
-  --source "$ROOT/sources/02876657.zip" --output "$ROOT/prepared" \
-  2>&1 | tee "$ROOT/logs/prepare.log"
+  --source "$ROOT/sources/02876657.zip" --output "$WORK/prepared" \
+  2>&1 | tee "$WORK/logs/prepare.log"
 ```
 
 An existing bottle archive can be passed directly to `--source`; another download is unnecessary. Preparation refuses to overwrite an existing prepared manifest. Use a fresh output directory for a revised source selection and update `DATA` accordingly.
@@ -104,15 +127,15 @@ if not r['learning_ready']:
 PY
 ```
 
-**Stop here for the current 14-source dataset.** The remaining commands document the measured training sequence once preparation passes. New source data changes the dataset fingerprint and requires fresh preflight and training runs.
+Continue only when expanded preparation reports `learning_ready: true`. New source selection changes the dataset fingerprint and requires fresh preflight and training runs. Source-validation yield alone is insufficient; complementary fracture generation must pass too.
 
 ## 4. Profile all three stages on the A5000
 
 ```bash
 set -o pipefail
 python -u -m reassembly preflight --config "$BASE" --managed-root "$ROOT" \
-  --manifest "$DATA" --device cuda --output "$ROOT/preflight" \
-  2>&1 | tee "$ROOT/logs/preflight.log"
+  --manifest "$DATA" --device cuda --output "$WORK/preflight" \
+  2>&1 | tee "$WORK/logs/preflight.log"
 ```
 
 The report must have `status: passed` and peak reserved memory **below 20 GiB**. The profiler retries batch 1 with more accumulation if batch 2 exceeds the cap; point resolution stays unchanged. Use `CFG`, the generated resolved config, for all later commands. A CPU preflight cannot authorize CUDA training. Do not use local Windows preflight reports on the server.
@@ -140,17 +163,17 @@ for STAGE in 1 2 3; do
   INIT=()
   if [ "$STAGE" -gt 1 ]; then
     PREV=$((STAGE - 1))
-    INIT=(--initialize-from "$ROOT/overfit/s$PREV/best.pt")
+    INIT=(--initialize-from "$WORK/overfit/s$PREV/best.pt")
   fi
   python -u -m reassembly train --config "$CFG" --manifest "$DATA" --device cuda \
     --preflight-report "$PF" --overfit --stage "$STAGE" \
-    --run-dir "$ROOT/overfit/s$STAGE" "${INIT[@]}" \
-    2>&1 | tee "$ROOT/logs/overfit-s$STAGE.log"
+    --run-dir "$WORK/overfit/s$STAGE" "${INIT[@]}" \
+    2>&1 | tee "$WORK/logs/overfit-s$STAGE.log"
 done
 python -u -m reassembly evaluate --config "$CFG" --manifest "$DATA" --device cuda \
-  --overfit --checkpoint "$ROOT/overfit/s3/best.pt" --output "$ROOT/overfit/eval" \
-  2>&1 | tee "$ROOT/logs/overfit-eval.log"
-python - "$ROOT/overfit/eval/evaluation.json" <<'PY'
+  --overfit --checkpoint "$WORK/overfit/s3/best.pt" --output "$WORK/overfit/eval" \
+  2>&1 | tee "$WORK/logs/overfit-eval.log"
+python - "$WORK/overfit/eval/evaluation.json" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
 print(r['summary'])
@@ -169,7 +192,7 @@ This runs separate fresh `predicted` and `contact_only` experiments with equal b
 (
 set -euo pipefail
 for CONDITION in predicted contact_only; do
-  RUN="$ROOT/pilot/$CONDITION"
+  RUN="$WORK/pilot/$CONDITION"
   for STAGE in 1 2 3; do
     INIT=()
     if [ "$STAGE" -gt 1 ]; then
@@ -177,9 +200,9 @@ for CONDITION in predicted contact_only; do
       INIT=(--initialize-from "$RUN/s$PREV/best.pt")
     fi
     python -u -m reassembly train --config "$CFG" --manifest "$DATA" --device cuda \
-      --preflight-report "$PF" --overfit-report "$ROOT/overfit/eval/evaluation.json" \
+      --preflight-report "$PF" --overfit-report "$WORK/overfit/eval/evaluation.json" \
       --condition "$CONDITION" --stage "$STAGE" --run-dir "$RUN/s$STAGE" "${INIT[@]}" \
-      2>&1 | tee "$ROOT/logs/$CONDITION-s$STAGE.log"
+      2>&1 | tee "$WORK/logs/$CONDITION-s$STAGE.log"
   done
 done
 )
@@ -198,9 +221,9 @@ for SPLIT in test cut_holdout; do
     if [ "$CONDITION" = contact_only ]; then MODEL=contact_only; fi
     python -u -m reassembly evaluate --config "$CFG" --manifest "$DATA" --device cuda \
       --split "$SPLIT" --condition "$CONDITION" \
-      --checkpoint "$ROOT/pilot/$MODEL/s3/best.pt" \
-      --output "$ROOT/eval/$SPLIT/$CONDITION" \
-      2>&1 | tee "$ROOT/logs/eval-$SPLIT-$CONDITION.log"
+      --checkpoint "$WORK/pilot/$MODEL/s3/best.pt" \
+      --output "$WORK/eval/$SPLIT/$CONDITION" \
+      2>&1 | tee "$WORK/logs/eval-$SPLIT-$CONDITION.log"
   done
 done
 )
@@ -215,17 +238,17 @@ Create one decision report for each split:
 set -euo pipefail
 for SPLIT in test cut_holdout; do
   INPUTS=(--input "$(dirname "$DATA")/preparation_report.json" --input "$PF"
-          --input "$ROOT/overfit/eval/evaluation.json")
+          --input "$WORK/overfit/eval/evaluation.json")
   for MODEL in predicted contact_only; do
     for STAGE in 1 2 3; do
-      INPUTS+=(--input "$ROOT/pilot/$MODEL/s$STAGE/training_report.json")
+      INPUTS+=(--input "$WORK/pilot/$MODEL/s$STAGE/training_report.json")
     done
   done
   for CONDITION in contact_only predicted gt perturbed; do
-    INPUTS+=(--input "$ROOT/eval/$SPLIT/$CONDITION/evaluation.json")
+    INPUTS+=(--input "$WORK/eval/$SPLIT/$CONDITION/evaluation.json")
   done
   python -m reassembly report --config "$CFG" "${INPUTS[@]}" \
-    --output "$ROOT/pilot_report_$SPLIT.json"
+    --output "$WORK/pilot_report_$SPLIT.json"
 done
 )
 ```
@@ -239,7 +262,7 @@ In another SSH terminal:
 ```bash
 watch -n 2 nvidia-smi
 # Or inspect the current log:
-tail -f "$HOME/reassembly_v2/logs/predicted-s3.log"
+tail -f "$HOME/reassembly_v2/bottles498/logs/predicted-s3.log"
 ```
 
 Resume an interrupted stage with its explicit checkpoint and the same run directory/configuration:
@@ -247,8 +270,8 @@ Resume an interrupted stage with its explicit checkpoint and the same run direct
 ```bash
 python -u -m reassembly train --config "$CFG" --manifest "$DATA" --device cuda \
   --preflight-report "$PF" --condition predicted --stage 3 \
-  --run-dir "$ROOT/pilot/predicted/s3" --resume "$ROOT/pilot/predicted/s3/latest.pt" \
-  2>&1 | tee -a "$ROOT/logs/predicted-s3-resume.log"
+  --run-dir "$WORK/pilot/predicted/s3" --resume "$WORK/pilot/predicted/s3/latest.pt" \
+  2>&1 | tee -a "$WORK/logs/predicted-s3-resume.log"
 ```
 
 For an interrupted fixed overfit stage, add `--overfit` and use its `overfit/sN` directory. Completed budgets are not resumed automatically. Changing data, architecture, loss settings or batch settings requires a fresh experiment and matching preflight.
@@ -257,9 +280,9 @@ XYZ-only inference accepts two or three `N×3` NumPy arrays in consistent units:
 
 ```bash
 python -m reassembly infer --config "$CFG" --device cuda \
-  --checkpoint "$ROOT/pilot/predicted/s3/best.pt" \
+  --checkpoint "$WORK/pilot/predicted/s3/best.pt" \
   --fragment /path/to/fragment_a.npy --fragment /path/to/fragment_b.npy \
-  --output "$ROOT/inference/example_001" --save-scaffold
+  --output "$WORK/inference/example_001" --save-scaffold
 ```
 
 For three pieces, add a third `--fragment`. Use a fresh output directory. `result.json` reports status, confidence and transforms; `assembly.npz` contains aligned original-resolution fragments when a solve exists. Apply matrices as `x_aligned = x @ R.T + t`; the reference transform is identity. Failed solves return null transforms; low-confidence or failed results exit with code 2 and must not be treated as successful assemblies.

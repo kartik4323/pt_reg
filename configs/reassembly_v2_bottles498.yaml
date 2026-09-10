@@ -1,0 +1,10 @@
+# Explicit reassessment after the first 100 candidates yielded only 14 sources.
+# All omitted settings use the supported v2 defaults, including 2,000 updates,
+# 1,024 points, batch 2 / accumulation 4, 20 GiB VRAM and 40 GiB managed storage.
+version: 2
+data:
+  category: "02876657"
+  source_pool_reassessment: true
+  max_sources: 498
+  min_sources: 30
+  source_revision: "73b692a98ee796df2f64511e0cbd4a8af2c20b27"

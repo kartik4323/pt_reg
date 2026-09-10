@@ -136,6 +136,30 @@ class WorkflowTests(unittest.TestCase):
         for command in ("acquire", "prepare", "preflight", "train", "evaluate", "infer", "report"):
             self.assertIn(command, cli.format_help())
 
+    def test_expanded_source_pool_requires_explicit_bounded_reassessment(self):
+        cfg = load_config()
+        self.assertEqual(cfg['data']['max_sources'], 100)
+        cfg['data']['max_sources'] = 498
+        with self.assertRaisesRegex(ValueError, 'at most 100'):
+            validate_config(cfg)
+        cfg['data']['source_pool_reassessment'] = True
+        validate_config(cfg)
+        cfg['data']['max_sources'] = 499
+        with self.assertRaisesRegex(ValueError, 'at most 498'):
+            validate_config(cfg)
+        cfg['data']['max_sources'] = 498
+        cfg['data']['min_sources'] = 29
+        with self.assertRaisesRegex(ValueError, 'at least 30'):
+            validate_config(cfg)
+        cfg['data']['min_sources'] = 30
+        cfg['data']['source_pool_reassessment'] = 'true'
+        with self.assertRaisesRegex(ValueError, 'boolean'):
+            validate_config(cfg)
+        expanded = load_config(Path(__file__).resolve().parents[1] / 'configs/reassembly_v2_bottles498.yaml')
+        self.assertEqual(expanded['data']['max_sources'], 498)
+        self.assertEqual(expanded['data']['min_sources'], 30)
+        self.assertEqual(expanded['train']['max_updates'], 2000)
+
     def test_preflight_profile_is_bound_to_shapes_precision_and_dataset(self):
         manifest = self.write("manifest.json", {"fingerprint": "fixture"})
         report = {"kind": "preflight", "profile_signature": profile_signature(self.cfg),
