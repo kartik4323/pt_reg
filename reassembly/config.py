@@ -20,12 +20,12 @@ DEFAULTS = {
     },
     "model": {
         "sample_counts": [256, 128, 64], "dim": 128, "neighbors": 16,
-        "attention_layers": 2, "heads": 4, "truncation": 0.1,
+        "attention_layers": 2, "heads": 4, "truncation": 0.1, "contact_points": 256,
         "log_scale_min": -6.0, "log_scale_max": -2.0,
     },
     "loss": {
         "segmentation": 1.0, "matching": 1.0, "view_consistency": 0.1,
-        "sdf": 1.0, "calibration": 0.01, "geometry_retention": 0.25,
+        "sdf": 1.0, "calibration": 0.01, "geometry_retention": 0.25, "matching_localization": 1.0,
     },
     "train": {
         "max_updates": 2000, "batch_size": 2, "grad_accum_steps": 4,
@@ -33,7 +33,7 @@ DEFAULTS = {
         "gradient_clip": 1.0, "validation_interval": 100,
         "validation_samples": 32, "num_workers": 0,
         "overfit_patterns": 16, "overfit_updates": 2000,
-        "seed": 42, "amp": True,
+        "seed": 42, "amp": True, "contact_radius": .05, "contact_sigma": .01,
     },
     "solver": {
         "resolution": 32, "field_chunk": 2048, "field_extent": 2.25,
@@ -89,6 +89,12 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("Prepare distinct point reservoirs at least as large as training inputs")
     if cfg["model"]["dim"] % cfg["model"]["heads"]:
         raise ValueError("model.dim must be divisible by model.heads")
+    if not 3 <= cfg["model"]["contact_points"] <= cfg["data"]["points_per_fragment"]:
+        raise ValueError("model.contact_points must fit within the input point budget and be at least 3")
+    if not 0 < cfg["train"]["contact_sigma"] <= cfg["train"]["contact_radius"]:
+        raise ValueError("Use 0 < contact_sigma <= contact_radius")
+    if cfg["loss"]["matching_localization"] <= 0:
+        raise ValueError("Distance-aware contact supervision requires a positive matching_localization weight")
     if not 0 <= cfg["solver"]["prior_weight"] <= 0.25:
         raise ValueError("solver.prior_weight must be between 0 and 0.25")
     if cfg["train"]["max_updates"] > 2000:

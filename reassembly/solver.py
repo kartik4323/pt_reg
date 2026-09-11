@@ -179,11 +179,26 @@ def _correspondences(pair: dict[str, Any], options: dict) -> dict[str, Any] | No
         return None
     order = np.argsort(-values, kind="stable")
     indices, values = indices[order], values[order]
+    support_confidence = float(values.sum() / max(len(np.unique(indices[:, 0])), len(np.unique(indices[:, 1]))))
+    if 'source_matchability' in pair and 'target_matchability' in pair:
+        a, b = np.asarray(pair['source_matchability']), np.asarray(pair['target_matchability'])
+        if (a.shape != (len(source),) or b.shape != (len(target),)
+                or not np.isfinite(a).all() or not np.isfinite(b).all()
+                or (a < 0).any() or (a > 1).any() or (b < 0).any() or (b > 1).any()):
+            raise ValueError('Matchability must be finite per-point probabilities in [0,1]')
+        # Use retained matched-vs-dustbin mass for contact existence confidence.
+        # Individual correspondence probabilities remain the actual fit weights;
+        # their spread over several valid independent samples is not a dustbin.
+        support_confidence = min(float(a[np.unique(indices[:, 0])].mean()),
+                                 float(b[np.unique(indices[:, 1])].mean()))
     return {"i": int(pair["i"]), "j": int(pair["j"]),
             "source": source[indices[:, 0]], "target": target[indices[:, 1]],
             "weights": values, "source_indices": indices[:, 0],
             "target_indices": indices[:, 1],
-            "confidence": float(np.clip(values.sum() / max(len(source), len(target)), 0, 1))}
+            # Exterior/dustbin points are not evidence against a small contact.
+            # Preserve absolute probability mass: weak selected weights still
+            # produce weak confidence, without renormalizing them to sum to one.
+            "confidence": float(np.clip(support_confidence, 0, 1))}
 
 
 def _pair_candidates(correspondences: dict, options: dict) -> list[dict]:
@@ -404,7 +419,7 @@ def solve_from_matches(
         for points, weights in zip(exterior_points, exterior_weights):
             if weights.shape != (len(points),) or (weights < 0).any() or not np.isfinite(weights).all():
                 raise ValueError("invalid exterior probabilities")
-    correspondences, candidates, seen = [], {}, set()
+    correspondences, candidates, seen, pair_diagnostics = [], {}, set(), {}
     for pair in matches:
         i, j = int(pair["i"]), int(pair["j"])
         if not (0 <= i < j < num_fragments):
@@ -413,13 +428,24 @@ def solve_from_matches(
             raise ValueError("duplicate fragment pair")
         seen.add((i, j))
         selected = _correspondences(pair, options)
+        key = f"{i}-{j}"
+        pair_diagnostics[key] = {"source_points": len(pair['source_xyz']), "target_points": len(pair['target_xyz']),
+                                 "raw_mass": float(np.asarray(pair['weights']).sum()),
+                                 "selected_correspondences": 0, "candidate_count": 0,
+                                 "reason": "insufficient_correspondence_support"}
         if selected is None:
             continue
         correspondences.append(selected)
         fits = _pair_candidates(selected, options)
+        pair_diagnostics[key].update(selected_correspondences=len(selected['weights']),
+                                     unique_source_points=len(np.unique(selected['source_indices'])),
+                                     unique_target_points=len(np.unique(selected['target_indices'])),
+                                     selected_mass=float(selected['weights'].sum()), confidence=selected['confidence'],
+                                     candidate_count=len(fits), reason=None if fits else 'degenerate_or_inconsistent_support')
         if fits:
             candidates[(i, j)] = fits
     diagnostics = {"pair_candidate_counts": {f"{i}-{j}": len(values) for (i, j), values in candidates.items()},
+                   "pairs": pair_diagnostics,
                    "anchor_index": int(anchor_index), "hypotheses": 0, "refinement_accepted_steps": 0}
     failure = {"status": "failed", "confidence": 0.0, "rotations": None, "translations": None,
                "anchor_index": int(anchor_index), "diagnostics": diagnostics}
@@ -450,7 +476,12 @@ def solve_from_matches(
                         "pre_refinement_contact_rms": initial_detail["contact_rms"]})
     if not (np.isfinite(rotations).all() and np.isfinite(translations).all()):
         return {**failure, "reason": "nonfinite_refinement"}
-    mass_confidence = float(np.mean([pair["confidence"] for pair in correspondences]))
+    # A weak bridge must not be hidden by a strong edge. Non-contacting pairs
+    # cannot lower confidence merely by existing in a complete three-part set.
+    edge_confidence = {(pair['i'], pair['j']): pair['confidence'] for pair in correspondences}
+    mass_confidence = max(min(edge_confidence[edge] for edge in edges)
+                          for edges in combinations(candidates, num_fragments - 1))
+    diagnostics['contact_confidence'] = float(mass_confidence)
     confidence = float(mass_confidence * np.exp(-detail["contact_rms"] / max(float(options.get("huber_delta", 0.02)), 1e-6)))
     status = "ok" if confidence >= float(options.get("min_assembly_confidence", 0.1)) else "low_confidence"
     return {"status": status, "reason": None if status == "ok" else "weak_or_inconsistent_contact_support",
@@ -514,6 +545,9 @@ def solve_assembly(model, batch: dict, cfg: dict, condition: str = "predicted", 
                                 "source_xyz": _numpy(pair["source_xyz"])[0],
                                 "target_xyz": _numpy(pair["target_xyz"])[0],
                                 "weights": _numpy(pair["weights"])[0]})
+                for name in ('source_matchability', 'target_matchability'):
+                    if name in pair:
+                        matches[-1][name] = _numpy(pair[name])[0]
             # Only predicted original-surface probabilities enter the solver.
             probabilities = torch.sigmoid(-encoded["fracture_logits"])
             exterior = [_numpy(points)[0, i] for i in range(count)]

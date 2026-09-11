@@ -257,6 +257,58 @@ Report geometric assembly success, per-part/whole Chamfer, contact residuals, fa
 
 ## 8. Monitor, resume, and infer
 
+### Restart after the 16-pattern assembly check failed
+
+The September 11 contact fix changes matching selection, supervision, and confidence (`coarse-scaffold-reassembly-v2.1-local-contacts`). It requires **fresh stage 1/2/3 weights and a new CUDA preflight**. Old checkpoints are intentionally rejected. Keep the existing preparation; downloading or fracturing again is unnecessary. The 0.01 success tolerance and the all-16 acceptance gate are unchanged. See [the diagnosis and training review](REASSEMBLY_OVERFIT_REVIEW.md).
+
+With `ptreg-v2` activated, run this on the reported VM:
+
+```bash
+(
+set -euo pipefail
+cd /home/kpandey/satellite/pt_reg
+git pull --ff-only origin main
+export REASSEMBLY_ROOT="/home/kpandey/reassembly_v2"
+WORK="$REASSEMBLY_ROOT/bottles498"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+for NAME in overfit preflight logs; do
+  if [ -d "$WORK/$NAME" ]; then
+    mv -T -- "$WORK/$NAME" "$WORK/$NAME.before-contact-fix-$STAMP"
+  fi
+done
+bash scripts/run_reassembly_v2_pilot.sh preflight
+bash scripts/run_reassembly_v2_pilot.sh overfit
+)
+```
+
+The renamed folders preserve the previous results; the new logs do not mix old and new attempts. The resource guard still counts the preserved files. Do not rerun `all`, which would try to prepare into the existing dataset directory. If overfit passes, continue the bounded pilot:
+
+```bash
+(
+set -euo pipefail
+export REASSEMBLY_ROOT="/home/kpandey/reassembly_v2"
+bash scripts/run_reassembly_v2_pilot.sh train
+bash scripts/run_reassembly_v2_pilot.sh evaluate
+bash scripts/run_reassembly_v2_pilot.sh report
+)
+```
+
+If it fails, inspect `overfit/eval/evaluation.json` and the new `sample_diagnostic` lines in `logs/overfit-eval.log`. They include per-part errors, contact support, pair candidate counts, confidence, and pre/post-refinement residuals. `matching_mass` and `matching_localization` are now separate training metrics; the new composite loss is not numerically comparable to the old mass-only objective.
+
+An optional supervision-only diagnostic can test the representation ceiling on this exact prepared dataset without training:
+
+```bash
+python -m reassembly.contact_audit \
+  --config configs/reassembly_v2_bottles498.yaml \
+  --manifest "$REASSEMBLY_ROOT/bottles498/prepared/manifest.json" \
+  --managed-root "$REASSEMBLY_ROOT" \
+  --output "$REASSEMBLY_ROOT/bottles498/contact_ceiling_audit.json"
+```
+
+This audit supplies GT surface labels and positions to construct ideal matches. Its results **never** authorize training or count as learned assembly performance.
+
+### Monitoring and explicit resume
+
 In another SSH terminal:
 
 ```bash

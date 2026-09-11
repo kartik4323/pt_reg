@@ -10,10 +10,11 @@ import torch
 from scipy.spatial import cKDTree
 
 from .checkpoints import load_checkpoint
+from . import ARCHITECTURE
 from .data import FractureDataset, make_oracle_field
 from .geometry import export_transforms, normalize_fragments
 from .model import ReassemblyModel
-from .resources import seed_all, write_json
+from .resources import seed_all, write_json, jsonable
 from .solver import solve_assembly
 from .training import collate_samples
 
@@ -143,9 +144,14 @@ def evaluate(checkpoint: Path, manifest: Path, output: Path, cfg: dict, device: 
         with torch.no_grad():
             encoded = model.encode(batch['points'], batch['fragment_mask'], batch['anchor_index'])
             pairs = model.match(encoded, use_scaffold=condition != 'contact_only')
-            matching, positives = correspondence_loss(pairs, batch, float(cfg['train'].get('contact_radius', .05)))
+            matching_diagnostics = {}
+            matching, positives = correspondence_loss(
+                pairs, batch, float(cfg['train'].get('contact_radius', .05)),
+                localization_sigma=float(cfg['train'].get('contact_sigma', .01)),
+                localization_weight=float(cfg['loss'].get('matching_localization', 1.0)), diagnostics=matching_diagnostics)
             row.update(predicted_model_matching_loss=float(matching), positive_contact_targets=int(positives),
                        fracture_segmentation_loss=float(segmentation_loss(encoded['fracture_logits'], batch['fracture_labels'], batch['fragment_mask'])))
+            row.update({name: float(value) for name, value in matching_diagnostics.items()})
         # Measure the learned reconstruction independently of the oracle ablation.
         if condition != 'contact_only':
             with torch.no_grad():
@@ -175,8 +181,11 @@ def evaluate(checkpoint: Path, manifest: Path, output: Path, cfg: dict, device: 
                 guard.check(additional_bytes=sum(v.nbytes for v in arrays.values()))
             np.savez_compressed(output / f'example_{index:02d}.npz', **arrays)
         print(f'evaluate {condition} {index+1}/{len(dataset)}: {row["status"]}, success={row["success"]}', flush=True)
+        # CLI summaries omit the sample array. Persist the actual failure
+        # evidence in tee'd logs as well, so a logs-only handoff is actionable.
+        print('sample_diagnostic ' + json.dumps(jsonable(row), allow_nan=False), flush=True)
     summary = aggregate(rows)
-    report = {'schema_version': 2, 'kind': 'evaluation', 'purpose': state['purpose'],
+    report = {'schema_version': 2, 'architecture': ARCHITECTURE, 'kind': 'evaluation', 'purpose': state['purpose'],
               'condition': condition, 'split': 'fixed_train_16' if overfit else split,
               'dataset_fingerprint': dataset.fingerprint, 'checkpoint': str(Path(checkpoint).resolve()),
               'trained_updates': state['step'], 'training_lineage': state.get('training_lineage', {}), 'config': cfg,
@@ -191,6 +200,12 @@ def evaluate(checkpoint: Path, manifest: Path, output: Path, cfg: dict, device: 
               'diagnostic_note': 'Matching/segmentation/SDF diagnostics measure the learned model. GT and perturbed fields are used only in their explicitly labeled solver ablations. Pre/post contact residuals are in each sample diagnostics.',
               'fixed_fit_passed': bool(overfit and condition == 'predicted' and len(rows) == 16 and all(r['success'] for r in rows)
                                        and all(r['status'] == 'ok' for r in rows))}
+    report['failure_breakdown'] = {
+        'no_solution': sum(r['failed'] for r in rows),
+        'geometrically_inaccurate_solution': sum(not r['failed'] and not r['success'] for r in rows),
+        'geometrically_correct_low_confidence': sum(r['success'] and r['status'] != 'ok' for r in rows),
+        'accepted': sum(r['success'] and r['status'] == 'ok' for r in rows),
+    }
     write_json(output / 'evaluation.json', report, guard)
     return report
 

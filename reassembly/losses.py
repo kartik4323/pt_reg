@@ -30,7 +30,7 @@ def segmentation_loss(logits: Tensor, labels: Tensor, fragment_mask: Tensor) -> 
     return (masked_mean(raw, positive) + masked_mean(raw, negative)) / count.clamp_min(1)
 
 
-def contact_targets(pair: dict[str, Any], batch: dict[str, Tensor], radius: float) -> Tensor:
+def contact_geometry(pair: dict[str, Any], batch: dict[str, Tensor], radius: float) -> tuple[Tensor, Tensor]:
     i, j = pair["i"], pair["j"]
     source_indices, target_indices = pair["source_indices"], pair["target_indices"]
     source = batch["canonical_points"][:, i].gather(1, source_indices[..., None].expand(-1, -1, 3))
@@ -38,8 +38,35 @@ def contact_targets(pair: dict[str, Any], batch: dict[str, Tensor], radius: floa
     source_interface = batch["interface_ids"][:, i].gather(1, source_indices)
     target_interface = batch["interface_ids"][:, j].gather(1, target_indices)
     same_interface = (source_interface[:, :, None] == target_interface[:, None, :]) & (source_interface[:, :, None] >= 0)
-    near = torch.cdist(source.float(), target.float()) <= radius
-    return same_interface & near & pair["valid"][:, None, None]
+    distance = torch.cdist(source.float(), target.float())
+    return same_interface & (distance <= radius) & pair["valid"][:, None, None], distance
+
+
+def contact_targets(pair: dict[str, Any], batch: dict[str, Tensor], radius: float) -> Tensor:
+    return contact_geometry(pair, batch, radius)[0]
+
+
+def local_contact_distribution(positives: Tensor, distance: Tensor, sigma: float) -> Tensor:
+    """Distance-weighted multi-positive targets; empty rows remain empty."""
+    has_match = positives.any(-1, keepdim=True)
+    logits = (-distance.float().square() / (2 * sigma ** 2)).masked_fill(~positives, -torch.inf)
+    logits = torch.where(has_match, logits, torch.zeros_like(logits))
+    return logits.softmax(-1) * has_match
+
+
+def localization_loss(probabilities: Tensor, positives: Tensor, distance: Tensor,
+                      valid: Tensor, sigma: float) -> Tensor:
+    # Separate from matched/unmatched mass: broad-radius membership alone can
+    # have zero loss while its chosen points are too far apart for rigid fits.
+    target = local_contact_distribution(positives, distance, sigma)
+    real = probabilities.float()[..., :-1]
+    # Smooth and normalize together. Clamping each log independently can make
+    # this KL spuriously negative when all valid probabilities underflow.
+    smoothed = real + 1e-8
+    mass = (smoothed * positives).sum(-1, keepdim=True)
+    conditional_log = smoothed.log() - mass.clamp_min(1e-8).log()
+    divergence = (target * (target.clamp_min(1e-8).log() - conditional_log)).sum(-1)
+    return masked_mean(divergence, positives.any(-1) & valid[:, None])
 
 
 def directional_contact_loss(probabilities: Tensor, positives: Tensor, valid: Tensor) -> Tensor:
@@ -61,18 +88,27 @@ def directional_contact_loss(probabilities: Tensor, positives: Tensor, valid: Te
 
 
 def correspondence_loss(pairs: list[dict[str, Any]], batch: dict[str, Tensor],
-                        radius: float) -> tuple[Tensor, Tensor]:
-    losses, positive_counts = [], []
+                        radius: float, *, localization_sigma: float = .01,
+                        localization_weight: float = 1.0, diagnostics: dict | None = None) -> tuple[Tensor, Tensor]:
+    losses, positive_counts, local_losses = [], [], []
     for pair in pairs:
-        positives = contact_targets(pair, batch, radius)
+        positives, distance = contact_geometry(pair, batch, radius)
         source_loss = directional_contact_loss(pair["source_prob"], positives, pair["valid"])
         target_loss = directional_contact_loss(pair["target_prob"], positives.transpose(-1, -2), pair["valid"])
         losses.append((source_loss + target_loss) * 0.5)
+        local_losses.append(0.5 * (
+            localization_loss(pair["source_prob"], positives, distance, pair["valid"], localization_sigma) +
+            localization_loss(pair["target_prob"], positives.transpose(-1, -2), distance.transpose(-1, -2),
+                              pair["valid"], localization_sigma)))
         positive_counts.append(positives.sum())
     # A 2-3 fragment input always produces at least one pair. Invalid padded
     # pairs contribute no loss and are omitted from the average.
     valid_pairs = torch.stack([pair["valid"].any() for pair in pairs])
-    return masked_mean(torch.stack(losses), valid_pairs), torch.stack(positive_counts).sum()
+    mass_loss = masked_mean(torch.stack(losses), valid_pairs)
+    local_loss = masked_mean(torch.stack(local_losses), valid_pairs)
+    if diagnostics is not None:
+        diagnostics.update(matching_mass=mass_loss, matching_localization=local_loss)
+    return mass_loss + localization_weight * local_loss, torch.stack(positive_counts).sum()
 
 
 def transformed_view(points: Tensor) -> Tensor:
@@ -127,9 +163,13 @@ def compute_losses(model: ReassemblyModel, batch: dict[str, Tensor], stage: int,
     encoded = model.encode(batch["points"], batch["fragment_mask"], batch["anchor_index"])
     use_scaffold = stage == 3 and config.get("condition", "predicted") != "contact_only"
     pairs = model.match(encoded, use_scaffold=use_scaffold)
-    matching, positive_count = correspondence_loss(pairs, batch, float(config.get("contact_radius", 0.05)))
+    matching_diagnostics = {}
+    matching, positive_count = correspondence_loss(
+        pairs, batch, float(config.get("contact_radius", 0.05)),
+        localization_sigma=float(config.get("contact_sigma", .01)),
+        localization_weight=float(weights.get("matching_localization", 1.0)), diagnostics=matching_diagnostics)
     total = float(weights.get("matching", config.get("matching_weight", 1.0))) * matching
-    diagnostics = {"matching": matching, "positive_contacts": positive_count}
+    diagnostics = {"matching": matching, "positive_contacts": positive_count, **matching_diagnostics}
     if stage in (1, 2):
         segmentation = segmentation_loss(encoded["fracture_logits"], batch["fracture_labels"], batch["fragment_mask"].bool())
         consistency_weight = float(weights.get("view_consistency", config.get("consistency_weight", 0.1)))

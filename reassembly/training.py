@@ -16,6 +16,7 @@ from .checkpoints import (finalize_checkpoint_budget, load_checkpoint, require_c
                           require_resume_config, restore_random_state, save_checkpoint)
 from .resources import GIB, jsonable, seed_all, write_json
 from .precision import NUMERICS_VERSION, NumericalUpdateError, optimizer_update
+from . import ARCHITECTURE
 
 
 def collate_samples(samples: list[dict], device) -> dict:
@@ -315,7 +316,7 @@ def train_stage(cfg, manifest, run_dir, stage, device, *, initialize_from=None, 
         restore_random_state(checkpoint)
     run_dir.mkdir(parents=True, exist_ok=True)
     write_json(run_dir / "config.resolved.json", cfg, guard)
-    write_json(run_dir / "run.json", {"schema_version": 2, "run_id": run_id, "stage": stage, "purpose": purpose,
+    write_json(run_dir / "run.json", {"schema_version": 2, "architecture": ARCHITECTURE, "run_id": run_id, "stage": stage, "purpose": purpose,
         "condition": condition, "dataset_fingerprint": fingerprint, "manifest": str(path.resolve()),
         "device": str(device), "torch": torch.__version__, "source_count": source_count,
         "numerics_version": NUMERICS_VERSION,
@@ -401,7 +402,7 @@ def train_stage(cfg, manifest, run_dir, stage, device, *, initialize_from=None, 
                                 purpose=purpose, metrics=last_metrics, scaler=scaler, guard=guard, run_id=run_id)
             print(f"stage={stage} update={step+1}/{steps} train={train_values['loss']:.5f} val={score:.5f}", flush=True)
     finalize_checkpoint_budget(run_dir / "best.pt", cfg, stage, purpose, run_id, guard)
-    report = {"status": "completed", "run_id": run_id, "stage": stage, "purpose": purpose, "condition": condition,
+    report = {"status": "completed", "architecture": ARCHITECTURE, "run_id": run_id, "stage": stage, "purpose": purpose, "condition": condition,
               "updates": steps, "seconds": time.perf_counter() - start, "metrics": last_metrics,
               "kind": "training", "schema_version": 2, "dataset_fingerprint": fingerprint,
               "updates_this_invocation": steps - initial_step,

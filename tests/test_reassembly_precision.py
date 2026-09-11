@@ -109,6 +109,8 @@ class PrecisionTests(unittest.TestCase):
         matcher = PartialContactMatcher({'dim': 8})
         logits = torch.full((1, 2, 4), -9., requires_grad=True)
         encoded = {'token_indices': torch.arange(4)[None, None].expand(1, 2, 4),
+                   'point_xyz': torch.randn(1, 2, 4, 3),
+                   'point_features': torch.randn(1, 2, 4, 8),
                    'descriptor': torch.randn(1, 2, 4, 8),
                    'token_features': torch.randn(1, 2, 4, 8),
                    'token_xyz': torch.randn(1, 2, 4, 3),

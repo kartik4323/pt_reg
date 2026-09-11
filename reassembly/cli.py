@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from .config import load_config
+from . import ARCHITECTURE
 from .precision import NUMERICS_VERSION
 from .resources import jsonable, make_guard, write_json
 
@@ -20,7 +21,8 @@ def profile_signature(cfg: dict) -> str:
     """Bind allocation results to every input/model/solver/loss size and precision."""
     relevant = {key: cfg[key] for key in ('version', 'data', 'model', 'loss', 'solver')}
     relevant['numerics_version'] = NUMERICS_VERSION
-    relevant['train'] = {key: cfg['train'][key] for key in ('batch_size', 'grad_accum_steps', 'amp')}
+    relevant['architecture'] = ARCHITECTURE
+    relevant['train'] = {key: cfg['train'][key] for key in ('batch_size', 'grad_accum_steps', 'amp', 'contact_radius', 'contact_sigma')}
     return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
 
 
@@ -52,7 +54,11 @@ def require_overfit(path: Path | None, manifest: Path, cfg: dict | None = None):
     if (report.get('kind') != 'evaluation' or not report.get('fixed_fit_passed')
             or report.get('dataset_fingerprint') != fingerprint or report.get('purpose') != 'overfit'
             or report.get('condition') != 'predicted'):
-        raise ValueError('A matching 16-pattern assembly overfit has not passed; inspect its failure diagnostics')
+        summary = report.get('summary', {})
+        raise ValueError('A matching 16-pattern assembly overfit has not passed: '
+                         f"success_rate={summary.get('success_rate')}, failure_rate={summary.get('failure_rate')}, "
+                         f"low_confidence_rate={summary.get('low_confidence_rate')}. "
+                         f"Inspect samples and failure_breakdown in {path}; later training remains blocked.")
     if cfg is not None and any(report.get('config', {}).get(key) != cfg[key] for key in ('data', 'model', 'loss', 'solver')):
         raise ValueError('Overfit report configuration differs from this experiment; repeat the fixed check')
 

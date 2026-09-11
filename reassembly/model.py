@@ -42,6 +42,35 @@ def mlp(in_channels: int, out_channels: int) -> nn.Sequential:
                          nn.GELU(), nn.Linear(out_channels, out_channels), nn.GELU())
 
 
+@torch.no_grad()
+def contact_point_indices(xyz: Tensor, fracture_logits: Tensor, count: int) -> Tensor:
+    """Mix global coverage with predicted-contact coverage, using XYZ only.
+
+    Half the budget is ordinary FPS. The rest covers unselected predicted
+    fracture points before falling back to the remaining surface. This avoids
+    losing a small interface at the encoder's 64-token context bottleneck.
+    No fracture supervision is consulted by this discrete selector.
+    """
+    count = min(count, xyz.shape[1])
+    base = max(1, count // 2)
+    indices = farthest_point_indices(xyz, base)
+    selected = torch.zeros(xyz.shape[:2], dtype=torch.bool, device=xyz.device)
+    selected.scatter_(1, indices, True)
+    nearest = torch.cdist(xyz.float(), gather_points(xyz, indices).float()).square().amin(-1)
+    contact = fracture_logits.float() >= 0
+    result = [indices]
+    rows = torch.arange(len(xyz), device=xyz.device)
+    for _ in range(count - base):
+        available = contact & ~selected
+        eligible = torch.where(available.any(-1, keepdim=True), available, ~selected)
+        current = nearest.masked_fill(~eligible, -1).argmax(-1)
+        result.append(current[:, None])
+        selected[rows, current] = True
+        distance = (xyz.float() - xyz[rows, current, None].float()).square().sum(-1)
+        nearest = torch.minimum(nearest, distance)
+    return torch.cat(result, -1)
+
+
 class LocalAggregation(nn.Module):
     def __init__(self, input_dim: int, dim: int, count: int, neighbors: int):
         super().__init__()
@@ -100,6 +129,7 @@ class GeometryEncoder(nn.Module):
             for coords, feats in hierarchy], -1))
         descriptors = F.normalize(self.descriptor_head(full_features).float(), dim=-1)
         return {
+            "point_xyz": points,
             "point_features": full_features.reshape(batch, fragments, npoints, -1),
             "descriptor": descriptors.reshape(batch, fragments, npoints, -1),
             "fracture_logits": self.fracture_head(full_features).reshape(batch, fragments, npoints),
@@ -165,6 +195,7 @@ class ShapeField(nn.Module):
 class PartialContactMatcher(nn.Module):
     def __init__(self, config: dict[str, Any]):
         super().__init__()
+        self.contact_points = int(config.get("contact_points", 256))
         dim = int(config.get("dim", 128))
         self.descriptor = mlp(dim * 2, dim)
         self.condition = mlp(5, dim)
@@ -173,9 +204,15 @@ class PartialContactMatcher(nn.Module):
         self.log_temperature = nn.Parameter(torch.tensor(math.log(0.1)))
 
     def forward(self, encoded: dict[str, Tensor], prior: Tensor | None) -> list[dict[str, Any]]:
-        indices = encoded["token_indices"]
+        xyz = encoded["point_xyz"]
+        batch, fragments, count, _ = xyz.shape
+        indices = contact_point_indices(xyz.reshape(-1, count, 3),
+                                        encoded["fracture_logits"].reshape(-1, count),
+                                        self.contact_points).reshape(batch, fragments, -1)
+        local_xyz = xyz.gather(2, indices[..., None].expand(-1, -1, -1, 3))
         point_desc = encoded["descriptor"].gather(2, indices[..., None].expand(-1, -1, -1, encoded["descriptor"].shape[-1]))
-        features = self.descriptor(torch.cat((point_desc, encoded["token_features"]), -1))
+        point_features = encoded["point_features"].gather(2, indices[..., None].expand(-1, -1, -1, point_desc.shape[-1]))
+        features = self.descriptor(torch.cat((point_desc, point_features), -1))
         if prior is not None:
             context = self.condition(prior).mean(1)
             gate, shift = self.condition_gate(context).chunk(2, dim=-1)
@@ -201,10 +238,12 @@ class PartialContactMatcher(nn.Module):
                     weights = weights * fracture[:, i, :, None] * fracture[:, j, None, :]
                     valid = encoded["fragment_mask"][:, i].bool() & encoded["fragment_mask"][:, j].bool()
                     weights = weights * valid[:, None, None]
-                    pairs.append({"i": i, "j": j, "source_xyz": encoded["token_xyz"][:, i],
-                                  "target_xyz": encoded["token_xyz"][:, j],
+                    pairs.append({"i": i, "j": j, "source_xyz": local_xyz[:, i],
+                                  "target_xyz": local_xyz[:, j],
                                   "source_indices": indices[:, i], "target_indices": indices[:, j],
                                   "weights": weights, "source_prob": source, "target_prob": target,
+                                  "source_matchability": (1 - source[..., -1]).clamp(0, 1) * fracture[:, i],
+                                  "target_matchability": (1 - target[..., -1]).clamp(0, 1) * fracture[:, j],
                                   "valid": valid})
         return pairs
 
