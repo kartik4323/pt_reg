@@ -10,9 +10,9 @@ import numpy as np
 import torch
 
 from diagnostics.reassembly_v2 import probes
-from diagnostics.reassembly_v2.__main__ import parse_args
+from diagnostics.reassembly_v2.__main__ import main, parse_args
 from diagnostics.reassembly_v2.contracts import matching_contract
-from diagnostics.reassembly_v2.runtime import compare, finalize, job_id, read, sha256, write
+from diagnostics.reassembly_v2.runtime import Limits, compare, finalize, job_id, read, sha256, write
 from diagnostics.reassembly_v2.variants import choose_subset, variant
 from diagnostics.reassembly_v2.worker import Engine, build_jobs
 from reassembly.config import load_config
@@ -186,10 +186,40 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(result['checkpoint_changes'],['fixture'])
             self.assertTrue((output/'diagnostic_bundle.tar.gz').is_file())
 
-    def test_cli_rejects_over_budget_or_output_inside_training_artifacts(self):
+    def test_cli_defaults_to_unlimited_and_accepts_optional_long_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(SystemExit): parse_args(['--managed-root',directory,'--hours','5'])
+            self.assertIsNone(parse_args(['--managed-root',directory]).hours)
+            self.assertEqual(parse_args(['--managed-root',directory,'--hours','24']).hours,24)
+            for value in ('0','-1','nan','inf'):
+                with self.assertRaises(SystemExit): parse_args(['--managed-root',directory,'--hours',value])
             with self.assertRaises(SystemExit): parse_args(['--managed-root',directory,'--output',str(Path(directory)/'bottles498/logs')])
+
+    def test_unlimited_runtime_still_checks_storage_and_optional_deadline_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            limit=Limits(Path(directory),Path(directory)/'output',None)
+            with patch.object(limit.guard,'check') as guard,patch('diagnostics.reassembly_v2.runtime.time.time',return_value=10**12):
+                limit.check()
+                guard.assert_called_once()
+                limit.deadline=1
+                with self.assertRaises(TimeoutError): limit.check()
+            with patch.object(limit.guard,'check',side_effect=RuntimeError('storage limit')):
+                limit.deadline=None
+                with self.assertRaisesRegex(RuntimeError,'storage limit'): limit.check()
+
+    def test_supervisor_passes_deadline_only_when_requested(self):
+        for optional in ([],['--hours','12']):
+            with self.subTest(optional=optional),tempfile.TemporaryDirectory() as directory:
+                output=Path(directory)/'diagnostics'/'fixture'
+                with patch.object(Limits,'check'),patch('diagnostics.reassembly_v2.__main__.subprocess.Popen') as launch, \
+                     patch('diagnostics.reassembly_v2.__main__.time.sleep'), \
+                     patch('diagnostics.reassembly_v2.__main__.finalize',return_value={'status':'complete','completed_jobs':1,'planned_jobs':1}):
+                    launch.return_value.poll.side_effect=[None,0]
+                    launch.return_value.returncode=0
+                    self.assertEqual(main(['--managed-root',directory,'--output',str(output),'--device','cpu']+optional),0)
+                command=launch.call_args.args[0]
+                invocation=read(output/'invocation.json')
+                self.assertEqual('--deadline' in command,bool(optional))
+                self.assertEqual(invocation['deadline_epoch'] is None,not optional)
 
 
 if __name__=='__main__': unittest.main()

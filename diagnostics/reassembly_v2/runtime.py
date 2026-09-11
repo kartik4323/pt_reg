@@ -37,7 +37,7 @@ class Limits:
         self.output=Path(output); self.deadline=deadline
         self.guard=ResourceGuard([root],40,50)
     def check(self):
-        if time.time()>=self.deadline: raise TimeoutError('Diagnostic deadline reached')
+        if self.deadline is not None and time.time()>=self.deadline: raise TimeoutError('Diagnostic deadline reached')
         used=tree_bytes(self.output)
         archive=self.output/'diagnostic_bundle.tar.gz'
         self.guard.check(additional_bytes=max(0,2*1024**3-used))

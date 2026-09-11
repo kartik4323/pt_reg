@@ -1,5 +1,6 @@
-"""Four-hour, read-only diagnosis supervisor. Run from the repository root."""
+"""Read-only diagnosis supervisor with an optional deadline. Run from the repository root."""
 import argparse
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -16,12 +17,13 @@ def parse_args(argv=None):
     parser.add_argument('--managed-root',type=Path,required=True)
     parser.add_argument('--output',type=Path)
     parser.add_argument('--device',default='cuda:0')
-    parser.add_argument('--hours',type=float,default=4)
+    parser.add_argument('--hours',type=float,default=None,help='Optional positive time limit in hours; default: run without a time limit')
     parser.add_argument('--resume',action='store_true',help='Continue completed diagnostic jobs only; never resume training')
     parser.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--deadline',type=float,help=argparse.SUPPRESS)
     args=parser.parse_args(argv)
-    if not 0<args.hours<=4: parser.error('--hours must be positive and at most 4')
+    if args.hours is not None and (not math.isfinite(args.hours) or args.hours<=0):
+        parser.error('--hours must be a finite positive number; omit it for no time limit')
     args.managed_root=args.managed_root.expanduser().resolve()
     args.output=(args.output or args.managed_root/'diagnostics'/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')).expanduser().resolve()
     if args.managed_root not in args.output.parents or args.output==args.managed_root/'bottles498' or args.managed_root/'bottles498' in args.output.parents:
@@ -47,7 +49,7 @@ def main(argv=None):
         return 0
     if args.output.exists() and any(args.output.iterdir()) and not args.resume:
         raise FileExistsError('Choose a fresh output directory or explicitly --resume diagnostics')
-    deadline=time.time()+args.hours*3600
+    deadline=None if args.hours is None else time.time()+args.hours*3600
     limits=Limits(args.managed_root,args.output,deadline)
     limits.check()
     args.output.mkdir(parents=True,exist_ok=True)
@@ -62,9 +64,11 @@ def main(argv=None):
     write(args.output/'invocation.json',{'managed_root':str(args.managed_root),'device':args.device,'hours':args.hours,
         'started_utc':datetime.now(timezone.utc).isoformat(),'deadline_epoch':deadline,'resume':args.resume})
     command=[sys.executable,'-m','diagnostics.reassembly_v2','--worker','--managed-root',str(args.managed_root),
-             '--output',str(args.output),'--device',args.device,'--deadline',str(deadline)]
+             '--output',str(args.output),'--device',args.device]
+    if deadline is not None: command.extend(['--deadline',str(deadline)])
     reason=None; process=None
-    print(f'Diagnostic output: {args.output}\nDeadline: {args.hours:g} hours; no training or optimizer updates.',flush=True)
+    duration='No time limit' if args.hours is None else f'Deadline: {args.hours:g} hours'
+    print(f'Diagnostic output: {args.output}\n{duration}; no training or optimizer updates.',flush=True)
     try:
         with open(args.output/'worker.log','a',encoding='utf-8') as log:
             process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,
@@ -77,7 +81,7 @@ def main(argv=None):
                     if progress.exists():
                         current=read(progress)['job']; print(f"Running {current['kind']}: {current['id']}",flush=True)
                     last_notice=time.monotonic()
-                time.sleep(min(1,max(.01,deadline-time.time())))
+                time.sleep(1 if deadline is None else min(1,max(.01,deadline-time.time())))
             if process.returncode: reason=f'Worker exited {process.returncode}; inspect worker.log and results errors'
     except (Exception,KeyboardInterrupt) as error:
         reason=f'{type(error).__name__}: {error}'

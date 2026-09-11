@@ -6,12 +6,14 @@ Run this from the VM repository, with the existing `ptreg-v2` environment active
 git pull --ff-only && python -m diagnostics.reassembly_v2 \
   --managed-root /home/kpandey/reassembly_v2 \
   --output "/home/kpandey/reassembly_v2/diagnostics/$(date -u +%Y%m%dT%H%M%SZ)" \
-  --device cuda:0 --hours 4
+  --device cuda:0
 ```
 
 The managed root must be the existing VM data root containing `bottles498`. This diagnosis is bound to fingerprint `b7f2b84a20964276c894300a7ece4d8f97f232903bace0f14131535594462043`. It rejects the different locally prepared dataset. If the root or recorded checkpoint paths differ, return the resulting error for artifact reconciliation; do not copy in unrelated weights or rebuild data.
 
-The output argument is optional: omitting it creates a timestamped directory below `<managed-root>/diagnostics`. The command exits with code **0** for completed coverage and **2** for partial coverage, a deadline, a replay mismatch, missing artifacts, or another error. A partial run is evidence to inspect, not a failed training run to restart. Computation stops at the deadline; final hash verification and packaging may finish afterward.
+There is **no time limit by default**: the runner continues through all planned probes unless interrupted or stopped by an artifact, reproducibility, execution, or resource check. To request a deadline, optionally add `--hours 12` (any finite positive duration is accepted). Memory and storage limits remain enforced regardless of runtime.
+
+The output argument is optional: omitting it creates a timestamped directory below `<managed-root>/diagnostics`. The command exits with code **0** for completed coverage and **2** for partial coverage, an explicitly requested deadline, a replay mismatch, missing artifacts, or another error. A partial run is evidence to inspect, not a failed training run to restart. When a deadline is requested, computation stops at that deadline; final hash verification and packaging may finish afterward.
 
 Return **`diagnostic_bundle.tar.gz`**, whose full path is printed at exit. It contains no checkpoints or mesh datasets. If interrupted during final packaging, the incremental JSON files remain in the output directory.
 
@@ -56,6 +58,6 @@ The report separates **Observed**, **Supported intervention effects**, and **Unr
 
 Batch size is **1** and inference remains FP32 as in production evaluation. Field queries remain chunked. A CUDA allocator limit and peak-reserved check enforce **less than 20 GiB**. Managed artifacts remain within **40 GiB**, with **50 GiB free space** preserved. The runner reserves up to **2 GiB** of headroom for diagnostics including the archive, and stops raw output at **900 MiB**. Thus startup can require roughly 52 GiB free before any output exists. The code never defaults to `/data`.
 
-If a deadline ends a run after artifact verification, the same code and unchanged inputs can continue completed diagnostic jobs with `--resume --output <that-exact-directory>`. This is an explicit additional invocation with its own requested deadline, not an automatic extension. Resume rejects changed code/input hashes and previously failed or mismatched jobs. After an adapter fix or artifact correction, use a fresh output directory.
+If a run stops after artifact verification, the same code and unchanged inputs can continue completed diagnostic jobs with `--resume --output <that-exact-directory>`. Resume has no time limit unless `--hours` is explicitly supplied. It rejects changed code/input hashes and previously failed or mismatched jobs. After a code update (including the change removing the mandatory four-hour limit), an adapter fix, or an artifact correction, use a fresh output directory.
 
 No architecture, objective, solver threshold or training change should be selected from this bundle until its reproducibility checks and controlled comparisons have been reviewed.
