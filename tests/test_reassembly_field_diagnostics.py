@@ -81,6 +81,28 @@ class FieldDiagnosticTests(unittest.TestCase):
             with self.assertRaises(SystemExit), patch('sys.stderr', new=io.StringIO()):
                 parse_args(['--managed-root', directory, '--hours', 'nan'])
 
+    def test_supervisor_reports_monitor_error_and_stops_worker(self):
+        from diagnostics.reassembly_field import __main__ as cli
+        from diagnostics.reassembly_field import runner
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'field_diagnostics/fixture'
+            error = FileNotFoundError(2, 'No such file', str(output / 'progress.json.tmp'))
+            summary = {'status': 'partial_or_blocked', 'completed_jobs': 11, 'planned_jobs': 144}
+            with patch.object(cli.Limits, 'check', side_effect=[None, error]), \
+                    patch.object(cli.subprocess, 'Popen') as launch, \
+                    patch.object(runner, 'finalize', return_value=summary) as finish, \
+                    patch('sys.stdout', new=io.StringIO()) as stdout:
+                launch.return_value.poll.side_effect = [None, None]
+                code = cli.main(['--managed-root', directory, '--output', str(output), '--device', 'cpu'])
+                self.assertEqual(code, 2)
+                launch.return_value.terminate.assert_called_once()
+                launch.return_value.wait.assert_called_once()
+                self.assertIn('Stopped: FileNotFoundError', stdout.getvalue())
+                self.assertIn('progress.json.tmp', finish.call_args.args[1])
+            failure = read(output / 'supervisor_error.json')
+            self.assertIn('FileNotFoundError', failure['traceback'])
+            self.assertIn('progress.json.tmp', failure['reason'])
+
     def test_same_recorded_pose_starts_proper_reference_fixed(self):
         sample = sample_fixture()
         starts = list(probes.pose_starts(sample))
@@ -227,6 +249,83 @@ class FieldDiagnosticTests(unittest.TestCase):
             checkpoint.write_bytes(b'changed')
             with self.assertRaisesRegex(RuntimeError, 'Resume input changed'):
                 validate_resume(root)
+
+    def monitoring_resume_fixture(self, root):
+        from diagnostics.reassembly_field import runner
+        repository, output = root / 'repository', root / 'output'
+        output.mkdir()
+        compatibility = read(Path(runner.__file__).with_name('resume_compatibility.json'))
+        inv = {'git_revision': 'feb77dd', 'dataset_integrity': {'dataset_fingerprint': FINGERPRINT}}
+        for key, change in compatibility['changes'].items():
+            section, name = key.split('/', 1)
+            path = repository / change['path']
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((runner.REPO / change['path']).read_bytes())
+            self.assertEqual(sha256(path), change['after'], 'Refresh the exact released compatibility hash')
+            inv.setdefault(section, {})[name] = {'path': str(path), 'sha256': change['before']}
+        # An unchanged numerical probe and checkpoint must also be verified.
+        probe = repository / 'diagnostics/reassembly_field/probes.py'
+        probe.write_bytes((runner.REPO / 'diagnostics/reassembly_field/probes.py').read_bytes())
+        inv['followup_files']['diagnostics/reassembly_field/probes.py'] = {'path': str(probe), 'sha256': sha256(probe)}
+        checkpoint = root / 'checkpoint.pt'
+        checkpoint.write_bytes(b'unchanged checkpoint')
+        inv['checkpoints'] = {'fixture': {'path': str(checkpoint), 'sha256': sha256(checkpoint)}}
+        write(output / 'inventory.json', inv)
+        write(output / 'results/done.json', {'job': {'id': 'done'}, 'value': .123})
+        write(output / 'scratch/grid/cursor.json', {'completed_nodes': 16})
+        (output / 'scratch/grid/distance.npy').write_bytes(b'unchanged grid bytes')
+        write(output / 'summary.json', {'status': 'partial_or_blocked', 'completed_jobs': 1})
+        return repository, output, compatibility, inv
+
+    def test_known_monitoring_migration_preserves_results_and_grid_resume(self):
+        from diagnostics.reassembly_field import runner
+        with tempfile.TemporaryDirectory() as directory:
+            repository, output, compatibility, inv = self.monitoring_resume_fixture(Path(directory))
+            original_inventory = (output / 'inventory.json').read_bytes()
+            preserved = {p: p.read_bytes() for p in output.rglob('*') if p.is_file() and p.name != 'inventory.json'}
+            with patch.object(runner, 'REPO', repository):
+                validate_resume(output)
+                validate_resume(output)  # No repeated migration or recomputation.
+            history = output / 'resume_history' / compatibility['id']
+            self.assertEqual((history / 'inventory.before.json').read_bytes(), original_inventory)
+            audit = read(history / 'migration.json')
+            self.assertFalse(audit['numerical_probes_changed'])
+            self.assertEqual(len(audit['changes']), 3)
+            self.assertEqual(audit['preserved_evidence']['results/done.json'], sha256(output / 'results/done.json'))
+            for p, content in preserved.items():
+                self.assertEqual(p.read_bytes(), content)
+            updated = read(output / 'inventory.json')
+            self.assertEqual(updated['checkpoints'], inv['checkpoints'])
+            self.assertEqual(len(list(output.glob('resume_history/*/migration.json'))), 1)
+
+    def test_monitoring_migration_rejects_changed_weights_probes_and_unknown_code(self):
+        from diagnostics.reassembly_field import runner
+        for kind in ('checkpoint', 'probe', 'unknown_monitoring_edit'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                repository, output, _, inv = self.monitoring_resume_fixture(Path(directory))
+                paths = {'checkpoint': Path(inv['checkpoints']['fixture']['path']),
+                         'probe': repository / 'diagnostics/reassembly_field/probes.py',
+                         'unknown_monitoring_edit': repository / 'reassembly/resources.py'}
+                paths[kind].write_bytes(paths[kind].read_bytes() + b'\n# unrelated change\n')
+                original = (output / 'inventory.json').read_bytes()
+                with patch.object(runner, 'REPO', repository):
+                    with self.assertRaisesRegex(RuntimeError, 'Resume input changed'):
+                        validate_resume(output)
+                self.assertEqual((output / 'inventory.json').read_bytes(), original)
+                self.assertFalse((output / 'resume_history').exists())
+
+    def test_monitoring_migration_verifies_prepared_data_before_writing(self):
+        from diagnostics.reassembly_field import runner
+        with tempfile.TemporaryDirectory() as directory:
+            repository, output, _, inv = self.monitoring_resume_fixture(Path(directory))
+            inv['prepared_manifest_path'] = str(Path(directory) / 'manifest.json')
+            write(output / 'inventory.json', inv)
+            original = (output / 'inventory.json').read_bytes()
+            with patch.object(runner, 'REPO', repository), patch.object(runner, 'verify_manifest', return_value={'dataset_fingerprint': 'changed'}):
+                with self.assertRaisesRegex(RuntimeError, 'Prepared data changed'):
+                    validate_resume(output)
+            self.assertEqual((output / 'inventory.json').read_bytes(), original)
+            self.assertFalse((output / 'resume_history').exists())
 
     def test_partial_report_lists_unrun_and_packages_without_weights(self):
         with tempfile.TemporaryDirectory() as directory:

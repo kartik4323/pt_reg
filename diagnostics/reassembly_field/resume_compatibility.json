@@ -1,0 +1,21 @@
+{
+  "id": "atomic-progress-monitoring-v1",
+  "reason": "Fix live-directory size scans racing with atomic progress/cursor writes, expose supervisor errors, and preserve exact numerical jobs across this monitoring-only update.",
+  "changes": {
+    "production_files/resources.py": {
+      "path": "reassembly/resources.py",
+      "before": "669e058688543364c20cd46d77ae8fe7ce3fe42f3a98c0e1047c21185f4334a7",
+      "after": "a3e5102036b96930302b529ab4e8e42838ca650a86bd52bc7861542d96ab5c39"
+    },
+    "followup_files/diagnostics/reassembly_field/runner.py": {
+      "path": "diagnostics/reassembly_field/runner.py",
+      "before": "c1ff92e7b1d27cb85b80611f266ad52d016c7fb3c251b866ba514d4c173416bf",
+      "after": "e2982a46baea035656fc340862abd3a9806cd942a717e9fceb7fdb100d43f06d"
+    },
+    "followup_files/diagnostics/reassembly_field/__main__.py": {
+      "path": "diagnostics/reassembly_field/__main__.py",
+      "before": "65f9df8481796859ae769526f5a8b02ea1417678fe276496258f0d5ea6ed482d",
+      "after": "11cf5afd68a10365945cf14c983e018d8b6e44a1186e9b191d403a5cc41bb253"
+    }
+  }
+}

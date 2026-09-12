@@ -36,7 +36,17 @@ PY
 # Keep logs outside the worker output; the worker requires a fresh directory.
 mkdir -p "${REASSEMBLY_ROOT}/repair_logs"
 LOG="${REASSEMBLY_ROOT}/repair_logs/${PHASE}-$(date -u +%Y%m%dT%H%M%S).log"
-trap 'status=$?; echo "Stopped in ${PHASE} (exit ${status}). Inspect ${LOG} and the phase JSON reports. A failed learning gate is not a successful experiment." >&2; exit "$status"' ERR
+phase_failed() {
+  local status=$?
+  echo "Stopped in ${PHASE} (exit ${status}). Inspect ${LOG} and the phase JSON reports." >&2
+  if [[ "$PHASE" == field ]]; then
+    echo "Inspect ${FIELD_DIAGNOSTICS}/summary.json (reason) and worker.log. No learning gate was evaluated." >&2
+  else
+    echo "A failed learning gate is not a successful experiment." >&2
+  fi
+  exit "$status"
+}
+trap phase_failed ERR
 
 if [[ "$PHASE" == field ]]; then
   command=("$PYTHON_BIN" -m diagnostics.reassembly_field --managed-root "$REASSEMBLY_ROOT" --output "$FIELD_DIAGNOSTICS" --device "$REPAIR_DEVICE")

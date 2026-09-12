@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import traceback
 from unittest.mock import patch
 
 from diagnostics.reassembly_v2.runtime import Limits, read, write
@@ -106,6 +107,7 @@ def main(argv=None):
                 reason = f'Worker exited {process.returncode}; inspect worker.log'
     except (Exception, KeyboardInterrupt) as exc:
         reason = f'{type(exc).__name__}: {exc}'
+        failure = {'reason': reason, 'traceback': traceback.format_exc()}
         if process and process.poll() is None:
             process.terminate()
             try:
@@ -113,8 +115,11 @@ def main(argv=None):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        write(args.output / 'supervisor_error.json', failure)
     finally:
         summary = finalize(args.output, reason)
+        if reason:
+            print(f'Stopped: {reason}', flush=True)
         print(f"{summary['status']}: {summary['completed_jobs']}/{summary['planned_jobs']} jobs.\n"
               f"Return: {args.output / 'field_diagnostic_bundle.tar.gz'}", flush=True)
     return 0 if summary['status'] == 'complete' else 2

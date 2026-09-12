@@ -50,6 +50,10 @@ bash scripts/run_reassembly_repair.sh bundle
 
 An exit2 at a learning gate means its measurements did not meet the requirements. Inspect `selection.json`, `gate/contact_gate.json`, or `acceptance.json`. Do not continue by changing success or confidence thresholds. Execution errors instead carry a traceback/error or `failure.json`.
 
+If the field diagnostic stopped with `FileNotFoundError` for `progress.json.tmp`, update this checkout and rerun the same `field` command with the same managed root and output. This was a race between atomic progress writes and the disk-usage monitor. The fix preserves completed jobs and continues an interrupted grid from its saved cursor; do not delete the output or scratch directory. The return bundle excludes scratch grids, so resume uses the original VM directory.
+
+This specific monitoring-only update has an exact before/after code-hash migration. It still verifies every recorded checkpoint, data file, and numerical probe. The original inventory, stop report, and hashes of preserved results/cursors are saved under `resume_history/atomic-progress-monitoring-v1/`. Unrelated code or input changes remain errors. Field failures print their reason and save supervisor tracebacks in `supervisor_error.json`; a field execution failure is not a learning-gate result.
+
 The comparisons use10,000 updates each for contact learning and a separate fresh16-pattern overfit run per configuration. The fixed set receives fresh samples and poses during training. All four configurations use identical sample streams, point resolution, optimizer settings, effective batch8, and absolute curriculum boundaries at600/1300 updates. The first unchanged architecture/objective condition is the longer-training control. Preflight falls back from batch2/accumulation4 to batch1/accumulation8 only after measuring memory at full geometry resolution.
 
 Validation evaluates all48 patterns. Contact checkpoints are selected lexicographically by assembly success, correspondence recall, then matching objective. Field checkpoints use near-surface error, then overall SDF error. Only best/latest weights are retained.

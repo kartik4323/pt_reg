@@ -86,14 +86,54 @@ def validate_resume(output):
     if not inventory_path.exists():
         raise RuntimeError('Interrupted inventory cannot be resumed; choose a fresh output')
     inv = read(inventory_path)
+    changes = []
+    compatibility = None
     for section in ('files', 'checkpoints', 'production_files', 'diagnostic_files', 'followup_files', 'source_files'):
         for name, entry in inv.get(section, {}).items():
             path = Path(entry['path'])
-            if not path.is_file() or sha256(path) != entry['sha256']:
-                raise RuntimeError(f'Resume input changed: {section}/{name}')
+            current = sha256(path) if path.is_file() else None
+            if current != entry['sha256']:
+                if compatibility is None:
+                    compatibility = read(Path(__file__).with_name('resume_compatibility.json'))
+                allowed = compatibility['changes'].get(f'{section}/{name}', {})
+                if (entry['sha256'] != allowed.get('before') or current != allowed.get('after')
+                        or not allowed.get('path') or path.resolve() != (REPO / allowed['path']).resolve()):
+                    raise RuntimeError(f'Resume input changed: {section}/{name}')
+                changes.append({'section': section, 'name': name, 'path': str(path),
+                                'before': entry['sha256'], 'after': current})
     manifest = inv.get('prepared_manifest_path')
     if manifest and verify_manifest(manifest)['dataset_fingerprint'] != inv['dataset_integrity']['dataset_fingerprint']:
         raise RuntimeError('Prepared data changed before resume')
+    if changes:
+        # Only an exact released monitoring fix may cross the code-hash boundary.
+        # Data, weights, numerical probes and completed measurements stay intact.
+        history = Path(output) / 'resume_history' / compatibility['id']
+        history.mkdir(parents=True, exist_ok=True)
+        original = inventory_path.read_bytes()
+        backup = history / 'inventory.before.json'
+        if backup.exists() and backup.read_bytes() != original:
+            raise RuntimeError('Resume migration backup differs from the original inventory')
+        if not backup.exists():
+            backup.write_bytes(original)
+        for name in ('summary.json', 'invocation.json', 'progress.json'):
+            source = Path(output) / name
+            target = history / name
+            if source.is_file() and not target.exists():
+                target.write_bytes(source.read_bytes())
+        preserved = list((Path(output) / 'results').glob('*.json'))
+        preserved += list((Path(output) / 'scratch').glob('*/cursor.json'))
+        audit = {'id': compatibility['id'], 'reason': compatibility['reason'],
+                 'changes': changes, 'original_inventory_sha256': sha256(backup),
+                 'original_git_revision': inv.get('git_revision'),
+                 'preserved_evidence': {p.relative_to(output).as_posix(): sha256(p) for p in preserved},
+                 'numerical_probes_changed': False, 'checkpoints_changed': False,
+                 'prepared_data_changed': False, 'optimizer_updates': 0}
+        write(history / 'migration.json', audit)
+        for change in changes:
+            inv[change['section']][change['name']]['sha256'] = change['after']
+        write(inventory_path, inv)
+        print(f"Applied {compatibility['id']}: preserved completed results and grid cursors; "
+              f"audit: {history / 'migration.json'}", flush=True)
 
 
 def build_jobs(dataset, indices):
@@ -194,7 +234,8 @@ def run(root, output, device, source=None, deadline=None, resume=False):
     write(output / 'progress.json', {'phase': 'artifact verification'})
     inv = original_inventory(work, output, limits, device)
     inv['prepared_manifest_path'] = str(work / 'prepared/manifest.json')
-    files = list(Path(__file__).parent.glob('*.py')) + list((REPO / 'reassembly/repair').glob('*.py'))
+    files = (list(Path(__file__).parent.glob('*.py')) + list((REPO / 'reassembly/repair').glob('*.py'))
+             + [Path(__file__).with_name('resume_compatibility.json')])
     inv['followup_files'] = {p.relative_to(REPO).as_posix(): {'path': str(p), 'sha256': sha256(p)} for p in files}
     write(output / 'inventory.json', inv)
     cfg = read(work / 'eval/test/predicted/evaluation.json')['config']
@@ -392,6 +433,7 @@ def finalize(output, reason=None):
                'input_changes': changed, 'hash_verification': verified, 'prepared_verification_after': prepared_after,
                'checkpoint_changes': [name.removeprefix('checkpoints/') for name in changed if name.startswith('checkpoints/')],
                'checkpoint_verification': {name.removeprefix('checkpoints/'): value for name, value in verified.items() if name.startswith('checkpoints/')},
+               'resume_migrations': [read(p) for p in sorted(output.glob('resume_history/*/migration.json'))],
                'optimizer_updates': 0, 'production_acceptance': False,
                'observed': observed, 'pose_observations': pose_observations,
                'source_objects': sorted({r.get('source_id') for r in rows if r.get('source_id')}),
@@ -417,6 +459,11 @@ def finalize(output, reason=None):
               'Matcher content interventions hold each query’s predicted uncertainty fixed. Their probability matrices are in tensors; they do not use the legacy evaluation loss as a proxy for conditioning.', '',
               f"Conditional 256-grid skips: {len(summary['conditional_skips'])}. Unrun: {len(unrun)}. Failed: {len(errors)}. Input changes: {len(changed)}.", '',
               *summary['unresolved']]
+    if reason:
+        lines += ['', f'Execution stopped: {reason}']
+    if summary['resume_migrations']:
+        lines += ['', 'Monitoring-only resume migrations are recorded in summary.json and resume_history/. '
+                      'Their original inventories and preserved-result hashes remain in this bundle.']
     (output / 'REPORT.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     bundle = output / 'field_diagnostic_bundle.tar.gz'
     with tarfile.open(bundle, 'w:gz') as archive:

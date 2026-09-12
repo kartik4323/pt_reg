@@ -5,6 +5,7 @@ import json
 import os
 import random
 import shutil
+import stat
 from pathlib import Path
 
 import numpy as np
@@ -51,17 +52,37 @@ def write_json(path: str | Path, value, guard=None) -> None:
 
 
 def tree_bytes(root: Path) -> int:
-    if not root.exists():
+    """Measure live files, tolerating removal during atomic report replacement.
+
+    Directory enumeration is not a snapshot: a writer may rename a temporary
+    file before we stat it. Ignore only vanished entries; permission and other
+    I/O errors must still stop resource checks. Never follow symbolic links.
+    """
+    root = Path(root)
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
         return 0
-    if root.is_file():
-        return root.stat().st_size
+    if stat.S_ISREG(info.st_mode):
+        return info.st_size
+    if stat.S_ISLNK(info.st_mode):
+        return 0
+
+    def walk_error(error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
     total = 0
-    for directory, dirs, files in os.walk(root, followlinks=False):
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
         dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
         for name in files:
             path = Path(directory) / name
-            if not path.is_symlink():
-                total += path.stat().st_size
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
     return total
 
 
