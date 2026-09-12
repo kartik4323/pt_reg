@@ -1,0 +1,25 @@
+version: 3
+data:
+  expected_fingerprint: b7f2b84a20964276c894300a7ece4d8f97f232903bace0f14131535594462043
+  max_sources: 498
+  source_pool_reassessment: true
+  points_per_fragment: 1024
+  sdf_queries: 2048
+train:
+  max_updates: 10000
+  overfit_updates: 10000
+  batch_size: 2
+  grad_accum_steps: 4
+  validation_interval: 500
+  amp: true
+repair:
+  geometry_variant: revised
+  view_supervision: resampled_contrastive
+  curriculum_updates: [600, 1300]
+  evaluation_seeds: [4101, 4102, 4103]
+  training_seeds: [42, 43, 44]
+resources:
+  managed_root: ~/reassembly_v2
+  cap_gib: 40
+  min_free_gib: 50
+  max_vram_gib: 20

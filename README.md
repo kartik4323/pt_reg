@@ -1,6 +1,18 @@
 # Coarse shape priors for rigid fragment assembly
 
-The supported workflow is **reassembly v2**: learn local geometry from XYZ, predict an uncertain whole-object scaffold, then recover rigid poses from contacts with scaffold guidance. It accepts **2–3 complete fragments** and returns matrices in the original reference fragment's coordinate frame.
+The current experimental workflow is **reassembly repair v3**: learn local contacts from XYZ, predict an uncertain whole-object scaffold, and use spatial scaffold agreement to rank and refine rigid assembly candidates. It accepts **2–3 complete fragments** and returns matrices in the original reference fragment's coordinate frame.
+
+Start with [the repair VM guide](docs/REASSEMBLY_REPAIR.md) and [the versioned configuration](configs/reassembly_repair_bottles498.yaml). The previous pilot failed on fresh rotations/samples and on training geometry; the repair is implemented but its learning targets require new VM measurements. Existing v2 checkpoints are used only for the focused diagnostic, and new training starts fresh.
+
+```bash
+bash scripts/run_reassembly_repair.sh field
+bash scripts/run_reassembly_repair.sh comparisons
+bash scripts/run_reassembly_repair.sh replicate
+bash scripts/run_reassembly_repair.sh scaffold
+bash scripts/run_reassembly_repair.sh final-test
+```
+
+Run phases separately and inspect failed gates before continuing. The following v2 documentation remains available for preparation and exact replay.
 
 This implementation starts from fresh weights. The neural models, data format, training entry point, and checkpoints are independent of the historical pipeline.
 
@@ -10,9 +22,8 @@ flowchart LR
     N --> E["Shared local geometry encoder"]
     E --> S["Reference-frame uncertain TSDF"]
     E --> M["Partial contact matching"]
-    S --> M
     M --> K["Weighted Kabsch candidates • assembly trees"]
-    S --> R["Damped rigid refinement"]
+    S --> R["Spatial candidate scoring and damped rigid refinement"]
     K --> R
     R --> O["Original input points transformed by R and t"]
 ```
@@ -32,7 +43,7 @@ ShapeNet access is gated. The access check validates the bottle category archive
 
 The pilot uses 1,024 points per fragment, hierarchical 256 → 128 → 64 local groups, 128 channels, an implicit signed field, unmatched contact states, and explicit solver failures. Only the input fragments form the output assembly; generated geometry is guidance.
 
-All stages are bounded to 2,000 updates. Training requires a matching preflight; held-out learning starts after the fixed 16-pattern fit check. CUDA preflight enforces **less than 20 GiB peak reserved memory**, with batch 2 → 1 fallback. Managed artifacts are capped at 40 GiB while preserving 50 GiB free space. A CPU check does not certify A5000 memory or learning performance.
+The original v2 stages remain bounded to 2,000 updates. Repair v3 uses explicitly declared matched10,000-update experiments and stronger rotation/resampling/assembly gates; its Stage3 has no training phase. CUDA preflight enforces **less than20GiB peak reserved memory**, with batch2 →1 fallback. Managed artifacts are capped at40GiB while preserving50GiB free space. A CPU check does not certify GPU memory or learning performance.
 
 Literature informs the design: [Neural Shape Mating](https://neural-shape-mating.github.io/) for complementary cuts, [Jigsaw](https://jiaxin-lu.github.io/Jigsaw/) for fracture matching, and [Jigsaw++](https://arxiv.org/html/2410.11816v2) for whole-shape guidance. No literature weights are loaded.
 

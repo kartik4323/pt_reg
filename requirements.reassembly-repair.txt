@@ -1,0 +1,2 @@
+# Reuse the measured VM dependency versions; no pretrained weights are installed.
+-r requirements.reassembly-v2.txt
