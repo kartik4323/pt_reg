@@ -40,10 +40,19 @@ def code_hash():
     return fingerprint({str(p.relative_to(base)): digest(p) for p in sorted(base.rglob('*.py')) if '__pycache__' not in p.parts})
 
 
+def is_relative_to(path, root):
+    """Lexical containment compatible with Python 3.8; resolve paths first."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def checked(root, relative):
     root = Path(root).resolve()
     path = (root / relative).resolve()
-    if not path.is_relative_to(root):
+    if not is_relative_to(path, root):
         raise ValueError(f'Path escapes artifact root: {relative}')
     return path
 

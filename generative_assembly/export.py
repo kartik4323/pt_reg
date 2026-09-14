@@ -1,7 +1,7 @@
 """Frozen method recipe and portable evidence/pipeline bundles."""
 from pathlib import Path
 import shutil
-from .storage import read, write, fingerprint, digest, verify_job, checked
+from .storage import read, write, fingerprint, digest, verify_job, checked, is_relative_to
 
 
 def freeze(store):
@@ -30,7 +30,7 @@ def require_frozen(store):
 def bundle(store,destination,kind='pipeline'):
     destination=Path(destination).resolve()
     if destination.exists(): raise ValueError('Bundle destination already exists; choose a new path')
-    if destination.is_relative_to(store.root): raise ValueError('Export outside the run root to avoid recursive bundles')
+    if is_relative_to(destination, store.root): raise ValueError('Export outside the run root to avoid recursive bundles')
     if kind=='pipeline' and store.config['smoke']:
         raise ValueError('Smoke artifacts cannot enter a pipeline bundle; use --kind research')
     recipe=require_frozen(store)

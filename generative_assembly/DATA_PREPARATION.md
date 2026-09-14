@@ -1,6 +1,8 @@
 # Prepare fragment data for the generative assembly study
 
-Run these commands from the `pt_reg` repository root, with the core requirements installed in the study environment. The Git repository contains code, not the prepared datasets or model weights.
+Run these commands from the `pt_reg` repository root. `import-v2` uses NumPy/SciPy and supports the existing Python 3.8 preparation environment; it does not require Torch, Diffusers or a new model installation. Use the separate Python 3.10+ study environment and its core/model requirements for the full experiments. The Git repository contains code, not the prepared datasets or model weights.
+
+If import reports `AttributeError: 'PosixPath' object has no attribute 'is_relative_to'`, update with `git pull --ff-only` and rerun the same import command. The path guards now use the Python 3.8-compatible `relative_to` operation, retaining escape checks. In the previous version, this particular error occurred before any fragment output was written, so no data cleanup or regeneration is needed.
 
 ## Which data is used?
 

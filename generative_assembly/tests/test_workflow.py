@@ -58,7 +58,8 @@ class WorkflowTests(unittest.TestCase):
                       patterns=[dict(source_id='bottle',pattern_id='break0',path='pattern.npz',sha256=digest(source/'pattern.npz'),
                                      split='cut_holdout',cut_family='held_out',band='hard')])
         write(source/'manifest.json',manifest)
-        data.import_v2(source/'manifest.json',self.root/'imported')
+        with patch.object(Path,'is_relative_to',create=True,side_effect=AttributeError('Python 3.8 has no is_relative_to')):
+            data.import_v2(source/'manifest.json',self.root/'imported')
         imported=self.root/'imported'/'dataset.json'; doc=data.inventory(imported)
         rec=doc['cases'][0]
         self.assertEqual(rec['split'],'test'); self.assertEqual(rec['original_split'],'cut_holdout')
