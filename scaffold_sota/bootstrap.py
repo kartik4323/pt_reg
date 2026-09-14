@@ -19,14 +19,14 @@ from .setup import _stop_owned_child, subprocess_environment
 
 TOOLS_REQUIREMENTS = (
     "numpy==1.26.4", "scipy==1.13.1", "trimesh==4.6.8",
-    "PyYAML==6.0.2", "rtree==1.4.1",
+    "PyYAML==6.0.2", "rtree==1.4.1", "uv==0.9.26",
 )
 TORCH_REQUIREMENT = "torch==2.6.0"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 # Run inside the new environment only. The current interpreter may have no pip,
 # Torch, NumPy or YAML. Checking actual geometry catches missing libspatialindex.
-SMOKE_SCRIPT = """import json, pathlib, sys
+SMOKE_SCRIPT = """import json, pathlib, sys, subprocess
 import numpy, scipy, trimesh, yaml, rtree, torch
 import scaffold_sota.data, scaffold_sota.priors, scaffold_sota.evaluation
 from scaffold_sota.priors import architectures
@@ -40,6 +40,7 @@ assert numpy.isfinite(trimesh.proximity.signed_distance(mesh, numpy.array([[0., 
 result = {'status': 'passed', 'cpu_tools_verified': True, 'native_models_verified': False,
           'python': sys.version, 'prefix': sys.prefix,
           'versions': {module.__name__: module.__version__ for module in (numpy, scipy, trimesh, yaml, rtree, torch)}}
+result['uv'] = subprocess.check_output([sys.executable, '-m', 'uv', '--version'], text=True).strip()
 pathlib.Path(sys.argv[1]).write_text(json.dumps(result, indent=2) + '\\n', encoding='utf-8')
 print(json.dumps(result))
 """

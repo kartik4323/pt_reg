@@ -37,6 +37,9 @@ def parser():
     child = sub.add_parser("setup-tools", help="Plan or install an isolated CPU environment for data and prior tools")
     common(child)
     child.add_argument("--execute", action="store_true")
+    child = sub.add_parser("setup-cuda", help="Plan or install private CUDA 11.3/GCC build tools for Jigsaw and CCS")
+    common(child)
+    child.add_argument("--execute", action="store_true")
     child = sub.add_parser("setup", help="Plan or install an isolated native environment")
     common(child, model=True)
     child.add_argument("--execute", action="store_true")
@@ -155,6 +158,9 @@ def dispatch(args):
     if args.command == "setup-tools":
         from .bootstrap import setup_tools
         return setup_tools(root, cfg, execute=args.execute)
+    if args.command == "setup-cuda":
+        from .cuda_tools import setup_cuda
+        return setup_cuda(root, cfg, execute=args.execute)
     if args.command == "setup":
         from .setup import setup_model
         return setup_model(root, args.model, cfg, execute=args.execute, source=args.source)

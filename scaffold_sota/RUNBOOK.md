@@ -30,16 +30,31 @@ The run root must be outside the repository and `/data`. The runner enforces a 7
 python -m scaffold_sota setup-tools --run-root "$STUDY_ROOT" --execute
 conda activate "$STUDY_ROOT/envs/tools"
 
+# Jigsaw/CCS need a compiler, not just the Conda CUDA runtime. If no matching
+# CUDA_HOME exists, install private CUDA 11.3 + GCC under the study directory.
+python -m scaffold_sota setup-cuda --run-root "$STUDY_ROOT" --execute
+
 # Inspect the planned commands before executing installation.
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model jigsaw
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model jigsaw --execute
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model ccs --execute
+# GARF default requires Ampere or newer. Do not run this on a V100.
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model garf --execute
 ```
 
 The tools environment uses Python 3.10, CPU-only Torch and the common numerical/mesh packages. It serves prior exports, diagnostics and report commands; it cannot train the native CUDA models. Its installation and import checks are logged under the study root. This leaves the previously active environment (for example `breaking-bad`) unchanged. In a new session, activate `"$STUDY_ROOT/envs/tools"` again before using commands that need common dependencies. If Conda cannot be found, enable the VM's existing Conda installation first.
 
 Native setup copies pinned upstream code, installs into `envs/<model>`, and logs each dependency step under `environments/<model>`. A successful installation is labelled `installed_unverified`; it does not certify legacy CUDA extension execution. Failures point to their step logs. `setup --source PATH` accepts another clean source checkout at the pinned revision. Matrix jobs use the default pinned checkout locations.
+
+### Recovery on the V100 server
+
+The `hades-prod01` snapshot reports a Tesla V100 32 GB, driver 550.163.01 and no `nvcc`. Keep the conservative 20-GiB study GPU budget. CUDA 12.4 in `nvidia-smi` is a driver capability indicator, not an installed compiler. `setup-cuda` installs NVIDIA's [CUDA 11.3.1 toolkit](https://anaconda.org/nvidia/cuda-toolkit/labels) and GCC 10 into `toolchains/cuda-11.3`, without sudo or driver changes. It compiles and links a probe but does not claim GPU execution. Native setup detects this private toolchain automatically and targets the detected GPU (V100: 7.0), respecting an explicit `TORCH_CUDA_ARCH_LIST` override. Installations remain subject to the study storage cap.
+
+Jigsaw's upstream Conda file contains the deprecated pip `sklearn` installer alias. The study-generated environment now omits that alias while retaining the upstream `scikit-learn=1.2.0` dependency and every other pin. This resolves the reported `Preparing metadata ... sklearn ... error`; the [package maintainer documents the rename](https://pypi.org/project/sklearn/). Retry `setup --model jigsaw --execute` against the partially created study environment; do not delete it or modify the upstream checkout.
+
+`setup-tools` now installs pinned `uv==0.9.26`, and GARF setup resolves the study tools binary without requiring shell PATH changes. Existing tools environments can rerun that command. However, fixing uv does not make GARF's default FlashAttention-2 path compatible with V100: the [native kernel supports Ampere and newer](https://github.com/Dao-AILab/flash-attention#nvidia-cuda-support). Default GARF setup stops before package installation on a detected V100. Keep GARF pending; a deliberately configured non-FlashAttention variant would still need native wheel, driver, memory and learning verification before inclusion.
+
+On this host, compile the runnable initial matrix with `--models jigsaw ccs`; this is matching/regression preparation and does not complete the planned generative-family comparison. Add the generative recipient only after establishing a supported runtime. Model setup now prints the last lines of failed dependency logs as well as their paths. Run recovery commands one at a time. The reported existing 760-MiB Python GPU job is not terminated; the training occupancy guard will reject concurrent use until that job exits.
 
 ## 3. Start native baselines before v3 arrives
 

@@ -34,13 +34,16 @@ def subprocess_environment(root):
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONUSERBASE", None)
     env.update(WANDB_MODE="disabled", PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1",
-               PYTHONPATH=str(REPO), CONDA_ALWAYS_YES="true", CONDA_CHANNEL_PRIORITY="flexible")
+               PYTHONPATH=str(REPO), CONDA_ALWAYS_YES="true", CONDA_CHANNEL_PRIORITY="flexible",
+               SCAFFOLD_SOTA_RUN_ROOT=str(root))
     return env
 
 
 def _cuda_compiler(env, prefix, release):
     """Choose the native compiler matching the pinned Torch CUDA ABI."""
     candidates = [Path(env[key]) for key in ("CUDA_HOME", "CUDA_PATH") if env.get(key)]
+    if env.get("SCAFFOLD_SOTA_RUN_ROOT"):
+        candidates.append(Path(env["SCAFFOLD_SOTA_RUN_ROOT"]) / "toolchains" / ("cuda-" + release))
     found = shutil.which("nvcc", path=env.get("PATH"))
     if found:
         candidates.append(Path(found).resolve().parent.parent)
@@ -50,11 +53,76 @@ def _cuda_compiler(env, prefix, release):
         if compiler.is_file():
             version = subprocess.check_output([str(compiler), "--version"], env=env, text=True)
             if re.search(r"release\s+" + re.escape(release) + r"(?:,|\s)", version):
+                libraries = [str(candidate / part) for part in ("lib64", "lib", "targets/x86_64-linux/lib")]
                 env.update(CUDA_HOME=str(candidate), CUDA_PATH=str(candidate),
                            PATH=str(candidate / "bin") + os.pathsep + env.get("PATH", ""),
-                           LD_LIBRARY_PATH=str(candidate / "lib64") + os.pathsep + env.get("LD_LIBRARY_PATH", ""))
-                return {"path": str(candidate), "version": version.strip()}
-    raise RuntimeError("Native extensions require CUDA %s nvcc (the runtime alone has no compiler). Set CUDA_HOME to an installed matching toolkit and rerun setup." % release)
+                           LD_LIBRARY_PATH=os.pathsep.join(libraries) + os.pathsep + env.get("LD_LIBRARY_PATH", ""))
+                host = candidate / "bin/x86_64-conda-linux-gnu-gcc"
+                cxx = candidate / "bin/x86_64-conda-linux-gnu-g++"
+                if host.is_file() and cxx.is_file():
+                    env.update(CC=str(host), CXX=str(cxx), CUDAHOSTCXX=str(cxx))
+                return {"path": str(candidate), "version": version.strip(), "host_cxx": env.get("CXX")}
+    hint = 'Run setup-cuda --run-root "$STUDY_ROOT" --execute, or set CUDA_HOME to an installed 11.3 toolkit.' if release == "11.3" else "Set CUDA_HOME to an installed matching toolkit."
+    raise RuntimeError("Native extensions require CUDA %s nvcc (the runtime alone has no compiler). %s Rerun setup afterwards." % (release, hint))
+
+
+def _uv_executable(root, execute=False):
+    owned = Path(root) / "envs/tools" / ("Scripts/uv.exe" if os.name == "nt" else "bin/uv")
+    if owned.is_file():
+        return str(owned)
+    found = shutil.which("uv")
+    if found:
+        return found
+    if execute:
+        raise RuntimeError('GARF requires uv. Run setup-tools --run-root "$STUDY_ROOT" --execute to install it into the study tools environment, then rerun GARF setup.')
+    return "uv"
+
+
+def _log_tail(path, count=35):
+    from collections import deque
+    with Path(path).open(encoding="utf-8", errors="replace") as stream:
+        return "".join(deque(stream, maxlen=count)).strip()
+
+
+def _gpu_capabilities(env):
+    command = ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"]
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        if visible.strip() in ("", "-1"):
+            return []
+        command += ["--id=" + visible]
+    try:
+        output = subprocess.check_output(command, env=env, text=True, stderr=subprocess.DEVNULL, timeout=15)
+        devices = []
+        for line in output.splitlines():
+            name, capability = (part.strip() for part in line.rsplit(",", 1))
+            if not re.fullmatch(r"\d+\.\d+", capability):
+                return []
+            devices.append({"name": name, "compute_capability": capability})
+        return devices
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def _check_garf_hardware(devices, cfg):
+    flash = cfg["model"].get("encoder_flash", True) or cfg["model"].get("denoiser_flash", False)
+    if flash and devices and any(float(item["compute_capability"]) < 8 for item in devices):
+        raise RuntimeError("GARF's default FlashAttention-2 path requires Ampere or newer; detected " +
+                           ", ".join(item["name"] for item in devices) +
+                           ". Keep this recipient pending on V100. A non-FlashAttention configuration needs a separate compatibility/preflight check; installing uv does not establish GPU support.")
+
+
+def _jigsaw_environment(document):
+    """Remove only the deprecated sklearn installer alias in the owned recipe."""
+    import copy
+    result = copy.deepcopy(document)
+    dependencies = result.get("dependencies", [])
+    if not any(isinstance(item, str) and re.match(r"(?:[^:]+::)?scikit-learn(?:[=<>! ]|$)", item) for item in dependencies):
+        raise ValueError("Jigsaw alias fix requires its native scikit-learn dependency")
+    for item in dependencies:
+        if isinstance(item, dict) and "pip" in item:
+            item["pip"] = [name for name in item["pip"] if not re.match(r"sklearn(?:[=<>! ]|$)", name)]
+    return result
 
 
 def _stop_owned_child(child):
@@ -100,6 +168,9 @@ def setup_model(root, model, cfg, execute=False, source=None):
         prefix = owned_output(root, root / "envs" / model)
         python = environment_python(root, model)
         env = subprocess_environment(root)
+        gpu_devices = _gpu_capabilities(env) if execute else []
+        if model == "garf" and execute:
+            _check_garf_hardware(gpu_devices, cfg)
         commands, cuda_steps, recipe_files = [], set(), []
         pip = [str(python), "-m", "pip"]
         if spec["environment"]["manager"] == "uv":
@@ -114,12 +185,14 @@ def setup_model(root, model, cfg, execute=False, source=None):
             env_file = spec["environment"].get("file")
             original_file = (REPO / "sota_repro" / env_file) if str(env_file).startswith("models/") else source / env_file
             document = yaml.safe_load(original_file.read_text(encoding="utf-8"))
+            if model == "jigsaw":
+                document = _jigsaw_environment(document)
             recipe_files.append(original_file)
             document.pop("name", None)
             document.pop("prefix", None)
             generated = work / "environment.yaml"
             generated.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-            commands.append(["conda", "env", "update" if prefix.exists() else "create", "--prefix", str(prefix), "--file", str(generated)])
+            commands.append(["conda", "env", "update" if (prefix / "conda-meta/history").is_file() else "create", "--prefix", str(prefix), "--file", str(generated)])
             requirements = REPO / "sota_repro/models" / model / "requirements.repro.txt"
             if requirements.exists():
                 command = pip + ["install", "-r", str(requirements)]
@@ -187,11 +260,16 @@ def setup_model(root, model, cfg, execute=False, source=None):
                          ["uv", "pip", "freeze", "--python", str(python)]]
         else:
             commands += [pip + ["check"], pip + ["freeze"]]
+        if model == "garf":
+            uv_executable = _uv_executable(root, execute=execute)
+            commands = [[uv_executable] + command[1:] if command[0] == "uv" else command for command in commands]
         plan = {"experiment_id": "scaffold_sota", "model": model, "source": info,
                 "environment_prefix": str(prefix), "python": str(python), "commands": commands,
                 "status": "unsupported_legacy_runtime" if model == "gpat" else "planned", "runtime_verified": False,
                 "recipe_hashes": {str(p): sha256_file(p) for p in recipe_files},
                 "cuda_build_steps": sorted(cuda_steps),
+                "detected_gpus": gpu_devices,
+                "environment_adjustments": ["Removed deprecated pip sklearn alias; native scikit-learn pin retained"] if model == "jigsaw" else [],
                 "note": "Compatibility recipes require real GPU preflight; GPAT stock Python 3.6 cannot execute this runner." if model == "gpat" else "Installation is not GPU verification. Last step records the resolved package versions in its log."}
         write_json(work / "setup.json", plan)
         if not execute:
@@ -204,8 +282,9 @@ def setup_model(root, model, cfg, execute=False, source=None):
                 if index in cuda_steps and not plan.get("cuda_compiler"):
                     release = "11.3" if model == "jigsaw" else spec["environment"]["cuda"]
                     plan["cuda_compiler"] = _cuda_compiler(env, prefix, release)
-                    # This pilot targets the user's RTX A5000 (Ampere).
-                    env["TORCH_CUDA_ARCH_LIST"] = "8.6"
+                    if not env.get("TORCH_CUDA_ARCH_LIST") and gpu_devices:
+                        env["TORCH_CUDA_ARCH_LIST"] = ";".join(sorted({item["compute_capability"] for item in gpu_devices}))
+                    plan["build_architectures"] = env.get("TORCH_CUDA_ARCH_LIST", "native_torch_detection")
                 print("%s setup %d/%d: %s" % (model, index + 1, len(commands), command[0]), flush=True)
                 with (work / ("setup-%02d.log" % index)).open("a", encoding="utf-8") as log:
                     child = subprocess.Popen(command, cwd=str(source), env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -218,7 +297,8 @@ def setup_model(root, model, cfg, execute=False, source=None):
                         _stop_owned_child(child)
                         raise
                     if child.returncode:
-                        raise RuntimeError("Dependency step failed (%s); inspect %s" % (child.returncode, log.name))
+                        log.flush()
+                        raise RuntimeError("Dependency step failed (%s); inspect %s\n%s" % (child.returncode, log.name, _log_tail(log.name)))
             plan["status"] = "installed_unverified"
             plan["note"] = "Run the native preflight on actual bottle data before training."
         except BaseException as exc:
