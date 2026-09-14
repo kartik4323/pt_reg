@@ -1,25 +1,35 @@
 # Bottle pilot: VM runbook
 
-Read [README.md](README.md) for implementation scope and [PLAN.md](PLAN.md) for the scientific design. Commands run from the repository on the Linux VM. Replace the manifest/checkpoint placeholders with actual immutable artifacts. Native CUDA compatibility and model learning remain to be measured; this repository does not contain trained SOTA weights or a completed v3 export.
+Read [README.md](README.md) for implementation scope and [PLAN.md](PLAN.md) for the scientific design. Commands run from the repository on the Linux VM. Discover the existing prepared dataset below; later checkpoint examples still need actual completed artifacts. Native CUDA compatibility and model learning remain to be measured; this repository does not contain prepared data, trained SOTA weights or a completed v3 export.
 
 ## 1. Own a separate runtime directory
 
-The orchestration interpreter needs Python 3.8+ and PyYAML. Data/prior operations also need Torch, NumPy, SciPy and trimesh. Model training runs in separately created native environments. Existing pinned checkouts under `sota_repro/models/<model>/upstream` must be present and clean.
+Start with any Python 3.8+ interpreter. `init`, `find-data` and `check-data` need only the standard library with the default or JSON config. They do not import Torch. Prior/geometry tools get their own CPU environment in step 2; native model training gets separate environments. Existing pinned checkouts under `sota_repro/models/<model>/upstream` must be present and clean.
 
 ```bash
-cd ~/Kartik_23CS30026/pt_reg
+cd ~/satellite/pt_reg  # Use your actual clone location.
 export STUDY_ROOT="$HOME/Kartik_23CS30026/scaffold_sota"
-export MANIFEST="/absolute/path/to/bottle/manifest.json"
 export PYTHONDONTWRITEBYTECODE=1
 python -m scaffold_sota init --run-root "$STUDY_ROOT"
-python -m scaffold_sota check-data --run-root "$STUDY_ROOT" --manifest "$MANIFEST"
+python -m scaffold_sota find-data --search-root "$HOME"
+
+# This assigns only one unambiguous candidate with all referenced files present.
+MANIFEST="$(python -m scaffold_sota find-data --search-root "$HOME" --path)" &&
+  export MANIFEST &&
+  python -m scaffold_sota check-data --run-root "$STUDY_ROOT" --manifest "$MANIFEST"
 ```
+
+`/absolute/path/to/bottle/manifest.json` from the earlier instructions was an example, not an existing file. Discovery reports the fingerprint, source/pattern counts and asset availability; it does not certify hashes. `check-data` then hashes all assets and verifies splits. Multiple candidates, incomplete scans or missing assets prevent automatic selection: narrow `--search-root` to the intended prepared dataset. The original workflow commonly used `$REASSEMBLY_ROOT/bottles498/prepared/manifest.json`, but the directory must actually exist on this host. If discovery finds no data, reuse/copy the original **prepared directory including its sources and patterns**; cloning this repository alone does not provide the dataset. Do not generate a different dataset as a silent substitute.
 
 The run root must be outside the repository and `/data`. The runner enforces a 75-GiB study cap, a 50-GiB free-space floor, PyTorch reserved memory below 20 GiB and 2 GiB free GPU headroom. Other GPU compute jobs cause a stop; they are never terminated. Environments, caches, temporary files, logs and native source copies all belong to this root. Its marker and lock prevent accidental ownership of another experiment.
 
 ## 2. Install the pilot recipients independently
 
 ```bash
+# This starts from the current interpreter without installing anything into it.
+python -m scaffold_sota setup-tools --run-root "$STUDY_ROOT" --execute
+conda activate "$STUDY_ROOT/envs/tools"
+
 # Inspect the planned commands before executing installation.
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model jigsaw
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model jigsaw --execute
@@ -27,7 +37,9 @@ python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model ccs --execute
 python -m scaffold_sota setup --run-root "$STUDY_ROOT" --model garf --execute
 ```
 
-Setup copies pinned upstream code, installs into `envs/<model>`, and logs each dependency step under `environments/<model>`. A successful installation is labelled `installed_unverified`; it does not certify legacy CUDA extension execution. Failures point to their step logs. `setup --source PATH` accepts another clean source checkout at the pinned revision. Matrix jobs use the default pinned checkout locations.
+The tools environment uses Python 3.10, CPU-only Torch and the common numerical/mesh packages. It serves prior exports, diagnostics and report commands; it cannot train the native CUDA models. Its installation and import checks are logged under the study root. This leaves the previously active environment (for example `breaking-bad`) unchanged. In a new session, activate `"$STUDY_ROOT/envs/tools"` again before using commands that need common dependencies. If Conda cannot be found, enable the VM's existing Conda installation first.
+
+Native setup copies pinned upstream code, installs into `envs/<model>`, and logs each dependency step under `environments/<model>`. A successful installation is labelled `installed_unverified`; it does not certify legacy CUDA extension execution. Failures point to their step logs. `setup --source PATH` accepts another clean source checkout at the pinned revision. Matrix jobs use the default pinned checkout locations.
 
 ## 3. Start native baselines before v3 arrives
 

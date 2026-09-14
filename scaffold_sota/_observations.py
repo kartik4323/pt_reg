@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from reassembly.prepare import _file_sha256, _seed, manifest_fingerprint, random_rotation, signed_distance
+from reassembly.prepare import _seed, random_rotation, signed_distance
+from .manifests import verify_manifest
 
 
 def _contained(root: Path, relative: str) -> Path:
@@ -23,55 +24,6 @@ def _contained(root: Path, relative: str) -> Path:
     except ValueError:
         raise ValueError("Manifest contains a path outside the prepared dataset")
     return path
-
-
-def verify_manifest(manifest: str | Path) -> dict:
-    """Verify immutable dataset contents once before profiling/training.
-
-    Hash files in bounded chunks, check paths after symlink resolution, and bind
-    their hashes to the exact source/pattern assignments and preparation config.
-    Ordinary minibatch reads deliberately do not repeat this complete scan.
-    """
-    manifest_path = Path(manifest).resolve()
-    document = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if document.get("schema_version") != 2 or document.get("sdf_convention") != "negative_inside":
-        raise ValueError("Manifest requires schema_version=2 and negative-inside SDF")
-    root = manifest_path.parent
-    seen_paths,source_ids,pattern_ids = set(),set(),set()
-    total_bytes = 0
-    try:
-        for group in ("sources","patterns"):
-            for record in document[group]:
-                relative = Path(record["path"])
-                if relative.is_absolute():
-                    raise ValueError("Manifest paths must be relative to the prepared dataset")
-                path = _contained(root,str(relative))
-                if path in seen_paths:
-                    raise ValueError(f"Manifest references duplicate asset path: {relative}")
-                seen_paths.add(path)
-                if not path.is_file():
-                    raise ValueError(f"Missing prepared asset: {relative}")
-                expected = record.get("sha256","")
-                if len(expected) != 64 or _file_sha256(path) != expected:
-                    raise ValueError(f"Prepared asset SHA-256 mismatch: {relative}")
-                total_bytes += path.stat().st_size
-                if group == "sources":
-                    if record["source_id"] in source_ids:
-                        raise ValueError("Duplicate source identity in manifest")
-                    source_ids.add(record["source_id"])
-                else:
-                    if record["source_id"] not in source_ids:
-                        raise ValueError("Pattern references unknown source identity")
-                    if record["pattern_id"] in pattern_ids:
-                        raise ValueError("Duplicate pattern identity in manifest")
-                    pattern_ids.add(record["pattern_id"])
-        fingerprint = manifest_fingerprint(document)
-    except (KeyError,TypeError) as exc:
-        raise ValueError(f"Malformed prepared manifest: {type(exc).__name__}") from exc
-    if fingerprint != document.get("fingerprint"):
-        raise ValueError("Dataset fingerprint mismatch: assignments or preparation metadata changed")
-    return {"status":"verified","dataset_fingerprint":fingerprint,
-            "verified_sources":len(source_ids),"verified_patterns":len(pattern_ids),"verified_bytes":total_bytes}
 
 
 def _numpy(value):

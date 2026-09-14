@@ -29,6 +29,14 @@ def parser():
     common(child)
     child = sub.add_parser("check-data", help="Verify shared immutable bottle data")
     common(child, data=True)
+    child = sub.add_parser("find-data", help="Locate prepared bottle manifests without importing ML dependencies")
+    child.add_argument("--search-root", nargs="+", dest="search_roots")
+    child.add_argument("--max-depth", type=int, default=8)
+    child.add_argument("--max-files", type=int, default=50000)
+    child.add_argument("--path", action="store_true", help="Print a path only when discovery finds one unambiguous complete candidate")
+    child = sub.add_parser("setup-tools", help="Plan or install an isolated CPU environment for data and prior tools")
+    common(child)
+    child.add_argument("--execute", action="store_true")
     child = sub.add_parser("setup", help="Plan or install an isolated native environment")
     common(child, model=True)
     child.add_argument("--execute", action="store_true")
@@ -124,6 +132,9 @@ def parser():
 
 def dispatch(args):
     cfg = load_config(getattr(args, "config", None))
+    if args.command == "find-data":
+        from .manifests import find_manifests
+        return find_manifests(args.search_roots, max_depth=args.max_depth, max_files=args.max_files)
     if args.command == "init":
         root = study_root(args.run_root, create=True)
         from .resources import ResourceGuard
@@ -137,12 +148,13 @@ def dispatch(args):
     if args.command == "status":
         return {"experiment_id": "scaffold_sota", "runs": [read_json(p) for p in sorted((root / "runs").glob("*/run.json"))]}
     if args.command == "check-data":
-        from .data import StudyDataset
-        dataset = StudyDataset(args.manifest, "all", points_per_fragment=cfg["data"]["points_per_fragment"])
-        result = {"fingerprint": dataset.fingerprint, "verification": dataset.verification,
-                  "patterns": len(dataset), "sources": len(dataset.manifest["sources"])}
+        from .manifests import check_data
+        result = check_data(args.manifest)
         write_json(root / "data_verification.json", result)
         return result
+    if args.command == "setup-tools":
+        from .bootstrap import setup_tools
+        return setup_tools(root, cfg, execute=args.execute)
     if args.command == "setup":
         from .setup import setup_model
         return setup_model(root, args.model, cfg, execute=args.execute, source=args.source)
@@ -224,6 +236,24 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         result = dispatch(args)
+        if args.command == "find-data" and args.path:
+            candidates = result["candidates"]
+            if (result.get("truncated") or result.get("errors") or len(candidates) != 1
+                    or not candidates[0].get("assets_present") or not candidates[0].get("fingerprint_matches")):
+                print(json.dumps(result, indent=2, sort_keys=True), file=sys.stderr)
+                raise ValueError("No unambiguous complete manifest selected. Inspect find-data output and narrow --search-root to the intended prepared dataset; no data is generated or substituted.")
+            print(candidates[0]["path"])
+            return 0
+    except ModuleNotFoundError as exc:
+        name = exc.name or "an optional dependency"
+        model = getattr(args, "model", None)
+        if args.command in ("train", "preflight", "evaluate"):
+            hint = ("Use this recipient's study environment; install it with setup --model " + model
+                    if model else "Use the checkpoint recipient's study environment under envs/<model>")
+        else:
+            hint = "Run setup-tools --run-root \"$STUDY_ROOT\" --execute, then use its envs/tools/bin/python interpreter"
+        print("scaffold_sota: Missing dependency '%s' in %s. %s.\nThe active environment has not been modified." % (name, sys.executable, hint), file=sys.stderr)
+        return 2
     except (ValueError, RuntimeError, FileNotFoundError, FileExistsError) as exc:
         print("scaffold_sota: " + str(exc), file=sys.stderr)
         return 2

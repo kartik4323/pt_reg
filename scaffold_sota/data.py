@@ -8,33 +8,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ._observations import FractureDataset, verify_manifest as _verify_asset_manifest
+from ._observations import FractureDataset
+from .manifests import verify_manifest
 
 
 INPUT_KEYS = ("points", "fragment_mask", "anchor_index")
-
-
-def verify_manifest(manifest):
-    """Validate every hash plus full source-identity/content split separation."""
-    result = _verify_asset_manifest(manifest)
-    document = json.loads(Path(manifest).read_text(encoding="utf-8"))
-    sources = {record["source_id"]: record for record in document["sources"]}
-    identity_split, content_split = {}, {}
-    for record in document["patterns"]:
-        split = record.get("split")
-        if split not in ("train", "val", "test", "cut_holdout"):
-            raise ValueError("Manifest has an unknown data split")
-        effective = "test" if split == "cut_holdout" else split
-        source_id = record["source_id"]
-        content = sources[source_id]["sha256"]
-        if source_id in identity_split and identity_split[source_id] != effective:
-            raise ValueError("Source object leaks across dataset splits")
-        if content in content_split and content_split[content] != effective:
-            raise ValueError("Identical source content leaks across study splits")
-        if record.get("cut_family") == "heldout_radial" and effective != "test":
-            raise ValueError("Held-out cut family leaked into training or validation")
-        identity_split[source_id], content_split[content] = effective, effective
-    return {**result, "source_split_separation": "verified", "content_split_separation": "verified"}
 
 
 def sanitize_input(sample: dict, device=None) -> dict:
