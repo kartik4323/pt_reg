@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -49,6 +50,15 @@ def _datasets(manifest, cfg, stage, purpose, query_cache):
     return train, val
 
 
+def _start_cuda_measurement(device):
+    # Availability checks and empty_cache do not initialize the allocator. With
+    # an explicit cuda:0, resetting peak stats before init can reject device 0.
+    torch.cuda.init()
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+
 def preflight(cfg, manifest, output, device, *, query_cache=None, guard=None):
     from .model import RepairModel, configure_stage
     from .losses import compute_losses
@@ -77,11 +87,14 @@ def preflight(cfg, manifest, output, device, *, query_cache=None, guard=None):
         attempt = {"batch_size": size, "stages": []}
         model = optimizer = scaler = batch = cache = field = None
         started = time.perf_counter()
+        operation = "cuda_initialization"
         try:
             if device.type == "cuda":
-                torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
+                _start_cuda_measurement(device)
+            operation = "batch_loading"
             batch = collate_samples([dataset[indices[i % len(indices)]] for i in range(size)], device)
             for stage in (1, 2):
+                operation = f"stage_{stage}_model_initialization"
                 seed_all(cfg["train"]["seed"])
                 model = RepairModel(resolved).to(device).train()
                 configure_stage(model, stage)
@@ -97,10 +110,12 @@ def preflight(cfg, manifest, output, device, *, query_cache=None, guard=None):
                         for k, v in _loss_numbers(losses).items():
                             totals[k] = totals.get(k, 0) + v/resolved["train"]["grad_accum_steps"]
                     return totals
+                operation = f"stage_{stage}_optimizer_step"
                 update = optimizer_update(model, optimizer, scaler, backward,
                     gradient_clip=cfg["train"]["gradient_clip"], context={"phase": "repair_preflight", "stage": stage, "update": 1})
                 attempt["stages"].append({"stage": stage, **update})
                 _check_cuda_memory(device, resolved)
+            operation = "continuous_field_and_solver"
             model.eval(); configure_stage(model, 3)
             one = collate_samples([dataset[indices[0]]], device)
             cache = build_candidates(model, one, resolved)
@@ -112,7 +127,8 @@ def preflight(cfg, manifest, output, device, *, query_cache=None, guard=None):
             _check_cuda_memory(device, resolved)
             attempt.update(passed=True, max_reserved_bytes=torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None)
         except (RuntimeError, ValueError) as exc:
-            attempt.update(passed=False, error=f"{type(exc).__name__}: {exc}")
+            attempt.update(passed=False, error=f"{type(exc).__name__}: {exc}",
+                           failed_operation=operation, traceback=traceback.format_exc())
             is_memory = isinstance(exc, torch.cuda.OutOfMemoryError) or "memory cap" in str(exc).lower()
             if not is_memory:
                 attempt["non_memory_failure"] = True
@@ -226,7 +242,7 @@ def train_stage(cfg, manifest, output, stage, device, *, preflight_report, field
     steps = cfg["train"]["overfit_updates" if purpose == "overfit" else "max_updates"]
     seed_all(cfg["train"]["seed"])
     if device.type == "cuda":
-        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
+        _start_cuda_measurement(device)
     model = RepairModel(cfg).to(device)
     configure_stage(model, stage)
     optimizer, scaler = _optimizer(model, cfg), _scaler(device.type == "cuda" and cfg["train"]["amp"])

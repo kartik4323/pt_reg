@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -72,14 +73,44 @@ def _train(cfg, manifest, root, stage, device, purpose, diagnostic, profile, que
         contact_gate_report=gate, guard=guard)
 
 
+def _retry_legacy_cuda_preflight(profile, profile_path, cfg, manifest, device):
+    """Preserve and retry only the old cold-start failure, before any training."""
+    attempts = profile.get("attempts", [])
+    old_code = profile.get("provenance", {}).get("code", {}).get("sha256")
+    if (profile.get("status") != "failed" or not attempts or not old_code
+            or old_code == code_inventory()["sha256"]
+            or any(a.get("stages") or a.get("failed_operation")
+                   or not a.get("error", "").startswith("RuntimeError: Invalid device argument") for a in attempts)):
+        return False
+    if (profile.get("config_signature") != signature(cfg) or profile.get("device") != str(device)
+            or profile.get("dataset_fingerprint") != dataset_integrity(manifest, cfg)["dataset_fingerprint"]):
+        raise ValueError("Failed preflight inputs changed; select a fresh experiment root")
+    root = profile_path.parent.parent.resolve()
+    # No existing run or checkpoint may have its supporting proof replaced.
+    if any((root / name).exists() for name in ("overfit", "contacts", "gate", "experiment.json")):
+        raise RuntimeError("Cannot retry this preflight after training artifacts have been created")
+    source = profile_path.parent.resolve()
+    archive = (root / f"preflight.failed.{uuid.uuid4().hex}").resolve()
+    if (profile_path.parent.is_symlink() or source != root / "preflight"
+            or source.parent != root or archive.parent != root):
+        raise ValueError("Preflight archive paths escaped the experiment directory")
+    source.rename(archive)
+    print(f"Archived CUDA startup preflight failure: {archive}; rerunning measured preflight", flush=True)
+    return True
+
+
 def _contact_experiment(cfg, manifest, root, device, diagnostic, query_cache, resume, guard):
     profile_path = root / "preflight" / "preflight.json"
     profile = _reuse(profile_path, resume)
+    if profile is not None and _retry_legacy_cuda_preflight(profile, profile_path, cfg, manifest, device):
+        profile = None
     if profile is None:
         profile = preflight(cfg, manifest, profile_path.parent, device, query_cache=query_cache, guard=guard)
     resolved = profile["config"]
     if profile["status"] == "failed":
-        raise RuntimeError(f"Preflight failed: {profile_path}")
+        errors = "; ".join(f"{a.get('failed_operation', 'unrecorded operation')}: {a.get('error', 'unknown error')}"
+                           for a in profile.get("attempts", []) if not a.get("passed"))
+        raise RuntimeError(f"Preflight failed: {profile_path}; {errors}")
     # Immutable comparison inputs, even if a prior preflight selected batch1.
     for section in ("repair", "model", "data", "loss", "solver"):
         if resolved[section] != cfg[section]:

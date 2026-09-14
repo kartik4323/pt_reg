@@ -5,6 +5,8 @@ import copy
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -231,6 +233,62 @@ class RepairWorkflowTests(unittest.TestCase):
         self.assertTrue(sampled)
         self.assertTrue(all(np.isfinite(value).all() for triple in sampled for value in triple))
         self.assertGreater(np.linalg.norm(sampled[0][2]), 0)
+
+    def test_cuda_measurement_initializes_before_resetting_explicit_device(self):
+        calls = []
+        selected = torch.device('cuda:3')
+        def reset(device):
+            if 'init' not in calls:
+                raise RuntimeError('Invalid device argument ')
+            self.assertEqual(device, selected)
+            calls.append('reset')
+        with patch.object(torch.cuda, 'init', side_effect=lambda: calls.append('init')), \
+                patch.object(torch.cuda, 'device') as context, \
+                patch.object(torch.cuda, 'empty_cache', side_effect=lambda: calls.append('empty')), \
+                patch.object(torch.cuda, 'reset_peak_memory_stats', side_effect=reset):
+            context.return_value.__enter__.side_effect = lambda: calls.append('enter')
+            context.return_value.__exit__.side_effect = lambda *a: calls.append('exit')
+            training._start_cuda_measurement(selected)
+            context.assert_called_once_with(selected)
+        self.assertEqual(calls, ['init', 'enter', 'empty', 'reset', 'exit'])
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required for a real cold-process allocator check')
+    def test_cuda_measurement_in_fresh_process(self):
+        subprocess.run([sys.executable, '-c',
+            "import torch; from reassembly.repair.training import _start_cuda_measurement; "
+            "assert not torch.cuda.is_initialized(); "
+            "_start_cuda_measurement(torch.device('cuda:0')); "
+            "assert torch.cuda.is_initialized(); "
+            "x = torch.empty(1024, device='cuda:0'); "
+            "assert torch.cuda.max_memory_allocated(0) >= x.numel()*x.element_size()"],
+            cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True, timeout=60)
+
+    def test_preflight_records_failing_operation_and_traceback(self):
+        with patch('reassembly.validation.run_correctness_checks', return_value=dict(passed=True)), \
+                patch.object(training, 'collate_samples', side_effect=RuntimeError('fixture batch failure')):
+            report = training.preflight(self.cfg, self.manifest, self.root/'failed_preflight', 'cpu')
+        attempt = report['attempts'][0]
+        self.assertEqual(attempt['failed_operation'], 'batch_loading')
+        self.assertIn('fixture batch failure', attempt['traceback'])
+        self.assertTrue(attempt['non_memory_failure'])
+
+    def test_preflight_cold_cuda_setup_reaches_batch_loading(self):
+        initialized = []
+        def reset(device):
+            if not initialized:
+                raise RuntimeError('Invalid device argument ')
+        with patch('reassembly.validation.run_correctness_checks', return_value=dict(passed=True)), \
+                patch.object(torch.cuda, 'is_available', return_value=True), \
+                patch.object(torch.cuda, 'init', side_effect=lambda: initialized.append(True)), \
+                patch.object(torch.cuda, 'device'), patch.object(torch.cuda, 'empty_cache'), \
+                patch.object(torch.cuda, 'reset_peak_memory_stats', side_effect=reset) as reset_stats, \
+                patch.object(training, 'collate_samples', side_effect=RuntimeError('reached batch loading')) as load, \
+                patch.object(training, 'provenance', return_value={'device': 'cuda:0'}):
+            report = training.preflight(self.cfg, self.manifest, self.root/'cold_cuda_preflight', 'cuda:0')
+        reset_stats.assert_called_once_with(torch.device('cuda:0'))
+        load.assert_called_once()
+        self.assertEqual(report['attempts'][0]['failed_operation'], 'batch_loading')
+        self.assertEqual(report['attempts'][0]['error'], 'RuntimeError: reached batch loading')
 
     def test_paired_fields_reuse_candidates_and_export_identical_coverage(self):
         model = RepairModel(self.cfg).eval()
