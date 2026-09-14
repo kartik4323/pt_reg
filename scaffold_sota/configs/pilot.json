@@ -1,0 +1,9 @@
+{
+  "experiment_id": "scaffold_sota",
+  "schema_version": 1,
+  "data": {"points_per_fragment": 1024, "sdf_queries": 512, "verify": true},
+  "prior": {"query_count": 512, "extent": 1.5},
+  "train": {"updates": 10000, "grad_accum_steps": 8, "validation_interval": 500, "checkpoint_interval": 500, "seed": 42},
+  "evaluation": {"threshold": 0.01, "observation_seeds": [4101, 4102, 4103], "bootstrap_samples": 2000},
+  "resources": {"cap_gib": 75, "min_free_gib": 50, "max_reserved_gib": 20, "min_gpu_free_gib": 2, "max_external_gpu_mib": 512}
+}

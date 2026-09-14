@@ -1,0 +1,4 @@
+{
+  "data": {"fixed_training": true, "train_limit": 16, "seed": 42},
+  "train": {"updates": 500, "grad_accum_steps": 1, "validation_interval": 100, "checkpoint_interval": 100, "seed": 42}
+}
