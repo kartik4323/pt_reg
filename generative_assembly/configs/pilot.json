@@ -1,0 +1,18 @@
+{
+  "smoke": false,
+  "points": 512,
+  "evaluation_points": 2048,
+  "pixels": 512,
+  "image_models": ["sd15_depth", "qwen"],
+  "input_types": ["F", "A"],
+  "image_seeds": [11, 23, 37, 51],
+  "reconstruct_all_for_E5": true,
+  "primary_model": "sd15_depth",
+  "primary_input": "A",
+  "primary_policy": "gated",
+  "images": {"python": null, "cpu_offload": true},
+  "reconstruction": {"backend": "instantmesh", "python": "/absolute/path/to/instantmesh-env/bin/python", "repo": "/absolute/path/to/InstantMesh"},
+  "solver": {"compute_control_max_seconds": 60, "compute_control_max_batches": 8},
+  "training": {"device": "cuda", "updates": 2000, "seeds": [101,202,303]},
+  "resources": {"minimum_free_gib": 10}
+}

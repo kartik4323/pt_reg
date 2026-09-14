@@ -1,0 +1,359 @@
+{
+  "schema_version": 1,
+  "study_id": "generative_fragment_assembly_feasibility",
+  "created": "2026-09-14",
+  "status": "design_only_not_executed",
+  "executable_config": false,
+  "protocol": "PROTOCOL.md",
+  "actual_results": null,
+  "assumptions": {
+    "known_object_membership": true,
+    "unknown_fragment_poses": true,
+    "shared_metric_scale": true,
+    "initial_fragment_counts": [
+      2,
+      3
+    ],
+    "initial_all_pieces_present": true,
+    "main_input": [
+      "fragment_xyz",
+      "input_estimated_normals"
+    ],
+    "main_output": "one_rigid_transform_per_original_fragment"
+  },
+  "supervision": {
+    "foundation_models": "frozen_external_pretrained_priors",
+    "oracle_inputs": "evaluator_and_explicit_diagnostic_arms_only",
+    "main_category_prompt": false,
+    "pseudo_labels": "inferred_from_training_fragments_only",
+    "label_based_development_tuning": "must_be_disclosed_as_development_supervision",
+    "final_test": "once_after_all_method_and_learning_choices_are_frozen"
+  },
+  "data_plan": {
+    "status": "source_inventory_required",
+    "categories": [
+      "bottle",
+      "bowl",
+      "mug"
+    ],
+    "split_unit": "original_source_object",
+    "development_sources": 24,
+    "unlabeled_training_sources": 120,
+    "locked_synthetic_sources": 60,
+    "real_scan_sources_target": 15,
+    "first_screen_sources": 12,
+    "patterns": "one_valid_2_3_5_piece_pattern_per_source_where_available",
+    "pose_resampling_repeats": 3,
+    "generation_seeds": [
+      11,
+      23,
+      37,
+      51
+    ],
+    "training_seeds": [
+      101,
+      202,
+      303
+    ]
+  },
+  "models": [
+    {
+      "id": "image_sd15_depth",
+      "role": "first_modular_baseline",
+      "checkpoints": [
+        "stable-diffusion-v1-5/stable-diffusion-inpainting",
+        "lllyasviel/control_v11f1p_sd15_depth"
+      ],
+      "pipeline": "StableDiffusionControlNetInpaintPipeline",
+      "revision": null,
+      "precision": null,
+      "resource_verified": false
+    },
+    {
+      "id": "image_qwen",
+      "role": "instruction_editing_comparison",
+      "checkpoints": [
+        "Qwen/Qwen-Image-Edit-2509"
+      ],
+      "revision": null,
+      "precision": null,
+      "resource_verified": false,
+      "note": "quantized_or_distilled_variants_are_separate_conditions"
+    },
+    {
+      "id": "image_sdxl",
+      "role": "optional_resolution_ablation",
+      "checkpoints": [
+        "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+      ],
+      "revision": null,
+      "resource_verified": false
+    },
+    {
+      "id": "reconstruct_instantmesh",
+      "role": "fixed_first_3d_bridge",
+      "repository": "https://github.com/TencentARC/InstantMesh",
+      "revision": null,
+      "resource_verified": false
+    },
+    {
+      "id": "reconstruct_trellis2",
+      "role": "later_bridge_replication",
+      "repository": "https://github.com/microsoft/TRELLIS.2",
+      "revision": null,
+      "resource_verified": false
+    }
+  ],
+  "first_screen_budget": {
+    "camera_rule": "F_and_A_share_reference_piece_camera_canvas_and_normalization_per_case",
+    "render_pixels": [
+      512,
+      512
+    ],
+    "input_types": [
+      "largest_fragment_F",
+      "frozen_geometry_only_rough_assembly_A"
+    ],
+    "edited_images": 192,
+    "raw_image_controls": 24,
+    "selected_edited_reconstructions_max": 96,
+    "raw_reconstructions": 24,
+    "true_image_oracle_reconstructions": 12,
+    "total_reconstructions_max": 132,
+    "additional_best_of_4_subset": "separately_budgeted",
+    "candidate_bank_size": 32
+  },
+  "metrics": {
+    "assembly_primary": "source_macro_success_difference",
+    "part_distance": "0.5_times_sum_of_directional_mean_unsquared_Euclidean_nearest_neighbor_distances",
+    "scale": "one_input_only_shared_maximum_fragment_diameter",
+    "part_success_threshold": 0.01,
+    "threshold_sensitivity": [
+      0.005,
+      0.01,
+      0.02
+    ],
+    "bootstrap_unit": "original_source",
+    "paired_bootstrap_resamples": 2000,
+    "confidence_interval": 0.95,
+    "failures": "included_in_all_case_success_denominator",
+    "selected_result": "input_only_choice",
+    "gt_best_of_k": "oracle_column_only"
+  },
+  "experiments": [
+    {
+      "id": "E0",
+      "title": "Coordinate_rendering_resource_integrity",
+      "depends_on": [],
+      "arms": [
+        "depth_round_trip",
+        "rigid_transform_round_trip",
+        "wrong_camera_scale_detection",
+        "reference_file_denial",
+        "model_resource_smoke"
+      ],
+      "gate": "numerical_integrity_and_no_reference_leakage",
+      "status": "planned"
+    },
+    {
+      "id": "E1",
+      "title": "Fragment_image_completion",
+      "depends_on": [
+        "E0"
+      ],
+      "arms": [
+        "raw",
+        "sd15_inpainting_depth",
+        "qwen_edit"
+      ],
+      "later_ablations": [
+        "generic_vs_category_prompt",
+        "no_depth",
+        "no_protection_vs_estimated_exterior_vs_oracle_exterior",
+        "sdxl_resolution"
+      ],
+      "gate": "development_geometry_fidelity_screen",
+      "status": "planned"
+    },
+    {
+      "id": "E2",
+      "title": "Image_to_3D_bridge",
+      "depends_on": [
+        "E1"
+      ],
+      "arms": [
+        "raw_image_3d",
+        "selected_generated_image_3d",
+        "true_complete_image_3d_oracle",
+        "true_mesh_oracle"
+      ],
+      "gate": "valid_geometry_and_improved_shape_without_exterior_damage",
+      "status": "planned"
+    },
+    {
+      "id": "E3",
+      "title": "Perfect_template_pose_utility",
+      "depends_on": [
+        "E0"
+      ],
+      "arms": [
+        "no_template",
+        "true_mesh_oracle",
+        "same_category_distractor",
+        "distorted_true_mesh_control"
+      ],
+      "regimes": [
+        "exact_pose_oracle_start",
+        "5deg_0.02_oracle_perturbation",
+        "15deg_0.05_oracle_perturbation",
+        "input_only_global_candidates"
+      ],
+      "gate": "template_utility_without_oracle_correspondences",
+      "status": "planned"
+    },
+    {
+      "id": "E4",
+      "title": "End_to_end_rigid_assembly",
+      "depends_on": [
+        "E2",
+        "E3"
+      ],
+      "arms": [
+        "B0_no_prior",
+        "B1_raw_image_prior",
+        "B2_generated_image_prior",
+        "B3_same_category_wrong_prior",
+        "B4_true_shape_oracle",
+        "B5_compute_matched_no_prior",
+        "B6_true_image_reconstructed_oracle"
+      ],
+      "interventions": [
+        "rerank_only",
+        "contact_preserving_refinement"
+      ],
+      "gate": "development_inference_benefit_then_locked_final_confirmation",
+      "status": "planned"
+    },
+    {
+      "id": "E5",
+      "title": "Uncertainty_and_rejection",
+      "depends_on": [
+        "E4"
+      ],
+      "arms": [
+        "always_use",
+        "constant_weak_weight",
+        "input_only_gate"
+      ],
+      "hypothesis_budgets": [
+        1,
+        2,
+        4
+      ],
+      "gate": "reduced_harm_with_nontrivial_coverage_and_retained_benefit",
+      "status": "planned"
+    },
+    {
+      "id": "E6",
+      "title": "Self_training",
+      "depends_on": [
+        "E5"
+      ],
+      "arms": [
+        "geometry_consistency_only",
+        "all_pseudo_labels",
+        "filtered_pseudo_labels",
+        "random_count_matched_pseudo_labels",
+        "frozen_teacher_inference"
+      ],
+      "initial_rounds": 1,
+      "conditional_additional_rounds": 1,
+      "gate": "held_out_learning_gain_or_explicit_speed_only_distillation",
+      "status": "planned"
+    },
+    {
+      "id": "E7",
+      "title": "Robustness_and_transfer",
+      "depends_on": [
+        "E4"
+      ],
+      "arms": [
+        "fragment_count",
+        "point_noise",
+        "point_dropout",
+        "missing_fragment",
+        "interface_erosion",
+        "density",
+        "real_scans"
+      ],
+      "gate": "scope_specific_report_no_automatic_generalization_claim",
+      "status": "planned"
+    }
+  ],
+  "proposed_gates": {
+    "status": "engineering_decisions_not_measured_or_universal",
+    "freeze_before_final_test": true,
+    "E1": {
+      "usable_rate_min": 0.9,
+      "median_exterior_drift_width_fraction_max": 0.02,
+      "median_silhouette_iou_gain_min": 0.1
+    },
+    "E2": {
+      "valid_mesh_rate_min": 0.9,
+      "median_relative_shape_cd_reduction_target": 0.1,
+      "held_out_exterior_damage": "no_material_increase"
+    },
+    "E4_final": {
+      "absolute_success_gain_min": 0.05,
+      "paired_ci_lower_bound_strictly_above": 0,
+      "baseline_success_damage_rate_max": 0.05
+    },
+    "E5": {
+      "relative_harm_reduction_target": 0.5,
+      "retain_E4_gain": true,
+      "reject_all_not_a_pass": true
+    },
+    "E6_final": {
+      "absolute_success_gain_over_geometry_learner_min": 0.05,
+      "paired_ci_lower_bound_strictly_above": 0,
+      "training_seeds": 3
+    }
+  },
+  "execution_order": [
+    "E0",
+    "E1_and_E3_independent",
+    "E2",
+    "E4_development",
+    "E5_development",
+    "E6_training_and_development",
+    "freeze_all_conditions",
+    "E4_E5_E6_locked_evaluation",
+    "E7_frozen_scope_tests"
+  ],
+  "required_run_fields": [
+    "protocol_hash",
+    "code_revision",
+    "checkpoint_hashes",
+    "source_split_hash",
+    "supervision_track",
+    "input_hashes",
+    "camera_and_mask_hashes",
+    "prompts",
+    "seeds",
+    "precision_and_quantization",
+    "scale_and_coordinate_metadata",
+    "candidate_budgets",
+    "input_only_selection_scores",
+    "oracle_flags",
+    "predicted_transforms",
+    "failure_status",
+    "runtime",
+    "peak_memory"
+  ],
+  "known_limitations": [
+    "model_revisions_not_pinned_until_execution_preflight",
+    "source_pools_not_yet_materialized",
+    "no_launchers_or_model_adapters_implemented_by_this_artifact",
+    "no_runtime_or_accuracy_results"
+  ]
+}

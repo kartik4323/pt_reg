@@ -1,0 +1,25 @@
+{
+  "smoke": true,
+  "points": 32,
+  "evaluation_points": 64,
+  "pixels": 32,
+  "image_models": ["sd15_depth"],
+  "input_types": ["F", "A"],
+  "image_seeds": [11],
+  "solver": {
+    "candidates": 2,
+    "patches": 8,
+    "refine_evaluations": 2,
+    "alignment_starts": 1,
+    "alignment_iterations": 1,
+    "scales": [1.0],
+    "gate_exterior": 100,
+    "gate_contact_ratio": 100,
+    "compute_control_max_seconds": 0.001,
+    "compute_control_max_batches": 1
+  },
+  "training": {"updates": 2, "seeds": [101], "hidden": 16, "checkpoint_every": 1, "device": "cpu"},
+  "robustness": {"noise": [0.005], "dropout": [], "repeats": 1, "missing_piece": false, "erosion_fraction": 0.1},
+  "evaluation": {"bootstrap": 20},
+  "resources": {"minimum_free_gib": 0.1}
+}
