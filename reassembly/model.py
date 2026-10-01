@@ -230,8 +230,8 @@ class PartialContactMatcher(nn.Module):
                     logits = torch.einsum("bkd,bld->bkl", features[:, i], features[:, j]) / temperature
                     # Explicit dustbins keep unmatched mass. Neither direction is
                     # renormalized after discarding its dustbin column.
-                    source_logits = logits + fracture[:, j, None].clamp_min(1e-6).log()
-                    target_logits = logits.transpose(-1, -2) + fracture[:, i, None].clamp_min(1e-6).log()
+                    source_logits = logits + fracture[:, j].unsqueeze(1).clamp_min(1e-6).log()
+                    target_logits = logits.transpose(-1, -2) + fracture[:, i].unsqueeze(1).clamp_min(1e-6).log()
                     source = torch.cat((source_logits, self.dustbin.expand(*source_logits.shape[:-1], 1)), -1).softmax(-1)
                     target = torch.cat((target_logits, self.dustbin.expand(*target_logits.shape[:-1], 1)), -1).softmax(-1)
                     weights = source[..., :-1] * target[..., :-1].transpose(-1, -2)

@@ -146,8 +146,8 @@ class RepairContactMatcher(PartialContactMatcher):
                 with torch.autocast(device_type=features.device.type, enabled=False):
                     a, b = F.normalize(a.float(), dim=-1), F.normalize(b.float(), dim=-1)
                     logits = torch.einsum('bkd,bld->bkl', a, b) / temperature
-                    source_logits = logits + fracture[:, j, None].clamp_min(1e-6).log()
-                    target_logits = logits.transpose(-1, -2) + fracture[:, i, None].clamp_min(1e-6).log()
+                    source_logits = logits + fracture[:, j].unsqueeze(1).clamp_min(1e-6).log()
+                    target_logits = logits.transpose(-1, -2) + fracture[:, i].unsqueeze(1).clamp_min(1e-6).log()
                     source = torch.cat((source_logits, self.dustbin.expand(*source_logits.shape[:-1], 1)), -1).softmax(-1)
                     target = torch.cat((target_logits, self.dustbin.expand(*target_logits.shape[:-1], 1)), -1).softmax(-1)
                     valid = encoded['fragment_mask'][:, i].bool() & encoded['fragment_mask'][:, j].bool()
