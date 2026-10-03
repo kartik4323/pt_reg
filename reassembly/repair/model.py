@@ -122,6 +122,8 @@ class RepairContactMatcher(PartialContactMatcher):
         self.blocks = nn.ModuleList([
             ContactAttentionBlock(int(config.get('dim', 128)), int(config.get('heads', 4)))
             for _ in range(2 if revised else 0)])
+        import math
+        self.dustbin = nn.Parameter(torch.tensor(math.log(float(self.contact_points))))
 
     def forward(self, encoded: dict, prior=None):
         if prior is not None:
