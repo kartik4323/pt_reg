@@ -22,6 +22,8 @@ def launch(request, directory, python=None, timeout=3600):
         worker(directory/'request.json')
         return read(directory/'backend.json')
     env = os.environ.copy()
+    if python:
+        env['PATH'] = os.path.dirname(python) + os.pathsep + env.get('PATH', '')
     package_parent = str(Path(__file__).resolve().parent.parent)
     env['PYTHONPATH'] = package_parent + os.pathsep + env.get('PYTHONPATH', '')
     with (directory / 'worker.log').open('w', encoding='utf-8') as log:

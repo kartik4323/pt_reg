@@ -29,82 +29,184 @@ def save_prediction(directory, case, poses, diagnostics, **extra):
     return dict(diagnostics=diagnostics, **extra)
 
 
+def _build_prompt(cfg, rec):
+    """Select the active prompt text based on cfg['prompt_variant']."""
+    variant = cfg.get('prompt_variant', 'original')
+    if variant == 'original':
+        base = cfg.get('prompt_original', cfg.get('prompt', ''))
+    else:  # 'short' or 'category'
+        base = cfg.get('prompt_short', cfg.get('prompt', ''))
+    if cfg.get('category_prompt') and rec.get('category'):
+        base = base.rstrip('.') + f'. The object is a {rec["category"]}.'
+    return base
+
+
+def _render_fragment(case, cfg, bank, kind):
+    """Render a single fragment-set into a rendering dict.
+
+    Applies render_mode (surface vs splat) and tight_crop based on config.
+    """
+    selected = [case['anchor']] if kind == 'F' else list(range(len(case['points'])))
+    points = np.concatenate([case['points'][i] if kind == 'F' else g.apply(case['points'][i], bank[0, i]) for i in selected])
+    ns = np.concatenate([case['normals'][i] if kind == 'F' else case['normals'][i] @ bank[0, i, :3, :3].T for i in selected])
+    ext = np.concatenate([case['exterior'][i] for i in selected])
+    return points, ns, ext
+
+
 def e0(store, case):
     cfg, rec = store.config, case['record']
+    render_mode = cfg.get('render_mode', 'splat')
+    mask_type   = cfg.get('mask_type', 'original')
+    fill_target = cfg.get('canvas_fill_target', 0.0)
+    n_views     = cfg.get('n_render_views', 1)
+
     def prepare(out):
         started = time.time()
         bank, scores = g.candidates(case, cfg['solver'], data.seed_for(cfg['seed'], rec['id'], 'bank'))
         np.savez_compressed(out/'candidates.npz', poses=bank, scores=scores)
-        camera = render.camera_for(case['points'][case['anchor']], cfg['pixels'], cfg['canvas_extent'], cfg['splat_radius'])
+
+        # ── Camera(s) ────────────────────────────────────────────────────────
+        anchor_pts = case['points'][case['anchor']]
+        if n_views == 1:
+            camera = render.camera_for(anchor_pts, cfg['pixels'], cfg['canvas_extent'], cfg['splat_radius'])
+            cameras = [camera]
+            camera_labels = ['v0']
+        else:
+            cameras = render.camera_for(anchor_pts, cfg['pixels'], cfg['canvas_extent'],
+                                        cfg['splat_radius'], n_views=n_views)
+            camera_labels = [f'v{i}' for i in range(n_views)]
+            camera = cameras[0]  # keep canonical camera for coordinate checks
+
         write(out/'camera.json', camera)
+
+        # ── Render each view × each input_type ───────────────────────────────
         for kind in cfg['input_types']:
-            selected = [case['anchor']] if kind == 'F' else list(range(len(case['points'])))
-            points = np.concatenate([case['points'][i] if kind == 'F' else g.apply(case['points'][i],bank[0,i]) for i in selected])
-            ns = np.concatenate([case['normals'][i] if kind == 'F' else case['normals'][i] @ bank[0,i,:3,:3].T for i in selected])
-            ext = np.concatenate([case['exterior'][i] for i in selected])
-            directory = out/kind; directory.mkdir(exist_ok=True)
-            render.save(directory, render.render(points, ns, ext, camera, cfg['splat_radius']))
+            pts, ns, ext = _render_fragment(case, cfg, bank, kind)
+
+            for cam, vlabel in zip(cameras, camera_labels):
+                # Choose renderer
+                if render_mode == 'surface':
+                    rendered = render.render_surface(pts, ns, ext, cam, cfg['splat_radius'])
+                else:
+                    rendered = render.render(pts, ns, ext, cam, cfg['splat_radius'])
+
+                # Optional tight crop (FIX #6)
+                if fill_target > 0:
+                    rendered = render.tight_crop(rendered, target_fill=fill_target)
+
+                # Save with mask type (FIX #5)
+                directory = out / f'{kind}_{vlabel}' if n_views > 1 else out / kind
+                directory.mkdir(exist_ok=True)
+                render.save(directory, rendered, use_inverted_mask=(mask_type == 'inverted'))
+
         np.savez_compressed(out/'observed.npz', **{f'points_{i}':p for i,p in enumerate(case['points'])},
-                            **{f'indices_{i}':p for i,p in enumerate(case['indices'])}, centers=case['centers'], scale=case['scale'], anchor=case['anchor'])
+                            **{f'indices_{i}':p for i,p in enumerate(case['indices'])},
+                            centers=case['centers'], scale=case['scale'], anchor=case['anchor'])
+
+        # Coordinate integrity check (unchanged, uses canonical camera)
         exported = g.export_poses(case, bank[0])
         errors = [np.max(abs((g.apply(case['points'][i]*case['scale']+case['centers'][i],exported[i])-case['centers'][case['anchor']])/case['scale'] - g.apply(case['points'][i],bank[0,i]))) for i in range(len(exported))]
-        # Actual pixel-center depth back-projection compared against splatted points.
-        p = case['points'][case['anchor']]
-        r = render.render(p, None, None, camera, 0)
+        p_anc = case['points'][case['anchor']]
+        r = render.render(p_anc, None, None, camera, 0)
         y,x = np.nonzero(r['valid']); B=np.asarray(camera['basis']); extent=cfg['canvas_extent']; size=cfg['pixels']
         reconstructed = np.column_stack(((x/(size-1)-0.5)*2*extent,(0.5-y/(size-1))*2*extent,r['depth'][y,x])) @ B.T
-        raster_error = float(np.linalg.norm(reconstructed-p[r['ids'][y,x]],axis=1).max())
+        raster_error = float(np.linalg.norm(reconstructed-p_anc[r['ids'][y,x]],axis=1).max())
         tolerance = np.sqrt(2)*extent/(size-1)+1e-6
         if max(errors) > 1e-5 or raster_error > tolerance: raise RuntimeError('Coordinate integrity failed')
         if shutil.disk_usage(store.root).free < cfg['resources']['minimum_free_gib']*1024**3:
             raise RuntimeError('Insufficient free disk for configured experiment budget')
         write(out/'checks.json', dict(transform_error=max(errors), depth_error=raster_error, raster_tolerance=tolerance,
-                                      reference_files_accessed=False, gpu_smoke='performed_by_first_real_E1_E2_jobs'))
-        return dict(anchor=case['anchor'], scale=case['scale'], candidates=len(bank), geometry_seconds=time.time()-started,
-                    exterior_method=case['exterior_method'], normalization='input_only_shared_max_fragment_diameter')
-    return [store.run('E0',rec,'prepare',prepare)]
+                                      reference_files_accessed=False, gpu_smoke='performed_by_first_real_E1_E2_jobs',
+                                      render_mode=render_mode, mask_type=mask_type, n_views=n_views))
+        return dict(anchor=case['anchor'], scale=case['scale'], candidates=len(bank),
+                    geometry_seconds=time.time()-started,
+                    exterior_method=case['exterior_method'],
+                    normalization='input_only_shared_max_fragment_diameter',
+                    render_mode=render_mode, mask_type=mask_type, n_views=n_views)
+    return [store.run('E0', rec, 'prepare', prepare)]
+
 
 
 def e1(store, case):
-    cfg, rec = store.config, case['record']; parent, _ = prepared(store,case)
-    rows=[]
+    cfg, rec = store.config, case['record']
+    parent, _ = prepared(store, case)
+    n_views = cfg.get('n_render_views', 1)
+    rows = []
+
+    # Build the list of (kind_label, kind_base) pairs to iterate.
+    # If n_views=1: F, A  (original behaviour)
+    # If n_views>1: F_v0, F_v1, ..., A_v0, A_v1, ...
+    input_dirs = []
     for kind in cfg['input_types']:
-        image = store.artifact(parent,f'{kind}/image.png')
-        with np.load(store.artifact(parent,f'{kind}/render.npz'),allow_pickle=False) as f:
-            input_render = {k:f[k] for k in f.files}
-        def raw(out, image=image, kind=kind):
-            shutil.copy2(image,out/'image.png')
-            return dict(model='raw',input_type=kind,seed=None)
-        rows.append(store.run('E1',rec,f'raw__{kind}',raw,parents=[parent]))
+        if n_views == 1:
+            input_dirs.append((kind, kind))   # (arm_suffix, dir_name)
+        else:
+            for vi in range(n_views):
+                input_dirs.append((f'{kind}_v{vi}', f'{kind}_v{vi}'))
+
+    prompt = _build_prompt(cfg, rec)
+
+    for kind_label, dir_name in input_dirs:
+        image_path = store.artifact(parent, f'{dir_name}/image.png')
+        try:
+            with np.load(store.artifact(parent, f'{dir_name}/render.npz'), allow_pickle=False) as f:
+                input_render = {k: f[k] for k in f.files}
+        except Exception:
+            continue
+
+        def raw(out, image=image_path, kl=kind_label):
+            shutil.copy2(image, out / 'image.png')
+            return dict(model='raw', input_type=kl, seed=None)
+
+        rows.append(store.run('E1', rec, f'raw__{kind_label}', raw, parents=[parent]))
+
         for model in cfg['image_models']:
             for seed in cfg['image_seeds']:
-                def generate(out,model=model,kind=kind,seed=seed,input_render=input_render,image=image):
-                    prompt=cfg['prompt']+(f' The object category is {rec["category"]}.' if cfg['category_prompt'] else '')
-                    request=dict(kind='image',smoke=cfg['smoke'],model=model,config=cfg['images'],image=str(image),
-                                 control=str(store.artifact(parent,f'{kind}/control.png')),mask=str(store.artifact(parent,f'{kind}/mask.png')),
-                                 seed=seed,prompt=prompt,oracle=False)
-                    launch(request,out,cfg['images']['python'],cfg['resources']['worker_timeout_seconds'])
-                    return dict(model=model,input_type=kind,seed=seed,selection=render.image_score(out/'image.png',input_render))
-                rows.append(store.run('E1',rec,f'{model}__{kind}__{seed}',generate,parents=[parent]))
+                def generate(out, model=model, kl=kind_label, dn=dir_name, seed=seed,
+                             input_render=input_render, image=image_path):
+                    request = dict(
+                        kind='image', smoke=cfg['smoke'], model=model,
+                        config=cfg['images'], image=str(image),
+                        control=str(store.artifact(parent, f'{dn}/control.png')),
+                        mask=str(store.artifact(parent, f'{dn}/mask.png')),
+                        seed=seed, prompt=prompt, oracle=False,
+                    )
+                    launch(request, out, cfg['images']['python'], cfg['resources']['worker_timeout_seconds'])
+                    return dict(model=model, input_type=kl, seed=seed,
+                                selection=render.image_score(out / 'image.png', input_render))
+                rows.append(store.run('E1', rec, f'{model}__{kind_label}__{seed}', generate, parents=[parent]))
     return rows
 
 
-def _reconstruct(store,case,row):
-    cfg=store.config
+
+def _reconstruct(store, case, row):
+    cfg = store.config
     def reconstruct(out):
         import trimesh
-        image=store.artifact(row,'image.png')
-        launch(dict(kind='reconstruction',smoke=cfg['smoke'],config=cfg['reconstruction'],image=str(image),oracle=row['oracle']),
-               out,cfg['reconstruction']['python'],cfg['reconstruction']['timeout_seconds'])
-        mesh=trimesh.load(out/'mesh.obj',force='mesh',process=False)
-        if len(mesh.faces)==0: raise ValueError('Reconstructor returned no surface')
-        points,_=data.sample_mesh(mesh, max(1024,cfg['evaluation_points']),np.random.default_rng(data.seed_for(row['job_id'],'surface')))
-        aligned, fit=g.fit_template(points,case,cfg['solver'],data.seed_for(case['record']['id'],'align'))
-        np.savez_compressed(out/'shape.npz',raw=points,aligned=aligned)
-        write(out/'alignment.json',fit)
-        return dict(model=row['output']['model'],input_type=row['output']['input_type'],seed=row['output'].get('seed'),
-                    image_job=row['job_id'],alignment=fit,watertight=bool(mesh.is_watertight),vertices=len(mesh.vertices),faces=len(mesh.faces))
-    return store.run('E2',case['record'],row['arm'],reconstruct,oracle=row['oracle'],parents=[row])
+        image = store.artifact(row, 'image.png')
+        launch(dict(kind='reconstruction', smoke=cfg['smoke'], config=cfg['reconstruction'],
+                    image=str(image), oracle=row['oracle']),
+               out, cfg['reconstruction']['python'], cfg['reconstruction']['timeout_seconds'])
+        mesh = trimesh.load(out / 'mesh.obj', force='mesh', process=False)
+        if len(mesh.faces) == 0: raise ValueError('Reconstructor returned no surface')
+        points, _ = data.sample_mesh(mesh, max(1024, cfg['evaluation_points']),
+                                     np.random.default_rng(data.seed_for(row['job_id'], 'surface')))
+
+        # FIX #8: fit_template returns (None, rejection_dict) for degenerate shapes.
+        aligned, fit = g.fit_template(points, case, cfg['reconstruction'], data.seed_for(case['record']['id'], 'align'))
+        if aligned is None:
+            # Template failed sanity check — fall back to raw unaligned points.
+            # Log the rejection so we can count how often this fires.
+            aligned = points
+            fit['fallback'] = 'degenerate_template_discarded'
+        np.savez_compressed(out / 'shape.npz', raw=points, aligned=aligned)
+        write(out / 'alignment.json', fit)
+        return dict(model=row['output']['model'], input_type=row['output']['input_type'],
+                    seed=row['output'].get('seed'), image_job=row['job_id'],
+                    alignment=fit, template_rejected='rejected' in fit,
+                    watertight=bool(mesh.is_watertight), vertices=len(mesh.vertices), faces=len(mesh.faces))
+    return store.run('E2', case['record'], row['arm'], reconstruct, oracle=row['oracle'], parents=[row])
+
 
 
 def e2(store,case):
@@ -181,6 +283,10 @@ def e3(store,case):
     for name,template in {'none':None,**shapes}.items():
         for regime,b in regimes.items():
             def job(out,b=b,template=template,regime=regime,name=name):
+                # If we have a shape template, regenerate candidates using the shape prior
+                if regime == 'global' and template is not None:
+                    b, _ = g.candidates(case, store.config['solver'], data.seed_for(case['record']['id'], 'bank', name), template=template)
+                
                 p,diag=g.solve(case,b,store.config['solver'],template,'always',True)
                 np.savez_compressed(out/'starts.npz',poses=b)
                 return save_prediction(out,case,p,diag,template=name,regime=regime,privilege='GT_start' if regime!='global' else 'template_only')

@@ -45,6 +45,8 @@ partnet_gpat_processed/
 partnet-pilot-v1/
 partnet-full/
 *.tar.zst
+*.tar.gz
+*.tar
 
 # Managed v2 data and scratch belong outside the source checkout.
 reassembly_v2/
@@ -64,3 +66,5 @@ mlruns/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+extracted_results/
+pilot_report*.json

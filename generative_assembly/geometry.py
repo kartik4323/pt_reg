@@ -109,11 +109,16 @@ def penetration_proxy(case, poses):
     return float(np.mean(values)) if values else 0.
 
 
-def candidates(case, cfg, seed, budget=None):
+def candidates(case, cfg, seed, budget=None, template=None):
     rng = np.random.default_rng(seed)
     n, anchor = len(case['points']), case['anchor']
     bank, scores = [], []
-    for _ in range(budget or cfg['candidates']):
+    
+    target_count = budget or cfg['candidates']
+    # If template is provided, oversample by 4x to find poses that match the shape prior
+    attempts = target_count * (4 if template is not None else 1)
+    
+    for _ in range(attempts):
         T = np.repeat(np.eye(4)[None], n, 0)
         placed = [anchor]
         remaining = list(rng.permutation([i for i in range(n) if i != anchor]))
@@ -132,17 +137,75 @@ def candidates(case, cfg, seed, budget=None):
             T[i, :3, :3] = R
             T[i, :3, 3] = apply(q[b:b+1], T[j])[0] - R @ p[a]
             placed.append(i)
+            
         score = contact_score(case, T, cfg) + penetration_proxy(case, T)
+        
+        if template is not None:
+            # Heavily penalize candidates that protrude outside the template silhouette
+            ext_score = exterior_score(case, T, template)
+            score += cfg.get('template_weight', 0.3) * ext_score * 5.0
+            
         bank.append(T); scores.append(score)
+        
     order = np.argsort(scores)
-    return np.asarray(bank)[order], np.asarray(scores)[order]
+    best_indices = order[:target_count]
+    return np.asarray(bank)[best_indices], np.asarray(scores)[best_indices]
+
+
+def check_template_shape(template, cfg):
+    """Return (is_valid, reason_str).
+
+    Detects degenerate templates produced by InstantMesh when SD generated a
+    flat stone-slab image instead of a 3D object.
+
+    Checks:
+      - aspect_ratio: bbox max_dim / min_dim  > template_max_aspect_ratio → slab
+      - flatness: fraction of points within the thinnest 5% of bbox height → flat sheet
+    """
+    pts = np.asarray(template, float)
+    bbox_min = pts.min(0)
+    bbox_max = pts.max(0)
+    dims = bbox_max - bbox_min
+    dims_sorted = np.sort(dims)
+    max_aspect = cfg.get('template_max_aspect_ratio', 6.0)
+    max_flat   = cfg.get('template_max_flatness', 0.85)
+
+    # Aspect ratio check
+    if dims_sorted[0] < 1e-8:
+        return False, 'degenerate_zero_thickness'
+    aspect = dims_sorted[-1] / dims_sorted[0]
+    if aspect > max_aspect:
+        return False, f'aspect_ratio_{aspect:.1f}_exceeds_{max_aspect}'
+
+    # Flatness check: how many points lie within the thinnest 5% of the bbox
+    thin_axis = int(np.argmin(dims))
+    thin_range = dims[thin_axis]
+    slab_thickness = 0.05 * thin_range
+    in_slab = np.abs(pts[:, thin_axis] - (bbox_min[thin_axis] + thin_range / 2)) < slab_thickness
+    flatness = float(in_slab.mean())
+    if flatness > max_flat:
+        return False, f'flatness_{flatness:.2f}_exceeds_{max_flat}'
+
+    return True, 'ok'
 
 
 def fit_template(template, case, cfg, seed):
-    """One global similarity fitted only to observed reference-fragment evidence."""
+    """One global similarity fitted only to observed reference-fragment evidence.
+
+    Returns (aligned_points, fit_dict).
+    Returns (None, {'rejected': reason}) if the template fails sanity checks —
+    the caller should treat None as "no usable template" and fall back gracefully.
+    """
     template = np.asarray(template, float)
     if len(template) < 16 or not np.isfinite(template).all():
         raise ValueError('Invalid template')
+
+    # ── FIX #8: Reject degenerate flat-slab templates ────────────────────────
+    is_valid, reason = check_template_shape(template, cfg)
+    if not is_valid:
+        return None, {'rejected': reason, 'uses_ground_truth_alignment': False}
+    # ─────────────────────────────────────────────────────────────────────────
+
     center = template.mean(0)
     radius = np.linalg.norm(template-center, axis=1).max()
     unit = (template-center) / max(2*radius, 1e-10)

@@ -8,8 +8,52 @@ DEFAULT = {
     'image_models': ['sd15_depth', 'qwen'], 'input_types': ['F', 'A'], 'image_seeds': [11, 23, 37, 51],
     'reconstruction_top_k': 2, 'reconstruct_all_for_E5': True,
     'primary_model': 'sd15_depth', 'primary_input': 'A', 'primary_policy': 'gated',
-    'prompt': 'The image shows broken pieces from one rigid object. Create one plausible intact object containing the surviving original exterior. Retain the reference camera, scale and location of surviving features. Extend the missing body beyond the fragment boundary. Remove exposed break faces where they become internal. Neutral gray material, white background, one object, no labels.',
-    'category_prompt': False,
+
+    # ── Prompt variants (FIX #7) ──────────────────────────────────────────────
+    # prompt_variant selects which prompt text to use at runtime.
+    # 'original'  : the original 96-word prompt (baseline)
+    # 'short'     : short, concrete, visually descriptive (recommended fix)
+    # 'category'  : short prompt + explicit category name appended
+    'prompt_variant': 'short',
+
+    # Original prompt kept for reference / ablation
+    'prompt_original': (
+        'The image shows broken pieces from one rigid object. Create one plausible intact '
+        'object containing the surviving original exterior. Retain the reference camera, '
+        'scale and location of surviving features. Extend the missing body beyond the '
+        'fragment boundary. Remove exposed break faces where they become internal. '
+        'Neutral gray material, white background, one object, no labels.'
+    ),
+    # Short prompt — better match to SD training caption distribution
+    'prompt_short': (
+        'A smooth intact object, complete and undamaged, neutral gray surface, '
+        'white background, studio lighting, single object, photorealistic.'
+    ),
+    # We keep category_prompt for backward compat; prompt_variant='category' uses it automatically
+    'category_prompt': True,
+
+    # ── Mask type (FIX #5) ────────────────────────────────────────────────────
+    # 'inverted'  : mask covers background → SD paints the missing body around the fragment
+    # 'original'  : mask covers fragment   → SD replaces the fragment (old buggy behaviour)
+    # Both are saved; this selects which one is used as the active mask.png for E1.
+    'mask_type': 'inverted',
+
+    # ── Surface rendering (FIX #1) ────────────────────────────────────────────
+    # 'surface'   : Poisson mesh + Phong shading (requires open3d; falls back if unavailable)
+    # 'splat'     : original point-splat renderer
+    'render_mode': 'surface',
+
+    # ── Tight canvas crop (FIX #6) ────────────────────────────────────────────
+    # Fraction of the canvas the fragment should occupy after cropping.
+    # 0.0 = no crop (original); 0.65 = fragment fills ~65% of the frame.
+    'canvas_fill_target': 0.65,
+
+    # ── Multi-view rendering (FIX #2) ─────────────────────────────────────────
+    # Number of camera viewpoints to render and pass to E1.
+    # 1 = original single canonical view; 4 = structured azimuths every 90°.
+    # Each view produces its own set of E1 generations; best one is selected.
+    'n_render_views': 1,
+
     'images': {'python': None, 'device': 'cuda', 'dtype': 'float16', 'cpu_offload': True,
                'steps': 30, 'qwen_steps': 40, 'guidance': 7.5, 'control_strength': 0.5, 'qwen_cfg': 4.0,
                'sd15_depth': 'stable-diffusion-v1-5/stable-diffusion-inpainting',
@@ -19,7 +63,14 @@ DEFAULT = {
                'sdxl': 'diffusers/stable-diffusion-xl-1.0-inpainting-0.1', 'revisions': {}},
     'reconstruction': {'backend': 'instantmesh', 'python': None, 'repo': None, 'commit': None,
                        'config': 'configs/instant-mesh-large.yaml', 'steps': 75, 'seed': 42,
-                       'revisions': {}, 'timeout_seconds': 3600},
+                       'revisions': {}, 'timeout_seconds': 3600,
+                       # FIX #8: Reject templates with degenerate shape before feeding to E3.
+                       # aspect_ratio_max: if the template's max/min bbox dimension ratio exceeds
+                       # this, it is treated as a flat slab and discarded (returns None from fit_template).
+                       'template_max_aspect_ratio': 6.0,
+                       # flatness_max: max fraction of points within a thin slab (thickness < 5% of bbox).
+                       # Above this, the template is considered degenerate.
+                       'template_max_flatness': 0.85},
     'solver': {'candidates': 32, 'patches': 32, 'contact_fraction': 0.08, 'contact_cap': 0.15,
                'template_weight': 0.3, 'refine_evaluations': 25, 'alignment_starts': 8,
                'alignment_iterations': 8, 'scales': [1.0, 1.5, 2.0],
