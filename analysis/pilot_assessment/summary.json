@@ -1,0 +1,354 @@
+{
+  "inputs": {
+    "test": {
+      "path": "C:\\Users\\KARTIK PANDEY\\OneDrive\\Desktop\\fragment_compact\\pt_reg\\pilot_report_test.json",
+      "sha256": "8a5108f0169c7ff42922878ec3cf9fca041e66d6940d6c0597af4f2d0bca5f9b",
+      "advance_eligible": false
+    },
+    "cut_holdout": {
+      "path": "C:\\Users\\KARTIK PANDEY\\OneDrive\\Desktop\\fragment_compact\\pt_reg\\pilot_report_cut_holdout.json",
+      "sha256": "6efbc002631fc2d609f255ad1ed7b518dad866eef63cb5a196838d661cf7d12c",
+      "advance_eligible": false
+    }
+  },
+  "evaluations": {
+    "test/contact_only": {
+      "examples": 69,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 69,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 109,
+      "pairs_below_total_mass_0.05": 76,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": null
+    },
+    "test/predicted": {
+      "examples": 69,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 69,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 109,
+      "pairs_below_total_mass_0.05": 85,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": 0.02441113498871741
+    },
+    "test/gt": {
+      "examples": 69,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 69,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 109,
+      "pairs_below_total_mass_0.05": 85,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": 0.02441113498871741
+    },
+    "test/perturbed": {
+      "examples": 69,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 69,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 109,
+      "pairs_below_total_mass_0.05": 85,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": 0.02441113498871741
+    },
+    "cut_holdout/contact_only": {
+      "examples": 11,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 11,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 33,
+      "pairs_below_total_mass_0.05": 21,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": null
+    },
+    "cut_holdout/predicted": {
+      "examples": 11,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 11,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 33,
+      "pairs_below_total_mass_0.05": 23,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": 0.02693779224699194
+    },
+    "cut_holdout/gt": {
+      "examples": 11,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 11,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 33,
+      "pairs_below_total_mass_0.05": 23,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": 0.02693779224699194
+    },
+    "cut_holdout/perturbed": {
+      "examples": 11,
+      "sources": 11,
+      "successes": 0,
+      "failure_breakdown": {
+        "no_solution": 11,
+        "geometrically_inaccurate_solution": 0,
+        "geometrically_correct_low_confidence": 0,
+        "accepted": 0
+      },
+      "pairs": 33,
+      "pairs_below_total_mass_0.05": 23,
+      "pair_candidates": 0,
+      "assembly_hypotheses": 0,
+      "sdf_l1": 0.02693779224699194
+    }
+  },
+  "training": [
+    {
+      "condition": "predicted",
+      "stage": 1,
+      "seconds": 1250.2901754339691,
+      "metrics": {
+        "train": {
+          "loss": 4.348195791244507,
+          "matching": 3.4812088012695312,
+          "positive_contacts": 481.25,
+          "matching_mass": 2.937834769487381,
+          "matching_localization": 0.5433740355074406,
+          "segmentation": 0.8668068945407867,
+          "consistency": 0.0018019673298113048
+        },
+        "validation": {
+          "loss": 4.838022738695145,
+          "matching": 3.9709098786115646,
+          "positive_contacts": 253.59375,
+          "matching_mass": 3.31194569170475,
+          "matching_localization": 0.6589641915634274,
+          "segmentation": 0.8669265005737543,
+          "consistency": 0.001863090746155649
+        },
+        "best_validation": 4.838022738695145,
+        "optimizer_update": {
+          "gradient_norm": 3.3176827430725098,
+          "amp_scale": 4096.0,
+          "amp_retries": 0
+        },
+        "amp_overflow_retries_total": 4
+      },
+      "cuda_peak_reserved_bytes": 325058560
+    },
+    {
+      "condition": "predicted",
+      "stage": 2,
+      "seconds": 1322.7188528149854,
+      "metrics": {
+        "train": {
+          "loss": 0.9676614552736282,
+          "matching": 3.1819674372673035,
+          "positive_contacts": 481.25,
+          "matching_mass": 2.6464090049266815,
+          "matching_localization": 0.5355584174394608,
+          "segmentation": 0.6938713490962982,
+          "consistency": 0.006511005369247869,
+          "sdf_l1": 0.025460028555244207,
+          "sdf_calibration": -2.6921072602272034,
+          "uncertainty_mae": 0.022727726493030787
+        },
+        "validation": {
+          "loss": 1.0432532746344805,
+          "matching": 3.474775083363056,
+          "positive_contacts": 253.59375,
+          "matching_mass": 2.820031963288784,
+          "matching_localization": 0.6547431154176593,
+          "segmentation": 0.69714180752635,
+          "consistency": 0.006036424576450372,
+          "sdf_l1": 0.02655670081730932,
+          "sdf_calibration": -2.643355682492256,
+          "uncertainty_mae": 0.024776713747996837
+        },
+        "best_validation": 0.026523482316406444,
+        "optimizer_update": {
+          "gradient_norm": 0.4712143540382385,
+          "amp_scale": 32768.0,
+          "amp_retries": 0
+        },
+        "amp_overflow_retries_total": 1
+      },
+      "cuda_peak_reserved_bytes": 390070272
+    },
+    {
+      "condition": "predicted",
+      "stage": 3,
+      "seconds": 843.6343081740197,
+      "metrics": {
+        "train": {
+          "loss": 3.146587312221527,
+          "matching": 3.146587312221527,
+          "positive_contacts": 481.25,
+          "matching_mass": 2.6160827577114105,
+          "matching_localization": 0.5305045619606972
+        },
+        "validation": {
+          "loss": 3.438288912177086,
+          "matching": 3.438288912177086,
+          "positive_contacts": 253.59375,
+          "matching_mass": 2.787469856441021,
+          "matching_localization": 0.6508190426975489
+        },
+        "best_validation": 3.435431756079197,
+        "optimizer_update": {
+          "gradient_norm": 0.07920630276203156,
+          "amp_scale": 131072.0,
+          "amp_retries": 0
+        },
+        "amp_overflow_retries_total": 0
+      },
+      "cuda_peak_reserved_bytes": 113246208
+    },
+    {
+      "condition": "contact_only",
+      "stage": 1,
+      "seconds": 1223.463679837063,
+      "metrics": {
+        "train": {
+          "loss": 4.348195791244507,
+          "matching": 3.4812088012695312,
+          "positive_contacts": 481.25,
+          "matching_mass": 2.937834769487381,
+          "matching_localization": 0.5433740355074406,
+          "segmentation": 0.8668068945407867,
+          "consistency": 0.0018019673298113048
+        },
+        "validation": {
+          "loss": 4.838022738695145,
+          "matching": 3.9709098786115646,
+          "positive_contacts": 253.59375,
+          "matching_mass": 3.31194569170475,
+          "matching_localization": 0.6589641915634274,
+          "segmentation": 0.8669265005737543,
+          "consistency": 0.001863090746155649
+        },
+        "best_validation": 4.838022738695145,
+        "optimizer_update": {
+          "gradient_norm": 3.3176827430725098,
+          "amp_scale": 4096.0,
+          "amp_retries": 0
+        },
+        "amp_overflow_retries_total": 4
+      },
+      "cuda_peak_reserved_bytes": 325058560
+    },
+    {
+      "condition": "contact_only",
+      "stage": 2,
+      "seconds": 1277.1140263309935,
+      "metrics": {
+        "train": {
+          "loss": 0.9676614552736282,
+          "matching": 3.1819674372673035,
+          "positive_contacts": 481.25,
+          "matching_mass": 2.6464090049266815,
+          "matching_localization": 0.5355584174394608,
+          "segmentation": 0.6938713490962982,
+          "consistency": 0.006511005369247869,
+          "sdf_l1": 0.025460028555244207,
+          "sdf_calibration": -2.6921072602272034,
+          "uncertainty_mae": 0.022727726493030787
+        },
+        "validation": {
+          "loss": 1.0432532746344805,
+          "matching": 3.474775083363056,
+          "positive_contacts": 253.59375,
+          "matching_mass": 2.820031963288784,
+          "matching_localization": 0.6547431154176593,
+          "segmentation": 0.69714180752635,
+          "consistency": 0.006036424576450372,
+          "sdf_l1": 0.02655670081730932,
+          "sdf_calibration": -2.643355682492256,
+          "uncertainty_mae": 0.024776713747996837
+        },
+        "best_validation": 0.026523482316406444,
+        "optimizer_update": {
+          "gradient_norm": 0.4712143540382385,
+          "amp_scale": 32768.0,
+          "amp_retries": 0
+        },
+        "amp_overflow_retries_total": 1
+      },
+      "cuda_peak_reserved_bytes": 390070272
+    },
+    {
+      "condition": "contact_only",
+      "stage": 3,
+      "seconds": 806.4062725590775,
+      "metrics": {
+        "train": {
+          "loss": 3.1426990926265717,
+          "matching": 3.1426990926265717,
+          "positive_contacts": 481.25,
+          "matching_mass": 2.6119931638240814,
+          "matching_localization": 0.5307059101760387
+        },
+        "validation": {
+          "loss": 3.4396399036049843,
+          "matching": 3.4396399036049843,
+          "positive_contacts": 253.59375,
+          "matching_mass": 2.7889199033379555,
+          "matching_localization": 0.6507199849002063
+        },
+        "best_validation": 3.4369907304644585,
+        "optimizer_update": {
+          "gradient_norm": 0.09492985159158707,
+          "amp_scale": 131072.0,
+          "amp_retries": 0
+        },
+        "amp_overflow_retries_total": 0
+      },
+      "cuda_peak_reserved_bytes": 111149056
+    }
+  ],
+  "resources": {
+    "gpu": "Tesla V100-PCIE-32GB",
+    "preflight_reserved_gib": 0.404296875,
+    "six_stage_training_hours": 1.8676742542083633,
+    "managed_mib_at_end_of_training": 300.7573051452637
+  }
+}
