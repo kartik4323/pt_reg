@@ -193,7 +193,8 @@ def _reconstruct(store, case, row):
                                      np.random.default_rng(data.seed_for(row['job_id'], 'surface')))
 
         # FIX #8: fit_template returns (None, rejection_dict) for degenerate shapes.
-        aligned, fit = g.fit_template(points, case, cfg['reconstruction'], data.seed_for(case['record']['id'], 'align'))
+        solver_cfg = dict(cfg.get('reconstruction', {}), **cfg['solver'])
+        aligned, fit = g.fit_template(points, case, solver_cfg, data.seed_for(case['record']['id'], 'align'))
         if aligned is None:
             # Template failed sanity check — fall back to raw unaligned points.
             # Log the rejection so we can count how often this fires.
