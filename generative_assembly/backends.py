@@ -60,7 +60,7 @@ def run_image(req, out):
     if not revisions.get(repo) or len(revisions[repo]) != 40:
         raise ValueError('Run lock-models first; exact image checkpoint revisions required')
     dtype = getattr(torch, 'bfloat16' if model == 'qwen' else cfg['dtype'])
-    kwargs = dict(torch_dtype=dtype, revision=revisions[repo])
+    kwargs = dict(torch_dtype=dtype, revision=revisions[repo], safety_checker=None)
     if model == 'sd15_depth':
         control_id = cfg['controlnet']
         control = ControlNetModel.from_pretrained(control_id, revision=revisions[control_id], torch_dtype=dtype)
@@ -71,6 +71,7 @@ def run_image(req, out):
         pipe = AutoPipelineForInpainting.from_pretrained(repo, **kwargs)
     elif model == 'qwen':
         from diffusers import QwenImageEditPlusPipeline
+        kwargs.pop('safety_checker', None) # Qwen pipeline doesn't accept safety_checker
         pipe = QwenImageEditPlusPipeline.from_pretrained(repo, **kwargs)
     else:
         raise ValueError(f'Unsupported image model {model}')
