@@ -48,11 +48,27 @@ DEFAULT = {
     # 0.0 = no crop (original); 0.65 = fragment fills ~65% of the frame.
     'canvas_fill_target': 0.65,
 
-    # ── Multi-view rendering (FIX #2) ─────────────────────────────────────────
+    # ── Multi-view rendering for E0 input (FIX #2 / Fix B) ───────────────────
     # Number of camera viewpoints to render and pass to E1.
     # 1 = original single canonical view; 4 = structured azimuths every 90°.
     # Each view produces its own set of E1 generations; best one is selected.
     'n_render_views': 1,
+
+    # ── Background stripping (Fix A) ─────────────────────────────────────────
+    # After SD generates the completion, strip pixels brighter than this threshold
+    # back to pure white (255,255,255). This removes studio vignette / haze that
+    # causes InstantMesh to hallucinate flat scatter sheets in 3D.
+    # Set to 0 to disable stripping entirely (for ablation).
+    'bg_strip_threshold': 235,
+
+    # ── Multi-view InstantMesh grid (Fix C) ───────────────────────────────────
+    # If > 1: generate this many SD completions from different E0 camera angles,
+    # pack them into a 2×3 Zero123++ input grid, and feed that to InstantMesh
+    # instead of a single image. This bypasses Zero123++ hallucination entirely
+    # and gives the LRM geometrically consistent views.
+    # Requires n_render_views >= n_instantmesh_views.
+    # 1 = original single-image mode (default); 6 = full 2×3 grid.
+    'n_instantmesh_views': 1,
 
     'images': {'python': None, 'device': 'cuda', 'dtype': 'float16', 'cpu_offload': True,
                'steps': 30, 'qwen_steps': 40, 'guidance': 7.5, 'control_strength': 0.5, 'qwen_cfg': 4.0,

@@ -179,13 +179,31 @@ def e1(store, case):
 
 
 
-def _reconstruct(store, case, row):
+def _reconstruct(store, case, row, multiview_rows=None):
+    """Run InstantMesh reconstruction on a single E1 image row.
+
+    If multiview_rows is provided (list of E1 rows from different camera angles),
+    their images are packed into a 2×3 grid and passed to InstantMesh as Fix C.
+    """
     cfg = store.config
     def reconstruct(out):
         import trimesh
         image = store.artifact(row, 'image.png')
+
+        # Fix C: Collect sibling view images for multi-view grid if configured
+        multiview_images = []
+        if multiview_rows:
+            for mv_row in multiview_rows:
+                try:
+                    p = store.artifact(mv_row, 'image.png')
+                    if Path(p).exists():
+                        multiview_images.append(str(p))
+                except Exception:
+                    pass
+
         launch(dict(kind='reconstruction', smoke=cfg['smoke'], config=cfg['reconstruction'],
-                    image=str(image), oracle=row['oracle']),
+                    image=str(image), oracle=row['oracle'],
+                    multiview_images=multiview_images),
                out, cfg['reconstruction']['python'], cfg['reconstruction']['timeout_seconds'])
         mesh = trimesh.load(out / 'mesh.obj', force='mesh', process=False)
         if len(mesh.faces) == 0: raise ValueError('Reconstructor returned no surface')
@@ -196,8 +214,6 @@ def _reconstruct(store, case, row):
         solver_cfg = dict(cfg.get('reconstruction', {}), **cfg['solver'])
         aligned, fit = g.fit_template(points, case, solver_cfg, data.seed_for(case['record']['id'], 'align'))
         if aligned is None:
-            # Template failed sanity check — fall back to raw unaligned points.
-            # Log the rejection so we can count how often this fires.
             aligned = points
             fit['fallback'] = 'degenerate_template_discarded'
         np.savez_compressed(out / 'shape.npz', raw=points, aligned=aligned)
@@ -205,32 +221,57 @@ def _reconstruct(store, case, row):
         return dict(model=row['output']['model'], input_type=row['output']['input_type'],
                     seed=row['output'].get('seed'), image_job=row['job_id'],
                     alignment=fit, template_rejected='rejected' in fit,
-                    watertight=bool(mesh.is_watertight), vertices=len(mesh.vertices), faces=len(mesh.faces))
+                    watertight=bool(mesh.is_watertight), vertices=len(mesh.vertices), faces=len(mesh.faces),
+                    n_multiview_images=len(multiview_images))
     return store.run('E2', case['record'], row['arm'], reconstruct, oracle=row['oracle'], parents=[row])
 
 
 
-def e2(store,case):
-    cfg=store.config; rows=[]
-    image_rows=store.find('E1',case['record']['id'])
-    for model in ['raw']+cfg['image_models']:
-        for kind in cfg['input_types']:
-            group=[r for r in image_rows if r['output']['model']==model and r['output']['input_type']==kind]
-            group.sort(key=lambda r:(r['output'].get('selection',{}).get('selection_score',0),r['output'].get('seed') or 0))
-            if not cfg['reconstruct_all_for_E5']: group=group[:cfg['reconstruction_top_k']]
-            rows.extend(_reconstruct(store,case,r) for r in group)
-    if cfg['oracles'] and case['record']['split']!='train':
-        ref=data.reference(store.dataset,case)
+def e2(store, case):
+    cfg = store.config
+    rows = []
+    image_rows = store.find('E1', case['record']['id'])
+    n_mv = cfg.get('n_instantmesh_views', 1)
+
+    for model in ['raw'] + cfg['image_models']:
+        # Collect all base kinds (F, A) — strip view suffixes for grouping
+        base_kinds = cfg['input_types']
+        for base_kind in base_kinds:
+            # Match rows for this model+base_kind, across all view variants (F, F_v0, F_v1, ...)
+            group = [r for r in image_rows
+                     if r['output']['model'] == model
+                     and (r['output']['input_type'] == base_kind
+                          or r['output']['input_type'].startswith(f'{base_kind}_v'))]
+            group.sort(key=lambda r: (r['output'].get('selection', {}).get('selection_score', 0),
+                                      r['output'].get('seed') or 0))
+            if not group:
+                continue
+            if not cfg['reconstruct_all_for_E5']:
+                group = group[:cfg['reconstruction_top_k']]
+
+            if n_mv > 1 and len(group) >= 2:
+                # Fix C: pick the best-scored single view as the primary, pass all others as multiview
+                primary = group[0]
+                siblings = group[1:n_mv]
+                rows.append(_reconstruct(store, case, primary, multiview_rows=siblings))
+            else:
+                rows.extend(_reconstruct(store, case, r) for r in group)
+
+    if cfg['oracles'] and case['record']['split'] != 'train':
+        ref = data.reference(store.dataset, case)
         if ref is not None and 'complete' in ref:
-            parent,_=prepared(store,case); camera=read(store.artifact(parent,'camera.json'))
+            parent, _ = prepared(store, case)
+            camera = read(store.artifact(parent, 'camera.json'))
             def oracle_image(out):
-                r=render.render(ref['complete'],None,None,camera,cfg['splat_radius'])
-                render.save(out,r)
-                return dict(model='true_image',input_type='oracle',seed=None)
-            r=store.run('E1_ORACLE',case['record'],'true_image',oracle_image,oracle=True,parents=[parent])
-            if r['status']=='complete': rows.append(_reconstruct(store,case,r))
+                r = render.render(ref['complete'], None, None, camera, cfg['splat_radius'])
+                render.save(out, r)
+                return dict(model='true_image', input_type='oracle', seed=None)
+            r = store.run('E1_ORACLE', case['record'], 'true_image', oracle_image, oracle=True, parents=[parent])
+            if r['status'] == 'complete':
+                rows.append(_reconstruct(store, case, r))
     if not rows: raise RuntimeError('No E1 outputs to reconstruct')
     return rows
+
 
 
 def templates(store,case,model=None,kind=None):

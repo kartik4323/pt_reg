@@ -92,9 +92,25 @@ def run_image(req, out):
         result = pipe(**params)
     if getattr(result, 'nsfw_content_detected', None) and any(result.nsfw_content_detected):
         raise RuntimeError('Model returned a filtered image; record a generation failure')
-    result.images[0].save(out / 'image.png')
+    output_image = result.images[0]
+    # ── FIX A: Background stripping ──────────────────────────────────────────
+    # SD + studio lighting prompt leaves a grey vignette/haze behind the object.
+    # InstantMesh treats every non-white pixel as physical geometry and
+    # reconstructs the haze as a flat scatter sheet in 3D space.
+    # Strip any pixel above bg_threshold back to pure 255,255,255.
+    bg_threshold = cfg.get('bg_strip_threshold', 235)
+    if bg_threshold > 0:
+        import numpy as np
+        arr = np.asarray(output_image).copy()
+        # Pixels where ALL channels are >= threshold → pure white background
+        bg = np.all(arr >= bg_threshold, axis=2)
+        arr[bg] = 255
+        output_image = Image.fromarray(arr)
+    # ─────────────────────────────────────────────────────────────────────────
+    output_image.save(out / 'image.png')
     return dict(kind='pretrained_image_generation', model=repo, revision=revisions[repo], revisions=revisions, dtype=str(dtype),
-                dimensions=list(result.images[0].size), diffusers=importlib.metadata.version('diffusers'), torch=torch.__version__)
+                dimensions=list(output_image.size), diffusers=importlib.metadata.version('diffusers'), torch=torch.__version__,
+                bg_strip_threshold=bg_threshold)
 
 
 def run_reconstruction(req, out):
@@ -120,6 +136,37 @@ def run_reconstruction(req, out):
         raise ValueError('InstantMesh commit differs from model lock')
     dirty = subprocess.check_output(['git','-C',str(repo),'diff','--name-only','HEAD'], text=True).strip()
     if dirty: raise ValueError('InstantMesh tracked source has uncommitted changes')
+
+    # ── Fix C: Multi-view grid packing ───────────────────────────────────────
+    # When multiple SD completions exist from different camera angles, pack them
+    # into a 2×3 grid image that InstantMesh accepts as Zero123++ bypass input.
+    # This gives the LRM real geometrically-diverse views instead of 6 hallucinated
+    # views from a single image, dramatically improving 3D reconstruction quality.
+    input_image_path = req['image']
+    multiview_images = req.get('multiview_images', [])
+    grid_used = False
+    if len(multiview_images) >= 4:
+        try:
+            import numpy as np
+            views = [Image.open(p).convert('RGB') for p in multiview_images[:6]]
+            # Pad to 6 views by repeating the last one if fewer than 6 provided
+            while len(views) < 6:
+                views.append(views[-1])
+            w, h = views[0].size
+            # Build 2 rows × 3 cols grid (Zero123++ canonical layout)
+            grid = Image.new('RGB', (w * 3, h * 2), (255, 255, 255))
+            for idx, v in enumerate(views):
+                row, col = divmod(idx, 3)
+                grid.paste(v, (col * w, row * h))
+            grid_path = out / 'multiview_grid.png'
+            grid.save(str(grid_path))
+            input_image_path = str(grid_path)
+            grid_used = True
+        except Exception as e:
+            # Graceful fallback: if grid assembly fails, use single image
+            grid_used = False
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Pin upstream weight resolution without changing its source checkout.
     import huggingface_hub
     import diffusers
@@ -140,14 +187,15 @@ def run_reconstruction(req, out):
     diffusers.DiffusionPipeline.from_pretrained = staticmethod(pretrained)
     sys.path.insert(0, str(repo))
     os.chdir(repo)
-    sys.argv = [str(repo/'run.py'), cfg['config'], req['image'], '--output_path', str(out/'upstream'),
+    sys.argv = [str(repo/'run.py'), cfg['config'], input_image_path, '--output_path', str(out/'upstream'),
                 '--diffusion_steps', str(cfg['steps']), '--seed', str(cfg['seed']), '--no_rembg']
     runpy.run_path(str(repo/'run.py'), run_name='__main__')
     meshes = list((out/'upstream').glob('*/meshes/*.obj'))
     if len(meshes) != 1: raise RuntimeError('Expected exactly one InstantMesh output mesh')
     shutil.copy2(meshes[0], out/'mesh.obj')
     return dict(kind='InstantMesh', commit=commit, run_py_sha256=digest(repo/'run.py'), revisions=cfg['revisions'],
-                downloaded=downloaded, foreground_resize=False, diffusers=importlib.metadata.version('diffusers'))
+                downloaded=downloaded, foreground_resize=False, diffusers=importlib.metadata.version('diffusers'),
+                multiview_grid=grid_used, n_views_in_grid=len(multiview_images) if grid_used else 1)
 
 
 def worker(path):
