@@ -30,9 +30,15 @@ if [ ! -f "$INSTANTMESH_PYTHON" ]; then
 fi
 echo "✅ Both Python envs found"
 
+# Load .env if present (e.g. GEMINI_API_KEY)
+if [ -f ~/satellite/pt_reg/.env ]; then
+    export $(grep -v '^#' ~/satellite/pt_reg/.env | xargs)
+    echo "✅ Loaded environment variables from .env"
+fi
+
 # 2. Patch the config — inject correct python paths for images + reconstruction
 echo ""
-echo "🔧 Patching config with correct Python env paths..."
+echo "🔧 Patching config with correct Python env paths & experiment arms..."
 python3 - <<PY
 import json
 from pathlib import Path
@@ -49,9 +55,19 @@ if "reconstruction" not in cfg:
     cfg["reconstruction"] = {}
 cfg["reconstruction"]["python"] = "$INSTANTMESH_PYTHON"
 
+# Compare imagination models in experiment:
+# sd15_depth (with ControlNet) vs sd15 (pure inpainting without depth blocker)
+cfg["image_models"] = ["sd15_depth", "sd15"]
+cfg["primary_model"] = "sd15"
+cfg["prompt_variant"] = "short"
+cfg["prompt_short"] = "A smooth intact object, complete and undamaged, neutral gray CAD surface, isolated on seamless solid white background, single object, centered, no shadows."
+cfg["bg_obj_threshold"] = 140
+
 Path("$PATCHED_CONFIG").write_text(json.dumps(cfg, indent=2))
-print(f"  images.python       = {cfg['images']['python']}")
+print(f"  images.python         = {cfg['images']['python']}")
 print(f"  reconstruction.python = {cfg['reconstruction']['python']}")
+print(f"  image_models          = {cfg['image_models']}")
+print(f"  bg_obj_threshold      = {cfg['bg_obj_threshold']}")
 print("✅ Patched config written to $PATCHED_CONFIG")
 PY
 

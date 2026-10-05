@@ -48,11 +48,61 @@ def lock_models(config):
     return config
 
 
+def run_gemini_image(req, out):
+    """Generate intact object using Google Gemini multimodal API."""
+    import os, io, base64, requests
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        env_file = Path(__file__).resolve().parent.parent / '.env'
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith('GEMINI_API_KEY='):
+                    api_key = line.split('=', 1)[1].strip()
+    if not api_key:
+        raise ValueError('GEMINI_API_KEY not found in environment or .env file')
+
+    with open(req['image'], 'rb') as f:
+        img_b64 = base64.b64encode(f.read()).decode('utf-8')
+
+    model_name = req.get('config', {}).get('gemini_model', 'gemini-2.5-flash-image')
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+
+    prompt = (
+        f"{req['prompt']} Look at the provided 2D rendering of the broken fragment. "
+        "Complete and render the full intact 3D object on a seamless pure white background (#FFFFFF) with neutral gray CAD shading."
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inlineData": {"mimeType": "image/png", "data": img_b64}}
+            ]
+        }]
+    }
+    resp = requests.post(url, json=payload, timeout=60)
+    if resp.status_code == 200:
+        data = resp.json()
+        candidates = data.get('candidates', [])
+        for c in candidates:
+            for p in c.get('content', {}).get('parts', []):
+                if 'inlineData' in p and p['inlineData'].get('data'):
+                    raw_bytes = base64.b64decode(p['inlineData']['data'])
+                    img = Image.open(io.BytesIO(raw_bytes)).convert('RGB')
+                    img.save(out / 'image.png')
+                    return dict(kind='gemini_api_image_generation', model=model_name, status='success')
+    err_msg = resp.text[:300]
+    if 'RESOURCE_EXHAUSTED' in err_msg or resp.status_code == 429:
+        raise RuntimeError(f"Gemini API Quota Exceeded (429): Google AI Studio requires billing enabled for image generation models. Details: {err_msg}")
+    raise RuntimeError(f"Gemini API error ({resp.status_code}): {err_msg}")
+
+
 def run_image(req, out):
     cfg, model = req['config'], req['model']
     if req['smoke']:
         shutil.copy2(req['image'], out / 'image.png')
         return dict(kind='smoke_copy_NOT_image_completion', model=model, smoke=True)
+    if model == 'gemini':
+        return run_gemini_image(req, out)
     import torch
     from diffusers import ControlNetModel, StableDiffusionControlNetInpaintPipeline, StableDiffusionInpaintPipeline, AutoPipelineForInpainting
     revisions = cfg['revisions']
@@ -85,7 +135,9 @@ def run_image(req, out):
         params.update(image=[image, Image.open(req['control']).convert('RGB')], true_cfg_scale=cfg['qwen_cfg'], guidance_scale=1.0,
                       negative_prompt=' ', prompt=req['prompt']+' The second image is a depth rendering of the same input, not another object.')
     else:
-        params.update(image=image, mask_image=Image.open(req['mask']).convert('L'), width=image.width, height=image.height, guidance_scale=cfg['guidance'])
+        neg_prompt = 'vignette, shadow, dark background, grey background, floor, table, gradient, noisy, blurry, border, frame, studio background'
+        params.update(image=image, mask_image=Image.open(req['mask']).convert('L'), width=image.width, height=image.height,
+                      guidance_scale=cfg['guidance'], negative_prompt=neg_prompt)
         if model == 'sd15_depth':
             params.update(control_image=Image.open(req['control']).convert('RGB'), controlnet_conditioning_scale=cfg['control_strength'])
     with torch.inference_mode():
@@ -94,37 +146,22 @@ def run_image(req, out):
         raise RuntimeError('Model returned a filtered image; record a generation failure')
     output_image = result.images[0]
     # ── FIX A: Mask-aware background stripping ───────────────────────────────
-    # The naive RGB threshold (235) was too high — the grey studio vignette is
-    # around 160-210, so it wasn't being stripped. Fix: use the original
-    # fragment silhouette mask from E0 to identify the background region
-    # precisely, then force any background pixel brighter than the rendered
-    # object (~90-150 grey) to pure 255,255,255.
-    #
-    # mask.png from E0 (inverted mode): WHITE = background, BLACK = fragment.
-    # After SD runs, anything in the background region with mean brightness
-    # >= bg_obj_threshold is background haze → strip to white.
-    bg_obj_threshold = cfg.get('bg_obj_threshold', 160)
-    if bg_obj_threshold > 0 and req.get('mask'):
+    # Strip any background pixel brighter than the rendered object (~90-150 grey)
+    # to pure 255,255,255. Also clamp the outer border so InstantMesh gets clean edges.
+    bg_obj_threshold = cfg.get('bg_obj_threshold', 140)
+    if bg_obj_threshold > 0:
         import numpy as np
         arr = np.asarray(output_image).copy()
-        size = arr.shape[0]
-        # Load the original fragment mask (inverted: white=background to fill)
-        mask_arr = np.asarray(Image.open(req['mask']).convert('L').resize(
-            (arr.shape[1], arr.shape[0]), Image.NEAREST))
-        # background = pixels where the mask was "fill me in" (> 127)
-        is_background = mask_arr > 127
-        # Within background pixels, strip anything brighter than the object rendering
-        mean_brightness = arr[is_background].mean(axis=1) if is_background.any() else np.array([])
-        if len(mean_brightness):
-            # Force all background-region pixels that are light grey → pure white
+        if req.get('mask'):
+            mask_arr = np.asarray(Image.open(req['mask']).convert('L').resize(
+                (arr.shape[1], arr.shape[0]), Image.NEAREST))
+            is_background = mask_arr > 127
             bg_to_strip = is_background & (arr.mean(axis=2) >= bg_obj_threshold)
             arr[bg_to_strip] = 255
-        output_image = Image.fromarray(arr)
-    elif bg_obj_threshold > 0:
-        # Fallback if no mask available: global threshold
-        import numpy as np
-        arr = np.asarray(output_image).copy()
-        arr[np.all(arr >= bg_obj_threshold, axis=2)] = 255
+        else:
+            arr[np.all(arr >= bg_obj_threshold, axis=2)] = 255
+        # Ensure canvas border (outer 4 pixels) is pure white
+        arr[:4, :] = 255; arr[-4:, :] = 255; arr[:, :4] = 255; arr[:, -4:] = 255
         output_image = Image.fromarray(arr)
     # ─────────────────────────────────────────────────────────────────────────
     output_image.save(out / 'image.png')

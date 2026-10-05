@@ -5,9 +5,14 @@ from .storage import read
 DEFAULT = {
     'schema_version': 1, 'smoke': False, 'seed': 4101, 'points': 512, 'evaluation_points': 2048,
     'pixels': 512, 'splat_radius': 2, 'canvas_extent': 1.5,
-    'image_models': ['sd15_depth', 'qwen'], 'input_types': ['F', 'A'], 'image_seeds': [11, 23, 37, 51],
+    # Compare imagination models in experiment:
+    # 'sd15_depth' : SD 1.5 with ControlNet depth conditioning
+    # 'sd15'       : SD 1.5 pure inpainting without depth blocker
+    # 'gemini'     : Google Gemini multimodal API
+    # 'sdxl'       : SDXL inpainting
+    'image_models': ['sd15_depth', 'sd15'], 'input_types': ['F', 'A'], 'image_seeds': [11, 23, 37, 51],
     'reconstruction_top_k': 2, 'reconstruct_all_for_E5': True,
-    'primary_model': 'sd15_depth', 'primary_input': 'A', 'primary_policy': 'gated',
+    'primary_model': 'sd15', 'primary_input': 'A', 'primary_policy': 'gated',
 
     # ── Prompt variants (FIX #7) ──────────────────────────────────────────────
     # prompt_variant selects which prompt text to use at runtime.
@@ -24,10 +29,10 @@ DEFAULT = {
         'fragment boundary. Remove exposed break faces where they become internal. '
         'Neutral gray material, white background, one object, no labels.'
     ),
-    # Short prompt — better match to SD training caption distribution
+    # Short prompt — pure white background without 'studio lighting' (prevents grey studio vignettes)
     'prompt_short': (
-        'A smooth intact object, complete and undamaged, neutral gray surface, '
-        'white background, studio lighting, single object, photorealistic.'
+        'A smooth intact object, complete and undamaged, neutral gray CAD surface, '
+        'isolated on seamless solid white background, single object, centered, no shadows.'
     ),
     # We keep category_prompt for backward compat; prompt_variant='category' uses it automatically
     'category_prompt': True,

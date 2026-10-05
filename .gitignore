@@ -68,3 +68,4 @@ mlruns/
 .ipynb_checkpoints/
 extracted_results/
 pilot_report*.json
+scratch/
