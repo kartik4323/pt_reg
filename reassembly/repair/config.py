@@ -13,7 +13,7 @@ from reassembly.config import DEFAULTS as V2_DEFAULTS, merge_config, validate_co
 DEFAULTS = merge_config(V2_DEFAULTS, {
     "version": 3,
     "data": {"max_sources": 498, "source_pool_reassessment": True},
-    "train": {"max_updates": 10000, "overfit_updates": 10000,
+    "train": {"max_updates": 10000, "overfit_updates": 20000,
               "validation_interval": 500, "validation_samples": 48},
     "repair": {"geometry_variant": "revised", "view_supervision": "resampled_contrastive",
                "view_positive_radius": .05, "view_negative_radius": .1, "view_temperature": .1,
