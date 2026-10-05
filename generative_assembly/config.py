@@ -55,11 +55,12 @@ DEFAULT = {
     'n_render_views': 1,
 
     # ── Background stripping (Fix A) ─────────────────────────────────────────
-    # After SD generates the completion, strip pixels brighter than this threshold
-    # back to pure white (255,255,255). This removes studio vignette / haze that
-    # causes InstantMesh to hallucinate flat scatter sheets in 3D.
-    # Set to 0 to disable stripping entirely (for ablation).
-    'bg_strip_threshold': 235,
+    # After SD generates the completion, pixels in the background region
+    # (determined by the E0 fragment mask) that are brighter than this threshold
+    # are forced to pure white (255,255,255). The rendered object is dark grey
+    # (~90-150), so 160 safely strips studio vignette without touching the object.
+    # Set to 0 to disable. Was previously 'bg_strip_threshold' at 235 (too high).
+    'bg_obj_threshold': 160,
 
     # ── Multi-view InstantMesh grid (Fix C) ───────────────────────────────────
     # If > 1: generate this many SD completions from different E0 camera angles,

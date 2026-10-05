@@ -93,24 +93,44 @@ def run_image(req, out):
     if getattr(result, 'nsfw_content_detected', None) and any(result.nsfw_content_detected):
         raise RuntimeError('Model returned a filtered image; record a generation failure')
     output_image = result.images[0]
-    # ── FIX A: Background stripping ──────────────────────────────────────────
-    # SD + studio lighting prompt leaves a grey vignette/haze behind the object.
-    # InstantMesh treats every non-white pixel as physical geometry and
-    # reconstructs the haze as a flat scatter sheet in 3D space.
-    # Strip any pixel above bg_threshold back to pure 255,255,255.
-    bg_threshold = cfg.get('bg_strip_threshold', 235)
-    if bg_threshold > 0:
+    # ── FIX A: Mask-aware background stripping ───────────────────────────────
+    # The naive RGB threshold (235) was too high — the grey studio vignette is
+    # around 160-210, so it wasn't being stripped. Fix: use the original
+    # fragment silhouette mask from E0 to identify the background region
+    # precisely, then force any background pixel brighter than the rendered
+    # object (~90-150 grey) to pure 255,255,255.
+    #
+    # mask.png from E0 (inverted mode): WHITE = background, BLACK = fragment.
+    # After SD runs, anything in the background region with mean brightness
+    # >= bg_obj_threshold is background haze → strip to white.
+    bg_obj_threshold = cfg.get('bg_obj_threshold', 160)
+    if bg_obj_threshold > 0 and req.get('mask'):
         import numpy as np
         arr = np.asarray(output_image).copy()
-        # Pixels where ALL channels are >= threshold → pure white background
-        bg = np.all(arr >= bg_threshold, axis=2)
-        arr[bg] = 255
+        size = arr.shape[0]
+        # Load the original fragment mask (inverted: white=background to fill)
+        mask_arr = np.asarray(Image.open(req['mask']).convert('L').resize(
+            (arr.shape[1], arr.shape[0]), Image.NEAREST))
+        # background = pixels where the mask was "fill me in" (> 127)
+        is_background = mask_arr > 127
+        # Within background pixels, strip anything brighter than the object rendering
+        mean_brightness = arr[is_background].mean(axis=1) if is_background.any() else np.array([])
+        if len(mean_brightness):
+            # Force all background-region pixels that are light grey → pure white
+            bg_to_strip = is_background & (arr.mean(axis=2) >= bg_obj_threshold)
+            arr[bg_to_strip] = 255
+        output_image = Image.fromarray(arr)
+    elif bg_obj_threshold > 0:
+        # Fallback if no mask available: global threshold
+        import numpy as np
+        arr = np.asarray(output_image).copy()
+        arr[np.all(arr >= bg_obj_threshold, axis=2)] = 255
         output_image = Image.fromarray(arr)
     # ─────────────────────────────────────────────────────────────────────────
     output_image.save(out / 'image.png')
     return dict(kind='pretrained_image_generation', model=repo, revision=revisions[repo], revisions=revisions, dtype=str(dtype),
                 dimensions=list(output_image.size), diffusers=importlib.metadata.version('diffusers'), torch=torch.__version__,
-                bg_strip_threshold=bg_threshold)
+                bg_obj_threshold=bg_obj_threshold)
 
 
 def run_reconstruction(req, out):
