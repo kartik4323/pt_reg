@@ -14,3 +14,8 @@ python -m unittest discover -s generative_assembly/tests -v
 ```
 
 The [artifact contract](ARTIFACTS.md) describes the saved inputs, cameras, hypotheses, poses, pseudo-labels and checkpoints. `pipeline_recipe.json`, a complete source snapshot and `SHA256SUMS.json` support later pipeline integration without reconstructing experiment history.
+
+For cross-study plots and an interactive browser of E0–E7 artifacts, open
+[pipeline_stage_results.ipynb](../pipeline_stage_results.ipynb). Set `RUN_PATHS`
+to individual runs or their parent groups. The notebook reads completed and
+partial runs without changing them; see [notebook setup](../PIPELINE_RESULTS_NOTEBOOK.md).
