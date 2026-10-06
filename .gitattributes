@@ -1,1 +1,2 @@
 scripts/run_reassembly_v2_pilot.sh text eol=lf
+run_imagination_study.sh text eol=lf

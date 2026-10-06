@@ -97,7 +97,9 @@ def e0(store, case):
                 # Save with mask type (FIX #5)
                 directory = out / f'{kind}_{vlabel}' if n_views > 1 else out / kind
                 directory.mkdir(exist_ok=True)
-                render.save(directory, rendered, use_inverted_mask=(mask_type == 'inverted'))
+                render.save(directory, rendered, mask_type=mask_type)
+                write(directory / 'camera.json', dict(cam, crop_box=rendered.get('crop_box'),
+                      image_transform='crop_then_resize' if fill_target > 0 else 'identity'))
 
         np.savez_compressed(out/'observed.npz', **{f'points_{i}':p for i,p in enumerate(case['points'])},
                             **{f'indices_{i}':p for i,p in enumerate(case['indices'])},
@@ -173,7 +175,10 @@ def e1(store, case):
                     )
                     launch(request, out, cfg['images']['python'], cfg['resources']['worker_timeout_seconds'])
                     return dict(model=model, input_type=kl, seed=seed,
-                                selection=render.image_score(out / 'image.png', input_render))
+                                selection=render.image_score(out / 'image.png', input_render),
+                                raw_selection=render.image_score(out / 'image_raw.png', input_render)
+                                if (out / 'image_raw.png').exists() else None,
+                                mask_type=cfg['mask_type'], prompt=prompt)
                 rows.append(store.run('E1', rec, f'{model}__{kind_label}__{seed}', generate, parents=[parent]))
     return rows
 
@@ -214,9 +219,9 @@ def _reconstruct(store, case, row, multiview_rows=None):
         solver_cfg = dict(cfg.get('reconstruction', {}), **cfg['solver'])
         aligned, fit = g.fit_template(points, case, solver_cfg, data.seed_for(case['record']['id'], 'align'))
         if aligned is None:
-            aligned = points
-            fit['fallback'] = 'degenerate_template_discarded'
-        np.savez_compressed(out / 'shape.npz', raw=points, aligned=aligned)
+            np.savez_compressed(out / 'shape.npz', raw=points)
+        else:
+            np.savez_compressed(out / 'shape.npz', raw=points, aligned=aligned)
         write(out / 'alignment.json', fit)
         return dict(model=row['output']['model'], input_type=row['output']['input_type'],
                     seed=row['output'].get('seed'), image_job=row['job_id'],
@@ -242,6 +247,8 @@ def e2(store, case):
                      if r['output']['model'] == model
                      and (r['output']['input_type'] == base_kind
                           or r['output']['input_type'].startswith(f'{base_kind}_v'))]
+            if model != 'raw' and cfg.get('skip_invalid_e1', True):
+                group = [r for r in group if r['output'].get('selection', {}).get('valid_foreground', False)]
             group.sort(key=lambda r: (r['output'].get('selection', {}).get('selection_score', 0),
                                       r['output'].get('seed') or 0))
             if not group:
@@ -249,13 +256,9 @@ def e2(store, case):
             if not cfg['reconstruct_all_for_E5']:
                 group = group[:cfg['reconstruction_top_k']]
 
-            if n_mv > 1 and len(group) >= 2:
-                # Fix C: pick the best-scored single view as the primary, pass all others as multiview
-                primary = group[0]
-                siblings = group[1:n_mv]
-                rows.append(_reconstruct(store, case, primary, multiview_rows=siblings))
-            else:
-                rows.extend(_reconstruct(store, case, r) for r in group)
+            if n_mv > 1:
+                raise ValueError('Independent completions are not calibrated consistent InstantMesh views; use n_instantmesh_views=1')
+            rows.extend(_reconstruct(store, case, r) for r in group)
 
     if cfg['oracles'] and case['record']['split'] != 'train':
         ref = data.reference(store.dataset, case)
@@ -263,26 +266,82 @@ def e2(store, case):
             parent, _ = prepared(store, case)
             camera = read(store.artifact(parent, 'camera.json'))
             def oracle_image(out):
-                r = render.render(ref['complete'], None, None, camera, cfg['splat_radius'])
+                r = (render.render_surface if cfg.get('render_mode') == 'surface' else render.render)(
+                    ref['complete'], None, None, camera, cfg['splat_radius'])
+                # Oracle uses the same input-derived image transform, never its own crop.
+                kind = cfg['input_types'][0] + ('_v0' if cfg.get('n_render_views', 1) > 1 else '')
+                with np.load(store.artifact(parent, f'{kind}/render.npz')) as f:
+                    if 'crop_box' in f.files:
+                        r = render.crop_render(r, f['crop_box'])
                 render.save(out, r)
                 return dict(model='true_image', input_type='oracle', seed=None)
             r = store.run('E1_ORACLE', case['record'], 'true_image', oracle_image, oracle=True, parents=[parent])
             if r['status'] == 'complete':
                 rows.append(_reconstruct(store, case, r))
-    if not rows: raise RuntimeError('No E1 outputs to reconstruct')
+    select_priors(store, case)
+    if not rows: raise RuntimeError('No valid E1 outputs to reconstruct')
     return rows
 
 
 
 def templates(store,case,model=None,kind=None):
     rows=store.find('E2',case['record']['id'])
-    rows=[r for r in rows if (model is None or r['output']['model']==model) and (kind is None or r['output']['input_type']==kind)]
+    rows=[r for r in rows if not r['output'].get('template_rejected')
+          and r['output'].get('alignment', {}).get('heldout_error') is not None
+          and (model is None or r['output']['model']==model)
+          and (kind is None or r['output']['input_type'].split('_v')[0]==kind)]
     result=[]
     for row in rows:
         with np.load(store.artifact(row,'shape.npz'),allow_pickle=False) as f: p=f['aligned']
         result.append((row,p))
     # Deployment selection uses held-out observed reference points, never GT.
     return sorted(result,key=lambda x:(x[0]['output']['alignment']['heldout_error'],x[0]['output'].get('seed') or 0))
+
+
+def select_priors(store, case):
+    """Keep up to three diverse, input-compatible hypotheses per model/input.
+
+    Selection never reads evaluator references. A shortfall is reported, not padded.
+    """
+    from scipy.spatial import cKDTree
+    groups = {}
+    for model in ['raw'] + store.config['image_models']:
+        for kind in store.config['input_types']:
+            selected = []
+            rejected = []
+            for row, points in templates(store, case, model, kind):
+                if row['output']['alignment']['heldout_error'] > store.config.get('prior_max_heldout_error', 0.08):
+                    rejected.append(dict(job_id=row['job_id'], reason='heldout_error'))
+                    continue
+                if model != 'raw' and not store.config['smoke']:
+                    image_rows = store.find('E1', case['record']['id'])
+                    image_row = next((r for r in image_rows if r['job_id'] == row['output'].get('image_job')), None)
+                    if not image_row or image_row['output'].get('selection', {}).get('growth_relative_to_input', 0) < store.config.get('prior_min_growth', 0.05):
+                        rejected.append(dict(job_id=row['job_id'], reason='insufficient_foreground_growth'))
+                        continue
+                distances = [(cKDTree(p).query(points)[0].mean() +
+                              cKDTree(points).query(p)[0].mean()) / 2 for _, p in selected]
+                if distances and min(distances) < store.config.get('prior_diversity_distance', 0.025):
+                    rejected.append(dict(job_id=row['job_id'], reason='duplicate_geometry'))
+                    continue
+                selected.append((row, points))
+                if len(selected) == store.config.get('prior_count', 3):
+                    break
+            bundle = {}
+            for rank, (row, points) in enumerate(selected):
+                bundle[f'normalized_{rank+1}'] = points
+                bundle[f'original_anchor_frame_{rank+1}'] = points * case['scale'] + case['centers'][case['anchor']]
+            bundle_path = store.root / 'priors' / case['record']['id'] / f'{model}__{kind}.npz'
+            if bundle:
+                bundle_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(bundle_path, **bundle)
+            groups[f'{model}__{kind}'] = dict(job_ids=[r['job_id'] for r, _ in selected],
+                requested=store.config.get('prior_count', 3), available=len(selected),
+                filtered_candidates=rejected,
+                point_cloud_bundle=str(bundle_path.relative_to(store.root)) if bundle else None,
+                selection='heldout_observed_error_then_aligned_shape_diversity')
+    write(store.root / 'priors' / f"{case['record']['id']}.json", groups)
+    return groups
 
 
 def oracle_templates(store,case):
@@ -342,9 +401,13 @@ def e4(store,case):
     for model,tag in [('raw','B1')]+[(m,'B2') for m in cfg['image_models']]:
         for kind in cfg['input_types']:
             found=templates(store,case,model,kind)
-            if found: arms.append((f'{tag}__{model}__{kind}',found[0][1],found[0][0],False))
+            chosen = select_priors(store, case)[f'{model}__{kind}']['job_ids']
+            found = [x for x in found if x[0]['job_id'] in chosen]
+            if found:
+                for rank, (tr, points) in enumerate(found):
+                    arms.append((f'{tag}__{model}__{kind}' + (f'__prior{rank+1}' if rank else ''), points, tr, False))
             else:
-                def missing(d): raise RuntimeError('No valid reconstructed hypothesis; no silent substitution')
+                def missing(d): return dict(not_applicable='No selected compatible complete hypothesis; see priors manifest')
                 rows.append(store.run('E4',case['record'],f'{tag}__{model}__{kind}__refine',missing,parents=[parent]))
     if cfg['oracles'] and case['record']['split']!='train':
         shapes,_=oracle_templates(store,case)

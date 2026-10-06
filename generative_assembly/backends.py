@@ -36,7 +36,7 @@ def lock_models(config):
     """Resolve floating model references once, before study identity is created."""
     from huggingface_hub import HfApi
     api = HfApi()
-    repos = {config['images'][m] for m in config['image_models']}
+    repos = {config['images'][m] for m in config['image_models'] if m != 'gemini'}
     if 'sd15_depth' in config['image_models']: repos.add(config['images']['controlnet'])
     config['images']['revisions'] = {r: api.model_info(r, revision=config['images']['revisions'].get(r, 'main')).sha for r in sorted(repos)}
     config['reconstruction']['revisions'] = {r: api.model_info(r, revision=config['reconstruction']['revisions'].get(r, 'main')).sha
@@ -88,6 +88,7 @@ def run_gemini_image(req, out):
                 if 'inlineData' in p and p['inlineData'].get('data'):
                     raw_bytes = base64.b64decode(p['inlineData']['data'])
                     img = Image.open(io.BytesIO(raw_bytes)).convert('RGB')
+                    img.save(out / 'image_raw.png')
                     img.save(out / 'image.png')
                     return dict(kind='gemini_api_image_generation', model=model_name, status='success')
     err_msg = resp.text[:300]
@@ -132,8 +133,11 @@ def run_image(req, out):
     params = dict(prompt=req['prompt'], generator=torch.Generator(device='cpu').manual_seed(req['seed']),
                   num_inference_steps=cfg['qwen_steps'] if model == 'qwen' else cfg['steps'])
     if model == 'qwen':
-        params.update(image=[image, Image.open(req['control']).convert('RGB')], true_cfg_scale=cfg['qwen_cfg'], guidance_scale=1.0,
-                      negative_prompt=' ', prompt=req['prompt']+' The second image is a depth rendering of the same input, not another object.')
+        use_depth = cfg.get('qwen_use_depth', False)
+        params.update(image=[image, Image.open(req['control']).convert('RGB')] if use_depth else [image],
+                      true_cfg_scale=cfg['qwen_cfg'], guidance_scale=1.0,
+                      negative_prompt=' ', prompt=req['prompt'] +
+                      (' The second image is a depth rendering of the same input, not another object.' if use_depth else ''))
     else:
         neg_prompt = 'vignette, shadow, dark background, grey background, floor, table, gradient, noisy, blurry, border, frame, studio background'
         params.update(image=image, mask_image=Image.open(req['mask']).convert('L'), width=image.width, height=image.height,
@@ -144,11 +148,12 @@ def run_image(req, out):
         result = pipe(**params)
     if getattr(result, 'nsfw_content_detected', None) and any(result.nsfw_content_detected):
         raise RuntimeError('Model returned a filtered image; record a generation failure')
-    output_image = result.images[0]
+    output_image = result.images[0].convert('RGB')
+    output_image.save(out / 'image_raw.png')
     # ── FIX A: Mask-aware background stripping ───────────────────────────────
     # Strip any background pixel brighter than the rendered object (~90-150 grey)
     # to pure 255,255,255. Also clamp the outer border so InstantMesh gets clean edges.
-    bg_obj_threshold = cfg.get('bg_obj_threshold', 140)
+    bg_obj_threshold = cfg.get('bg_obj_threshold', 0)
     if bg_obj_threshold > 0:
         import numpy as np
         arr = np.asarray(output_image).copy()
@@ -160,7 +165,7 @@ def run_image(req, out):
             arr[bg_to_strip] = 255
         else:
             arr[np.all(arr >= bg_obj_threshold, axis=2)] = 255
-        # Ensure canvas border (outer 4 pixels) is pure white
+        # Legacy cleanup arm only; never infer background from the edit mask in main arms.
         arr[:4, :] = 255; arr[-4:, :] = 255; arr[:, :4] = 255; arr[:, -4:] = 255
         output_image = Image.fromarray(arr)
     # ─────────────────────────────────────────────────────────────────────────
@@ -194,35 +199,12 @@ def run_reconstruction(req, out):
     dirty = subprocess.check_output(['git','-C',str(repo),'diff','--name-only','HEAD'], text=True).strip()
     if dirty: raise ValueError('InstantMesh tracked source has uncommitted changes')
 
-    # ── Fix C: Multi-view grid packing ───────────────────────────────────────
-    # When multiple SD completions exist from different camera angles, pack them
-    # into a 2×3 grid image that InstantMesh accepts as Zero123++ bypass input.
-    # This gives the LRM real geometrically-diverse views instead of 6 hallucinated
-    # views from a single image, dramatically improving 3D reconstruction quality.
+    # The official run.py path accepts one conditioning image. A collage is not
+    # a calibrated multi-view bypass, and independent edits are not consistent views.
     input_image_path = req['image']
     multiview_images = req.get('multiview_images', [])
-    grid_used = False
-    if len(multiview_images) >= 4:
-        try:
-            import numpy as np
-            views = [Image.open(p).convert('RGB') for p in multiview_images[:6]]
-            # Pad to 6 views by repeating the last one if fewer than 6 provided
-            while len(views) < 6:
-                views.append(views[-1])
-            w, h = views[0].size
-            # Build 2 rows × 3 cols grid (Zero123++ canonical layout)
-            grid = Image.new('RGB', (w * 3, h * 2), (255, 255, 255))
-            for idx, v in enumerate(views):
-                row, col = divmod(idx, 3)
-                grid.paste(v, (col * w, row * h))
-            grid_path = out / 'multiview_grid.png'
-            grid.save(str(grid_path))
-            input_image_path = str(grid_path)
-            grid_used = True
-        except Exception as e:
-            # Graceful fallback: if grid assembly fails, use single image
-            grid_used = False
-    # ─────────────────────────────────────────────────────────────────────────
+    if multiview_images:
+        raise ValueError('InstantMesh grid bypass is unsupported by this adapter; provide a single image')
 
     # Pin upstream weight resolution without changing its source checkout.
     import huggingface_hub
@@ -252,7 +234,7 @@ def run_reconstruction(req, out):
     shutil.copy2(meshes[0], out/'mesh.obj')
     return dict(kind='InstantMesh', commit=commit, run_py_sha256=digest(repo/'run.py'), revisions=cfg['revisions'],
                 downloaded=downloaded, foreground_resize=False, diffusers=importlib.metadata.version('diffusers'),
-                multiview_grid=grid_used, n_views_in_grid=len(multiview_images) if grid_used else 1)
+                multiview_grid=False, n_views_in_grid=1)
 
 
 def worker(path):

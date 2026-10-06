@@ -11,7 +11,7 @@ Changes vs original:
     camera bases (structured azimuths) rather than a single canonical view.
 """
 import numpy as np
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, label
 from PIL import Image
 from .geometry import frame
 
@@ -198,12 +198,28 @@ def tight_crop(rendered, border_fraction=0.08, target_fill=0.65):
     for key in ('depth', 'ids'):
         img = Image.fromarray(cropped[key].astype(np.float32) if key == 'depth'
                               else cropped[key].astype(np.int32))
-        # Use nearest-neighbour for index/depth maps
-        arr = np.array(Image.fromarray(
-            (cropped[key] - cropped[key].min()).astype(np.float32)).resize(target, Image.NEAREST))
-        cropped[key] = arr  # approximate — used only for scoring, not geometry
+        cropped[key] = np.array(img.resize(target, Image.NEAREST))
 
     return cropped
+
+
+def crop_render(rendered, box):
+    """Apply an already measured input crop to an evaluator render."""
+    y0, y1, x0, x1 = map(int, box)
+    size = rendered['valid'].shape[0]
+    result = dict(rendered)
+    for key in ('rgb', 'control', 'valid', 'protected', 'depth', 'ids'):
+        arr = rendered[key][y0:y1, x0:x1]
+        if arr.dtype == bool:
+            result[key] = np.asarray(Image.fromarray(arr.astype(np.uint8) * 255).resize(
+                (size, size), Image.NEAREST)) > 127
+        else:
+            if key == 'ids': arr = arr.astype(np.int32)
+            if key == 'depth': arr = arr.astype(np.float32)
+            result[key] = np.asarray(Image.fromarray(arr).resize((size, size),
+                Image.LANCZOS if key in ('rgb', 'control') else Image.NEAREST))
+    result.update(crop_box=tuple(map(int, box)), original_size=size)
+    return result
 
 
 # ── Inverted mask (FIX #5) ──────────────────────────────────────────────────────
@@ -211,25 +227,22 @@ def tight_crop(rendered, border_fraction=0.08, target_fill=0.65):
 def inverted_mask(rendered):
     """Return a mask that covers the BACKGROUND (area to be inpainted by SD).
 
-    Original mask = 0 (black) where fragment exists → SD erases the fragment.
-    Inverted mask = 0 (black) where background is  → SD paints the missing bottle body.
-
-    The fragment region is kept WHITE (255 = preserve), background is BLACK (0 = regenerate).
-    A small dilation ensures SD fills right up to the fragment boundary.
+    Diffusers convention: 255 = regenerate, 0 = preserve.
+    This legacy arm protects the whole fragment and a four-pixel surrounding rim.
     """
     # Dilate the fragment silhouette slightly so SD blends cleanly at edges
     fragment_mask = binary_dilation(rendered['valid'], iterations=4)
-    # inverted: fragment = white (keep), background = black (fill in)
+    # Background is white (editable); fragment is black (protected).
     return (~fragment_mask).astype(np.uint8) * 255
 
 
 # ── Save helpers ────────────────────────────────────────────────────────────────
 
-def save(directory, rendered, use_inverted_mask=False):
+def save(directory, rendered, use_inverted_mask=False, mask_type=None):
     """Save E0 rendering artifacts.
 
     use_inverted_mask=True  → save inverted mask (background to fill in).
-    use_inverted_mask=False → original behaviour (fragment silhouette mask).
+    use_inverted_mask=False → preserve estimated exterior, edit remaining pixels.
     Both are saved so experiments can compare them.
     """
     Image.fromarray(rendered['rgb']).save(directory / 'image.png')
@@ -240,7 +253,10 @@ def save(directory, rendered, use_inverted_mask=False):
     Image.fromarray(orig_mask).save(directory / 'mask_original.png')
     Image.fromarray(inv_mask).save(directory / 'mask_inverted.png')
     # Default mask used by downstream code: choose which one to use
-    Image.fromarray(inv_mask if use_inverted_mask else orig_mask).save(directory / 'mask.png')
+    masks = {'original': orig_mask, 'exterior': orig_mask, 'inverted': inv_mask,
+             'none': np.full_like(orig_mask, 255)}
+    active = mask_type or ('inverted' if use_inverted_mask else 'original')
+    Image.fromarray(masks[active]).save(directory / 'mask.png')
     np.savez_compressed(directory / 'render.npz',
                         **{k: v for k, v in rendered.items() if k not in ('rgb', 'control')})
 
@@ -261,9 +277,20 @@ def image_score(path, input_render):
     p = input_render['protected']
     retention = float(mask[p].mean()) if p.any() else None
     valid = bool(mask.mean() > 0.01 and mask.mean() < 0.95)
+    observed = input_render['valid'].astype(bool)
+    added = mask & ~observed
+    growth = float(added.sum() / max(1, observed.sum()))
+    components, count = label(mask)
+    sizes = np.bincount(components.ravel())[1:]
+    significant_components = int((sizes >= max(8, mask.size * 0.001)).sum())
+    border = float(np.concatenate((mask[0], mask[-1], mask[:, 0], mask[:, -1])).mean())
+    # Input-only heuristic: retention alone must not reward an unchanged fragment.
+    # Growth is diagnostic evidence, not proof of correct geometry.
     score = (1-(retention if retention is not None else 0.5)) + (0 if valid else 10)
+    score += 0.25 * max(0., 1. - growth / 0.1) + border + 0.1 * max(0, significant_components - 1)
     return dict(selection_score=score, observed_mask_retention=retention, valid_foreground=valid,
                 scoring_resized=resized, foreground_fraction=float(mask.mean()),
-                crop_border_fraction=float(np.concatenate((mask[0], mask[-1], mask[:, 0], mask[:, -1])).mean()),
-                selector='input_mask_retention_then_fixed_seed_tie_break',
+                crop_border_fraction=border, added_foreground_fraction=float(added.mean()),
+                growth_relative_to_input=growth, significant_components=significant_components,
+                selector='retention_growth_components_border_then_fixed_seed',
                 camera_preservation_verified=False)

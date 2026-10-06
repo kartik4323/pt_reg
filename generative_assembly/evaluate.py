@@ -80,6 +80,11 @@ def evaluate(store,split):
                 row['metrics'].update(candidate_recall=any(m['success'] for m in before),best_candidate_error=min(m['max_part_chamfer'] for m in before),
                                       initially_successful=before[0]['success'] if len(before)==1 else None)
         elif job['stage']=='E2' and 'complete' in ref:
+            if job['output'].get('template_rejected') or job['output'].get('alignment', {}).get('heldout_error') is None:
+                row['status'] = 'rejected'
+                row['metrics'] = dict(valid_surface=False, rejection=job['output'].get('alignment', {}).get('rejected'))
+                rows.append(row)
+                continue
             with np.load(store.artifact(job,'shape.npz'),allow_pickle=False) as f: p=f['aligned']
             q=ref['complete']; a=cKDTree(p).query(q)[0]; b=cKDTree(q).query(p)[0]
             precision=float(np.mean(b<0.01)); recall=float(np.mean(a<0.01))
@@ -88,8 +93,15 @@ def evaluate(store,split):
                                 alignment='input_only_not_oracle_aligned',thickness_and_cavity_metrics=None)
         elif job['stage']=='E1' and 'complete' in ref:
             parents=store.find('E0',base,'prepare')
-            camera=read(store.artifact(parents[0],'camera.json'))
+            kind=job['output']['input_type']
+            camera_path=store.root/'jobs'/parents[0]['job_id']/kind/'camera.json'
+            camera=read(camera_path if camera_path.exists() else store.artifact(parents[0],'camera.json'))
             truth=render.render(ref['complete'],None,None,camera,cfg['splat_radius'])['valid']
+            if camera.get('crop_box') is not None:
+                y0,y1,x0,x1=map(int,camera['crop_box'])
+                truth=np.asarray(
+                    Image.fromarray(truth[y0:y1,x0:x1].astype(np.uint8)*255).resize(
+                        (cfg['pixels'],cfg['pixels']),Image.NEAREST))>127
             image=Image.open(store.artifact(job,'image.png')).convert('RGB').resize((cfg['pixels'],cfg['pixels']))
             predicted=render.foreground(image)
             # Explicit point-splat silhouette proxy. No filled convex hull/cavity replacement.
@@ -99,6 +111,10 @@ def evaluate(store,split):
             exterior=ref['exterior'][case['anchor']]
             if exterior is not None and exterior.any():
                 known=render.render(case['points'][case['anchor']][exterior],None,None,camera,cfg['splat_radius'])['valid']
+                if camera.get('crop_box') is not None:
+                    y0,y1,x0,x1=map(int,camera['crop_box'])
+                    known=np.asarray(Image.fromarray(known[y0:y1,x0:x1].astype(np.uint8)*255).resize(
+                        (cfg['pixels'],cfg['pixels']),Image.NEAREST))>127
                 surviving=known & (truth & ~binary_erosion(truth))
                 boundary=predicted & ~binary_erosion(predicted)
                 if surviving.any() and boundary.any():

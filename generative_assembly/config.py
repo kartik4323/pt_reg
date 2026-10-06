@@ -11,7 +11,10 @@ DEFAULT = {
     # 'gemini'     : Google Gemini multimodal API
     # 'sdxl'       : SDXL inpainting
     'image_models': ['sd15_depth', 'sd15'], 'input_types': ['F', 'A'], 'image_seeds': [11, 23, 37, 51],
-    'reconstruction_top_k': 2, 'reconstruct_all_for_E5': True,
+    'reconstruction_top_k': 3, 'reconstruct_all_for_E5': True,
+    'prior_count': 3, 'prior_diversity_distance': 0.025,
+    'prior_max_heldout_error': 0.08, 'prior_min_growth': 0.05,
+    'skip_invalid_e1': True,
     'primary_model': 'sd15', 'primary_input': 'A', 'primary_policy': 'gated',
 
     # ── Prompt variants (FIX #7) ──────────────────────────────────────────────
@@ -39,9 +42,10 @@ DEFAULT = {
 
     # ── Mask type (FIX #5) ────────────────────────────────────────────────────
     # 'inverted'  : mask covers background → SD paints the missing body around the fragment
-    # 'original'  : mask covers fragment   → SD replaces the fragment (old buggy behaviour)
+    # 'exterior'/'original': preserve estimated exterior, regenerate fracture/background
+    # 'none': allow the generator to revise every pixel
     # Both are saved; this selects which one is used as the active mask.png for E1.
-    'mask_type': 'inverted',
+    'mask_type': 'exterior',
 
     # ── Surface rendering (FIX #1) ────────────────────────────────────────────
     # 'surface'   : Poisson mesh + Phong shading (requires open3d; falls back if unavailable)
@@ -51,7 +55,7 @@ DEFAULT = {
     # ── Tight canvas crop (FIX #6) ────────────────────────────────────────────
     # Fraction of the canvas the fragment should occupy after cropping.
     # 0.0 = no crop (original); 0.65 = fragment fills ~65% of the frame.
-    'canvas_fill_target': 0.65,
+    'canvas_fill_target': 0.0,
 
     # ── Multi-view rendering for E0 input (FIX #2 / Fix B) ───────────────────
     # Number of camera viewpoints to render and pass to E1.
@@ -60,23 +64,16 @@ DEFAULT = {
     'n_render_views': 1,
 
     # ── Background stripping (Fix A) ─────────────────────────────────────────
-    # After SD generates the completion, pixels in the background region
-    # (determined by the E0 fragment mask) that are brighter than this threshold
-    # are forced to pure white (255,255,255). The rendered object is dark grey
-    # (~90-150), so 160 safely strips studio vignette without touching the object.
-    # Set to 0 to disable. Was previously 'bg_strip_threshold' at 235 (too high).
-    'bg_obj_threshold': 160,
+    # Historical configs may supply bg_obj_threshold here; load() migrates it
+    # to images.bg_obj_threshold. Main arms disable destructive whitening.
 
     # ── Multi-view InstantMesh grid (Fix C) ───────────────────────────────────
-    # If > 1: generate this many SD completions from different E0 camera angles,
-    # pack them into a 2×3 Zero123++ input grid, and feed that to InstantMesh
-    # instead of a single image. This bypasses Zero123++ hallucination entirely
-    # and gives the LRM geometrically consistent views.
-    # Requires n_render_views >= n_instantmesh_views.
-    # 1 = original single-image mode (default); 6 = full 2×3 grid.
+    # Only the official single-image InstantMesh path is supported. Independent
+    # edits are not geometrically consistent canonical multi-view observations.
     'n_instantmesh_views': 1,
 
     'images': {'python': None, 'device': 'cuda', 'dtype': 'float16', 'cpu_offload': True,
+               'bg_obj_threshold': 0,
                'steps': 30, 'qwen_steps': 40, 'guidance': 7.5, 'control_strength': 0.5, 'qwen_cfg': 4.0,
                'sd15_depth': 'stable-diffusion-v1-5/stable-diffusion-inpainting',
                'sd15': 'stable-diffusion-v1-5/stable-diffusion-inpainting',
@@ -87,8 +84,7 @@ DEFAULT = {
                        'config': 'configs/instant-mesh-large.yaml', 'steps': 75, 'seed': 42,
                        'revisions': {}, 'timeout_seconds': 3600,
                        # FIX #8: Reject templates with degenerate shape before feeding to E3.
-                       # aspect_ratio_max: if the template's max/min bbox dimension ratio exceeds
-                       # this, it is treated as a flat slab and discarded (returns None from fit_template).
+                       # PCA second-largest/thinnest bbox dimension ratio; permits long bottles.
                        'template_max_aspect_ratio': 6.0,
                        # flatness_max: max fraction of points within a thin slab (thickness < 5% of bbox).
                        # Above this, the template is considered degenerate.
@@ -116,7 +112,15 @@ def merge(base, update):
 
 
 def load(path):
-    cfg = merge(copy.deepcopy(DEFAULT), read(path))
+    supplied = read(path)
+    cfg = merge(copy.deepcopy(DEFAULT), supplied)
+    # Accept historical top-level configuration, but give the worker setting priority.
+    if 'bg_obj_threshold' in supplied and 'bg_obj_threshold' not in supplied.get('images', {}):
+        cfg['images']['bg_obj_threshold'] = supplied['bg_obj_threshold']
+    if cfg['mask_type'] not in ('original', 'inverted', 'exterior', 'none'):
+        raise ValueError('Unknown mask_type')
+    if cfg['prior_count'] < 1:
+        raise ValueError('prior_count must be positive')
     if cfg['primary_model'] not in cfg['image_models'] or cfg['primary_input'] not in cfg['input_types']:
         raise ValueError('Primary image model/input must be in experiment conditions')
     if cfg['primary_policy'] not in ('always', 'weak', 'gated'):

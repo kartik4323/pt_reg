@@ -4,6 +4,7 @@
   "evaluation_points": 64,
   "pixels": 32,
   "image_models": ["sd15_depth"],
+  "primary_model": "sd15_depth",
   "input_types": ["F", "A"],
   "image_seeds": [11],
   "solver": {

@@ -159,10 +159,13 @@ def check_template_shape(template, cfg):
     flat stone-slab image instead of a 3D object.
 
     Checks:
-      - aspect_ratio: bbox max_dim / min_dim  > template_max_aspect_ratio → slab
+      - aspect_ratio: PCA bbox second-largest / thinnest dimension → slab
       - flatness: fraction of points within the thinnest 5% of bbox height → flat sheet
     """
     pts = np.asarray(template, float)
+    # PCA removes orientation dependence. A long bottle is not a flat sheet:
+    # compare its second-largest dimension with thickness, not height/thickness.
+    pts = (pts - pts.mean(0)) @ np.linalg.svd(pts - pts.mean(0), full_matrices=False)[2].T
     bbox_min = pts.min(0)
     bbox_max = pts.max(0)
     dims = bbox_max - bbox_min
@@ -173,7 +176,7 @@ def check_template_shape(template, cfg):
     # Aspect ratio check
     if dims_sorted[0] < 1e-8:
         return False, 'degenerate_zero_thickness'
-    aspect = dims_sorted[-1] / dims_sorted[0]
+    aspect = dims_sorted[-2] / dims_sorted[0]
     if aspect > max_aspect:
         return False, f'aspect_ratio_{aspect:.1f}_exceeds_{max_aspect}'
 
