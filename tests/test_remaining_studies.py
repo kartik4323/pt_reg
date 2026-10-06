@@ -99,6 +99,13 @@ class RemainingStudyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_graph([{'id':'a','depends_on':['b']},{'id':'b','depends_on':['a']}])
 
+    def test_unknown_gpu_lists_available_ids_and_accepts_uuid(self):
+        with patch('subprocess.check_output', side_effect=['0,GPU-a\n', '']):
+            with self.assertRaisesRegex(ValueError, r'Unknown GPU 1.*0 \(GPU-a\).*GA_GPUS'):
+                check_gpus(['1'])
+        with patch('subprocess.check_output', side_effect=['0, GPU-a\n', '']):
+            check_gpus(['GPU-a'])
+
     def test_incomplete_k_and_no_prior_have_explicit_baseline_fallback(self):
         cfg=copy.deepcopy(self.cfg); cfg['image_seeds']=[11,23,37,51]
         store=self.store('run',cfg); ex.e0(store,self.case)

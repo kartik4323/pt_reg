@@ -44,12 +44,15 @@ def check_gpus(ids):
         processes = subprocess.check_output(['nvidia-smi','--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits'],text=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError('GPU launch needs nvidia-smi and explicitly free --gpus IDs') from exc
-    known = dict(line.strip().split(', ') for line in rows.splitlines() if line.strip())
+    known = dict(tuple(part.strip() for part in line.split(',', 1))
+                 for line in rows.splitlines() if line.strip())
     busy = {line.split(',')[0].strip() for line in processes.splitlines() if line.strip()}
     for identifier in ids:
         uuid = known.get(identifier, identifier if identifier in known.values() else None)
         if not uuid:
-            raise ValueError(f'Unknown GPU {identifier}')
+            available = ', '.join(f'{index} ({uuid})' for index, uuid in known.items()) or 'none'
+            raise ValueError(f'Unknown GPU {identifier}. GPUs reported by nvidia-smi: {available}. '
+                             'Set GA_GPUS to available, unoccupied IDs and remove them from GA_EXCLUDE_GPUS.')
         if uuid in busy:
             raise RuntimeError(f'GPU {identifier} is occupied; omit it or reserve another GPU. Existing jobs are never stopped.')
 
