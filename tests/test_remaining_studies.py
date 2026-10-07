@@ -106,6 +106,18 @@ class RemainingStudyTests(unittest.TestCase):
         with patch('subprocess.check_output', side_effect=['0, GPU-a\n', '']):
             check_gpus(['GPU-a'])
 
+    def test_shared_gpu_opt_in_keeps_unknown_ids_invalid_and_records_occupancy(self):
+        with patch('subprocess.check_output', side_effect=['0, GPU-a\n', 'GPU-a, 123\n']):
+            result = check_gpus(['0'], allow_shared=True)
+        self.assertTrue(result['selected_gpus']['0']['compute_processes_present'])
+        self.assertEqual(result['compute_processes_at_launch'], ['GPU-a, 123'])
+        with patch('subprocess.check_output', side_effect=['0, GPU-a\n', '']):
+            with self.assertRaises(ValueError):
+                check_gpus(['1'], allow_shared=True)
+        plan = make_plan(self.base, self.dataset, ['E4'], ['0'], allow_shared_gpu=True)
+        self.assertTrue(plan['allow_shared_gpu'])
+        self.assertTrue(all(t['config']['suite_allow_shared_gpu'] for t in plan['tasks']))
+
     def test_incomplete_k_and_no_prior_have_explicit_baseline_fallback(self):
         cfg=copy.deepcopy(self.cfg); cfg['image_seeds']=[11,23,37,51]
         store=self.store('run',cfg); ex.e0(store,self.case)
@@ -237,6 +249,25 @@ class RemainingStudyTests(unittest.TestCase):
             result=stages.e4(store,self.case,True)[0]
         self.assertFalse(result['output']['diagnostics']['compute_matched'])
         self.assertTrue(result['output']['diagnostics']['target_exceeds_cap'])
+
+    def test_shared_gpu_compute_control_is_not_claimed_as_isolated_match(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg['suite_allow_shared_gpu'] = True
+        cfg['solver']['compute_control_max_seconds'] = 60
+        store = self.store('shared', cfg); ex.e0(store, self.case)
+        records = {stage: [{'stage': stage, 'seconds': 1, 'output': {
+            'model': cfg['primary_model'], 'input_type': cfg['primary_input'], 'seed': seed}}
+            for seed in cfg['image_seeds']] for stage in ('E1', 'E2')}
+        original = store.find
+        def find(stage, case, arm=None):
+            return records[stage] if stage in records else original(stage, case, arm)
+        with patch.object(store, 'find', side_effect=find), patch.object(stages.time, 'monotonic', side_effect=[0, 10, 20]):
+            result = stages.e4(store, self.case, True)[0]
+        diag = result['output']['diagnostics']
+        self.assertTrue(diag['generation_budget_complete'])
+        self.assertFalse(diag['target_exceeds_cap'])
+        self.assertFalse(diag['compute_matched'])
+        self.assertFalse(diag['timing_valid_for_isolated_comparison'])
 
 
 if __name__=='__main__':

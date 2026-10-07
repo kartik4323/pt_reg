@@ -25,7 +25,8 @@ def execute(plan_path, task_id, root, retry=False):
     import_completed(store, plan['source_runs']+parents, task['sources'], import_stages)
     if task['mode'] == 'robust_students':
         import_students(store, [p for p in parents if (p/'pseudo_labels'/'train.json').exists()])
-    write(run_root/'experiment.json', {'dataset': plan['dataset'], 'profile': task['condition'], 'task': task_id})
+    write(run_root/'experiment.json', {'dataset': plan['dataset'], 'profile': task['condition'], 'task': task_id,
+                                      'allow_shared_gpu': plan.get('allow_shared_gpu', False)})
     records = [c for c in data.inventory(plan['dataset'])['cases']
                if c['source_id'] in task['sources'] and c['split'] == task['split']]
     # Training tasks consume full train data and score full development data.

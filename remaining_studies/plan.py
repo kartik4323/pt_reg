@@ -11,10 +11,11 @@ def suite_hash():
     return storage.fingerprint({p.name: storage.digest(p) for p in sorted(Path(__file__).parent.glob('*.py'))})
 
 
-def make_plan(base_path, dataset, studies, gpus, cpu_workers=2, shards=None, excluded=(), sources=()):
+def make_plan(base_path, dataset, studies, gpus, cpu_workers=2, shards=None, excluded=(), sources=(), allow_shared_gpu=False):
     if cpu_workers < 1 or len(gpus) != len(set(gpus)) or set(gpus) & set(excluded):
         raise ValueError('Positive CPU workers and unique, non-excluded GPU IDs required')
     cfg = config.load(base_path)
+    cfg['suite_allow_shared_gpu'] = bool(allow_shared_gpu)
     doc = data.inventory(dataset)
     identities, observations = {}, {}
     for case in doc['cases']:
@@ -186,7 +187,8 @@ def make_plan(base_path, dataset, studies, gpus, cpu_workers=2, shards=None, exc
     return {'schema_version': 1, 'base_config': cfg, 'dataset': str(Path(dataset).resolve()),
             'dataset_sha256': storage.digest(dataset), 'engine_code_sha256': storage.code_hash(),
             'suite_code_sha256': suite_hash(), 'studies': sorted(studies), 'gpu_ids': list(gpus),
-            'excluded_gpus': list(excluded), 'cpu_workers': cpu_workers, 'source_runs': sorted(set(roots)),
+            'excluded_gpus': list(excluded), 'allow_shared_gpu': bool(allow_shared_gpu),
+            'cpu_workers': cpu_workers, 'source_runs': sorted(set(roots)),
             'source_counts': {s: len(v) for s,v in splits.items()}, 'categories': categories,
             'unavailable': unavailable, 'tasks': tasks,
             'model_locks_ready': not missing_locks, 'missing_model_locks': missing_locks,

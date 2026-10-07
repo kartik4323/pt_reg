@@ -38,7 +38,7 @@ def validate_graph(tasks):
             del remaining[tid]
 
 
-def check_gpus(ids):
+def check_gpus(ids, allow_shared=False):
     try:
         rows = subprocess.check_output(['nvidia-smi','--query-gpu=index,uuid','--format=csv,noheader,nounits'],text=True)
         processes = subprocess.check_output(['nvidia-smi','--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits'],text=True)
@@ -47,14 +47,19 @@ def check_gpus(ids):
     known = dict(tuple(part.strip() for part in line.split(',', 1))
                  for line in rows.splitlines() if line.strip())
     busy = {line.split(',')[0].strip() for line in processes.splitlines() if line.strip()}
+    selected = {}
     for identifier in ids:
         uuid = known.get(identifier, identifier if identifier in known.values() else None)
         if not uuid:
             available = ', '.join(f'{index} ({uuid})' for index, uuid in known.items()) or 'none'
             raise ValueError(f'Unknown GPU {identifier}. GPUs reported by nvidia-smi: {available}. '
                              'Set GA_GPUS to available, unoccupied IDs and remove them from GA_EXCLUDE_GPUS.')
-        if uuid in busy:
-            raise RuntimeError(f'GPU {identifier} is occupied; omit it or reserve another GPU. Existing jobs are never stopped.')
+        selected[identifier] = {'uuid': uuid, 'compute_processes_present': uuid in busy}
+        if uuid in busy and not allow_shared:
+            raise RuntimeError(f'GPU {identifier} has compute processes. Reserve a free GPU or use '
+                               '--allow-shared-gpu to explicitly permit sharing. Existing jobs are never stopped.')
+    return {'allow_shared_gpu': bool(allow_shared), 'selected_gpus': selected,
+            'compute_processes_at_launch': processes.splitlines()}
 
 
 class Leases:
@@ -98,10 +103,13 @@ def launch(root, plan, python=None, retry=False, lock_dir=None, threads=1):
     validate_graph(plan['tasks'])
     if not plan.get('model_locks_ready', False):
         raise ValueError('Lock model revisions before research launch: '+str(plan.get('missing_model_locks')))
+    gpu_preflight = {'allow_shared_gpu': plan.get('allow_shared_gpu', False), 'selected_gpus': {}}
     if not plan['smoke'] and any(t['kind'] == 'gpu' for t in plan['tasks']):
         if not plan['gpu_ids']:
             raise ValueError('Real neural/training studies need explicit --gpus IDs')
-        check_gpus(plan['gpu_ids'])
+        gpu_preflight = check_gpus(plan['gpu_ids'], plan.get('allow_shared_gpu', False))
+        if plan.get('allow_shared_gpu', False):
+            print('Shared GPU mode: existing processes are permitted; isolated B5 timing comparisons are disabled.', flush=True)
     if threads < 1:
         raise ValueError('Thread limit must be positive')
     identity_path = root/'plan.json'
@@ -140,8 +148,10 @@ def launch(root, plan, python=None, retry=False, lock_dir=None, threads=1):
         write(root/'configs'/f'{task["id"]}.json',task['config'])
     suite_lock = lock(root/'suite.lock', {'root': str(root)})
     def snapshot():
-        write(state_path, {'tasks': states, 'active': list(active), 'resource_lock_dir': str(leases.root), 'smoke': plan['smoke']})
+        write(state_path, {'tasks': states, 'active': list(active), 'resource_lock_dir': str(leases.root),
+                           'smoke': plan['smoke'], 'allow_shared_gpu': plan.get('allow_shared_gpu', False)})
     try:
+        write(root/'gpu_preflight.json', dict(gpu_preflight, checked_at=time.time()))
         while any(s in ('pending','running') for s in states.values()):
             for tid, (process, log, handles, gpu) in list(active.items()):
                 code = process.poll()

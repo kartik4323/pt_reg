@@ -61,6 +61,22 @@ must be explicitly assigned, unique, and unoccupied at launch. The scheduler
 never stops existing GPU jobs. Resource locks coordinate simultaneous suites
 on the same host. `GA_RESOURCE_LOCK_DIR` can select a shared local lock folder.
 
+On a shared server, `--allow-shared-gpu` explicitly permits existing compute
+processes on the selected GPUs (it does not infer availability from memory or
+utilization). For example, with GPU 0 selected:
+
+```bash
+export GA_GPUS="0"
+export GA_EXCLUDE_GPUS=""
+bash run_remaining_studies.sh --allow-shared-gpu --dry-run
+bash run_remaining_studies.sh --allow-shared-gpu
+```
+
+This retains suite resource leases and records sharing in the immutable plan,
+task metadata and `gpu_preflight.json`. B5 outputs remain available but are
+marked invalid for isolated timing comparisons and cannot claim a compute
+match. Use the same flag on resume. Changing sharing policy requires a new root.
+
 ```bash
 python -m remaining_studies plan --base "$GA_CONFIG" --dataset "$GA_DATA" \
   --root "$GA_RUN_GROUP" --gpus 1 2 --exclude-gpus 0 --cpu-workers 2 \

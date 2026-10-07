@@ -17,6 +17,7 @@ def main():
         p.add_argument('--root',required=True); p.add_argument('--source-runs',nargs='*',default=[])
         p.add_argument('--studies',nargs='+',choices=['E4','E5','E6','E7'],default=['E4','E5','E6','E7'])
         p.add_argument('--gpus',nargs='*',default=[]); p.add_argument('--exclude-gpus',nargs='*',default=[])
+        p.add_argument('--allow-shared-gpu',action='store_true',help='Allow existing compute processes; record shared timing and invalidate isolated B5 timing comparisons')
         p.add_argument('--cpu-workers',type=int,default=2); p.add_argument('--shards',type=int)
         if name=='launch':
             p.add_argument('--dry-run',action='store_true'); p.add_argument('--retry-failed',action='store_true')
@@ -35,7 +36,7 @@ def main():
         print(path.read_text()); path.unlink(); return
     root=Path(args.root).expanduser().resolve()
     if args.command in ('plan','launch'):
-        plan=make_plan(args.base,args.dataset,args.studies,args.gpus,args.cpu_workers,args.shards,args.exclude_gpus,args.source_runs)
+        plan=make_plan(args.base,args.dataset,args.studies,args.gpus,args.cpu_workers,args.shards,args.exclude_gpus,args.source_runs,args.allow_shared_gpu)
         validate_graph(plan['tasks'])
         if args.command=='plan' or args.dry_run:
             summary={k:v for k,v in plan.items() if k not in ('tasks','base_config')}

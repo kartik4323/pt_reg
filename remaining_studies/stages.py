@@ -63,7 +63,9 @@ def e4(store, case, compute_only=False):
                                  cfg['solver']['refine_evaluations'] > 0)
             elapsed = time.monotonic() - start
             diag.update(target_seconds=target, search_seconds=elapsed,
-                        compute_matched=bool(budget_complete and target > 0 and target <= cap and elapsed >= target),
+                        compute_matched=bool(not cfg.get('suite_allow_shared_gpu', False) and budget_complete and target > 0 and target <= cap and elapsed >= target),
+                        shared_gpu_mode=cfg.get('suite_allow_shared_gpu', False),
+                        timing_valid_for_isolated_comparison=not cfg.get('suite_allow_shared_gpu', False),
                         target_exceeds_cap=target>cap,
                         generation_budget_complete=budget_complete, search_candidates=sum(map(len, banks)),
                         cap_seconds=cap, isolated_scheduler=True, target_scope='primary_model_input_all_seeds_E1_E2')
