@@ -1,0 +1,6 @@
+# Extracted input evidence remains local; the audit is the compact deliverable.
+experiments/
+comparison_progress.json
+queries/
+selection.json
+workflow.json
