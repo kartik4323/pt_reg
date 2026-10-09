@@ -1,0 +1,9 @@
+solver:
+  contact_orientation:
+    enabled: true
+    neighbors: 32
+    flatness_ratio: 0.2
+    tangent_ratio: 0.1
+    radial_cosine: 0.2
+    weight: 0.0004
+    offset: 0.02

@@ -1,0 +1,141 @@
+{
+  "diagnostic_only": true,
+  "scope": "Selected tensors at samples_poses/4101; not gate acceptance",
+  "solver_overrides": {
+    "contact_orientation": {
+      "enabled": true,
+      "neighbors": 32,
+      "flatness_ratio": 0.2,
+      "tangent_ratio": 0.1,
+      "radial_cosine": 0.2,
+      "weight": 0.0004,
+      "offset": 0.02
+    }
+  },
+  "summaries": {
+    "contact_validation": {
+      "baseline": {
+        "count": 12,
+        "geometric_successes": 3,
+        "accepted_successes": 0,
+        "candidate_coverage": 5
+      },
+      "orientation": {
+        "count": 12,
+        "geometric_successes": 5,
+        "accepted_successes": 0,
+        "candidate_coverage": 8
+      }
+    },
+    "gate/overfit": {
+      "baseline": {
+        "count": 12,
+        "geometric_successes": 7,
+        "accepted_successes": 3,
+        "candidate_coverage": 9
+      },
+      "orientation": {
+        "count": 12,
+        "geometric_successes": 8,
+        "accepted_successes": 3,
+        "candidate_coverage": 9
+      }
+    },
+    "gate/training": {
+      "baseline": {
+        "count": 12,
+        "geometric_successes": 1,
+        "accepted_successes": 0,
+        "candidate_coverage": 3
+      },
+      "orientation": {
+        "count": 12,
+        "geometric_successes": 2,
+        "accepted_successes": 0,
+        "candidate_coverage": 3
+      }
+    }
+  },
+  "baseline_agreements": 36,
+  "geometric_regressions": 0,
+  "subgroups": {
+    "contact_validation": {
+      "2": {
+        "baseline": {
+          "attempts": 8,
+          "geometric_successes": 2,
+          "accepted_successes": 0
+        },
+        "orientation": {
+          "attempts": 8,
+          "geometric_successes": 4,
+          "accepted_successes": 0
+        }
+      },
+      "3": {
+        "baseline": {
+          "attempts": 4,
+          "geometric_successes": 1,
+          "accepted_successes": 0
+        },
+        "orientation": {
+          "attempts": 4,
+          "geometric_successes": 1,
+          "accepted_successes": 0
+        }
+      }
+    },
+    "gate/overfit": {
+      "2": {
+        "baseline": {
+          "attempts": 6,
+          "geometric_successes": 1,
+          "accepted_successes": 0
+        },
+        "orientation": {
+          "attempts": 6,
+          "geometric_successes": 2,
+          "accepted_successes": 0
+        }
+      },
+      "3": {
+        "baseline": {
+          "attempts": 6,
+          "geometric_successes": 6,
+          "accepted_successes": 3
+        },
+        "orientation": {
+          "attempts": 6,
+          "geometric_successes": 6,
+          "accepted_successes": 3
+        }
+      }
+    },
+    "gate/training": {
+      "2": {
+        "baseline": {
+          "attempts": 8,
+          "geometric_successes": 1,
+          "accepted_successes": 0
+        },
+        "orientation": {
+          "attempts": 8,
+          "geometric_successes": 2,
+          "accepted_successes": 0
+        }
+      },
+      "3": {
+        "baseline": {
+          "attempts": 4,
+          "geometric_successes": 0,
+          "accepted_successes": 0
+        },
+        "orientation": {
+          "attempts": 4,
+          "geometric_successes": 0,
+          "accepted_successes": 0
+        }
+      }
+    }
+  }
+}

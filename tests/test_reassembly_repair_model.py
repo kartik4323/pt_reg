@@ -52,7 +52,7 @@ class RepairModelTests(unittest.TestCase):
     def tearDownClass(cls):
         torch.set_num_threads(cls.threads)
 
-    def test_existing_fresh_seed_matches_legacy_states_and_probabilities(self):
+    def test_existing_fresh_seed_preserves_legacy_allocation_except_explicit_dustbin(self):
         batch = fixture()
         for supervision in ('existing', 'resampled_contrastive'):
             with self.subTest(supervision=supervision):
@@ -69,7 +69,15 @@ class RepairModelTests(unittest.TestCase):
                     second_state = getattr(repaired, name).state_dict()
                     self.assertEqual(set(first_state), set(second_state))
                     for key in first_state:
+                        if name == 'matcher' and key == 'dustbin':
+                            self.assertEqual(first_state[key].item(), 1.)
+                            torch.testing.assert_close(second_state[key], torch.tensor(float(torch.log(torch.tensor(24.)))))
+                            continue
                         torch.testing.assert_close(first_state[key], second_state[key], atol=0, rtol=0)
+                # Compare probability semantics at the same declared dustbin,
+                # rather than undoing the intentional repair initialization.
+                with torch.no_grad():
+                    original.matcher.dustbin.fill_(float(torch.log(torch.tensor(24.))))
                 a = original.encode(batch['points'], batch['fragment_mask'], batch['anchor_index'])
                 b = repaired.encode(batch['points'], batch['fragment_mask'], batch['anchor_index'])
                 for first, second in zip(original.match(a, use_scaffold=False), repaired.match(b)):

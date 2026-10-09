@@ -32,6 +32,8 @@ def load_config(path=None):
 
 
 def validate_config(cfg):
+    from .orientation import options as orientation_options
+    orientation_options(cfg)
     if cfg.get("version") != 3:
         raise ValueError("Repair experiments require version: 3")
     # Reuse geometric/resource checks without changing the v2 pilot's limits.

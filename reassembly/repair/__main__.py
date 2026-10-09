@@ -42,6 +42,11 @@ def parser():
             command.add_argument("--split", choices=("train", "val", "test", "cut_holdout"), default="val")
             command.add_argument("--conditions", nargs="+", choices=("contact_only", "predicted", "gt", "perturbed"),
                                  default=["contact_only", "predicted", "gt", "perturbed"])
+            command.add_argument('--overfit', action='store_true')
+            command.add_argument('--seeds', type=int, nargs='+', default=[4101, 4102, 4103])
+            command.add_argument('--modes', nargs='+', choices=['unchanged', 'rotation', 'samples', 'samples_poses'], default=['samples_poses'])
+        if name in ('evaluate', 'contact-gate'):
+            command.add_argument('--solver-config', type=Path, help='Diagnostic YAML with only solver.contact_orientation settings')
         if name == "contact-gate":
             command.add_argument("--resume", action="store_true")
             command.add_argument("--overfit-checkpoint", type=Path, required=True)
@@ -69,6 +74,14 @@ def dispatch(args):
     cfg["resources"]["managed_root"] = str(root)
     guard = make_guard(cfg, output, args.manifest.resolve().parent if hasattr(args, "manifest") else root)
     guard.check()
+    solver_overrides = None
+    if getattr(args, 'solver_config', None) is not None:
+        import yaml
+        from .orientation import validate_overrides
+        document = yaml.safe_load(args.solver_config.read_text(encoding='utf-8'))
+        if not isinstance(document, dict) or set(document) != {'solver'}:
+            raise ValueError('Solver config must contain only a solver mapping')
+        solver_overrides = validate_overrides(document['solver'])
     if args.command == "supplement-queries":
         from .data import supplement_queries
         return supplement_queries(args.manifest, output, guard), 0
@@ -85,10 +98,12 @@ def dispatch(args):
     if args.command == "evaluate":
         from .evaluation import evaluate
         return evaluate(args.checkpoint, args.manifest, output, args.device, split=args.split,
-            conditions=args.conditions, query_cache=args.query_cache, guard=guard, resume=args.resume), 0
+            conditions=args.conditions, query_cache=args.query_cache, guard=guard, resume=args.resume,
+            overfit=args.overfit, seeds=args.seeds, modes=args.modes, solver_overrides=solver_overrides), 0
     if args.command == "contact-gate":
         from .evaluation import contact_gate
-        report = contact_gate(args.checkpoint, args.overfit_checkpoint, args.manifest, output, args.device, guard, resume=args.resume)
+        report = contact_gate(args.checkpoint, args.overfit_checkpoint, args.manifest, output, args.device, guard,
+                              resume=args.resume, solver_overrides=solver_overrides)
         return report, 0 if report["passed"] else 2
     if args.command == "run":
         from .workflow import run

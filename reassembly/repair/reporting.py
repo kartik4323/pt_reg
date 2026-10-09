@@ -17,6 +17,8 @@ from .config import signature
 def read_rows(report_path):
     report_path = Path(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get('diagnostic_only'):
+        raise ValueError('Diagnostic solver-override evaluations cannot be used for official acceptance')
     rows_path = report_path.parent / "examples.jsonl"
     if (report.get("kind") != "repair_evaluation" or report.get("status") != "completed"
             or report.get("metric_threshold") != .01 or report.get("checkpoint_unchanged") is not True

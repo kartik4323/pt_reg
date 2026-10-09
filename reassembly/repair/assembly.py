@@ -18,6 +18,7 @@ import torch
 
 from reassembly import solver
 from .fields import FieldSampler
+from . import orientation
 
 
 _CANDIDATE_DEFAULTS = dict(min_correspondence_weight=.001, min_pair_mass=.05,
@@ -26,7 +27,12 @@ _CANDIDATE_DEFAULTS = dict(min_correspondence_weight=.001, min_pair_mass=.05,
 
 def _candidate_options(cfg):
     options = solver._options(cfg)
-    return {key: options.get(key, default) for key, default in _CANDIDATE_DEFAULTS.items()}
+    result = {key: options.get(key, default) for key, default in _CANDIDATE_DEFAULTS.items()}
+    normal_options = orientation.options(cfg)
+    # Keep legacy fingerprints unchanged when the optional intervention is off.
+    if normal_options['enabled']:
+        result['contact_orientation'] = normal_options
+    return result
 
 
 def _numpy(value):
@@ -79,6 +85,7 @@ def build_candidates_from_matches(matches, num_fragments, anchor_index=0,
     if num_fragments not in (2, 3) or not 0 <= anchor_index < num_fragments:
         raise ValueError("candidate construction requires two or three fragments and a valid reference")
     options = solver._options(cfg)
+    normal_options = orientation.options(cfg)
     if exterior_points is not None:
         exterior_points = [_readonly(np.asarray(points, dtype=np.float64)) for points in exterior_points]
         if len(exterior_points) != num_fragments or any(p.ndim != 2 or p.shape[1] != 3 or not np.isfinite(p).all() for p in exterior_points):
@@ -107,13 +114,20 @@ def build_candidates_from_matches(matches, num_fragments, anchor_index=0,
                           candidate_count=0, reason='insufficient_correspondence_support')
         if selected is None:
             continue
+        if normal_options['enabled']:
+            orientation.attach_selected(selected, pair)
         correspondences.append(selected)
-        fits = solver._pair_candidates(selected, options)
+        fits = orientation.pair_candidates(selected, options, normal_options) if normal_options['enabled'] else solver._pair_candidates(selected, options)
         pairs[key].update(selected_correspondences=len(selected['weights']),
                           unique_source_points=len(np.unique(selected['source_indices'])),
                           unique_target_points=len(np.unique(selected['target_indices'])),
                           selected_mass=float(selected['weights'].sum()), confidence=selected['confidence'],
                           candidate_count=len(fits), reason=None if fits else 'degenerate_or_inconsistent_support')
+        if normal_options['enabled']:
+            support = orientation.reliable_support(selected, float(options.get('min_pair_mass', .05)))
+            pairs[key].update(orientation_reliable_correspondences=int(support.sum()),
+                orientation_reliable_mass=float(selected['weights'][support].sum()),
+                proposal_types=[fit.get('proposal_type', 'legacy') for fit in fits])
         if fits:
             candidates[(i, j)] = fits
     hypotheses = []
@@ -124,12 +138,19 @@ def build_candidates_from_matches(matches, num_fragments, anchor_index=0,
             if poses is not None:
                 hypotheses.append(dict(id=len(hypotheses), edges=list(edges), pair_choices=list(indices),
                                        poses=tuple(_readonly(value) for value in poses)))
+                if normal_options['enabled']:
+                    hypotheses[-1]['proposal_types'] = [fit.get('proposal_type', 'legacy') for fit in fits]
     digest = hashlib.sha256()
     digest.update(json.dumps(dict(count=num_fragments, anchor=anchor_index, options=_candidate_options(cfg)), sort_keys=True).encode())
     for pair in correspondences:
         digest.update(f"{pair['i']}-{pair['j']}".encode())
         for key in ('source', 'target', 'weights'):
             digest.update(np.ascontiguousarray(pair[key], dtype=np.float64).tobytes())
+        if normal_options['enabled']:
+            for key in ('source_normals', 'target_normals', 'source_normal_reliability', 'target_normal_reliability'):
+                if key in pair:
+                    digest.update(key.encode())
+                    digest.update(np.ascontiguousarray(pair[key], dtype=np.float64).tobytes())
     for item in hypotheses:
         for value in item['poses']:
             digest.update(np.ascontiguousarray(value, dtype=np.float64).tobytes())
@@ -168,6 +189,8 @@ def build_candidates(model, batch, cfg, encoded=None):
                     if name in pair:
                         match[name] = _numpy(pair[name])[0]
                 matches.append(match)
+            if orientation.options(cfg)['enabled']:
+                matches = orientation.attach_normals(matches, _numpy(points)[0, :count], cfg)
             probabilities = _numpy(torch.sigmoid(-encoded['fracture_logits']))[0]
             exterior, exterior_weights = [], []
             for i in range(count):
@@ -189,6 +212,16 @@ def solve_candidates(cache: CandidateCache, cfg, field: FieldSampler | None = No
     if _candidate_options(cfg) != cache.candidate_options:
         raise ValueError("candidate thresholds changed: rebuild candidates instead of reusing incompatible support")
     options = solver._options(cfg)
+    normal_options = orientation.options(cfg)
+    def score_pose(poses):
+        value, detail = solver._score(poses, cache.correspondences, cache.exterior_points,
+                                     cache.exterior_weights, field, options)
+        if normal_options['enabled']:
+            penalty, extra = orientation.score(poses, cache.correspondences, normal_options,
+                                               float(options.get('min_pair_mass', .05)))
+            value += penalty
+            detail.update(extra, orientation_penalty=penalty)
+        return value, detail
     diagnostics = copy.deepcopy(cache.diagnostics)
     failure = dict(status='failed', confidence=0., rotations=None, translations=None,
                    anchor_index=cache.anchor_index, diagnostics=diagnostics)
@@ -196,16 +229,22 @@ def solve_candidates(cache: CandidateCache, cfg, field: FieldSampler | None = No
         return {**failure, 'reason': 'no_valid_connected_assembly'}
     scored = []
     for hypothesis in cache.hypotheses:
-        score, detail = solver._score(hypothesis['poses'], cache.correspondences, cache.exterior_points,
-                                     cache.exterior_weights, field, options)
+        score, detail = score_pose(hypothesis['poses'])
         scored.append((score, hypothesis, detail))
     scored.sort(key=lambda item: item[0])
     finalists = []
+    refinement_decisions = []
     for initial_score, hypothesis, initial_detail in scored[:min(4, max(1, int(options.get('refine_candidates', 4))))]:
         refined, accepted = solver._refine(hypothesis['poses'], cache.anchor_index, cache.correspondences,
                                           cache.exterior_points, cache.exterior_weights, field, options)
-        score, detail = solver._score(refined, cache.correspondences, cache.exterior_points,
-                                     cache.exterior_weights, field, options)
+        score, detail = score_pose(refined)
+        if normal_options['enabled']:
+            reverted = not np.isfinite(score) or score > initial_score
+            refinement_decisions.append(dict(candidate_id=hypothesis['id'], reverted=reverted,
+                initial_score=float(initial_score), refined_score=float(score) if np.isfinite(score) else None,
+                attempted_accepted_steps=accepted))
+            if reverted:
+                score, refined, detail, accepted = initial_score, hypothesis['poses'], initial_detail, 0
         finalists.append((score, refined, detail, accepted, initial_score, initial_detail, hypothesis['id']))
     score, (rotations, translations), detail, accepted, initial_score, initial_detail, candidate_id = min(finalists, key=lambda item: item[0])
     diagnostics.update(detail)
@@ -217,6 +256,10 @@ def solve_candidates(cache: CandidateCache, cfg, field: FieldSampler | None = No
                        pre_refinement_prior_score=initial_detail['prior_score'],
                        pre_refinement_contact_rms=initial_detail['contact_rms'],
                        candidate_scores=[dict(id=item[1]['id'], score=float(item[0]), **item[2]) for item in scored])
+    if normal_options['enabled']:
+        selected = next(item for item in cache.hypotheses if item['id'] == candidate_id)
+        diagnostics.update(contact_orientation=normal_options, refinement_decisions=refinement_decisions,
+                           selected_proposal_types=selected['proposal_types'])
     if not (np.isfinite(rotations).all() and np.isfinite(translations).all()):
         return {**failure, 'reason': 'nonfinite_refinement'}
     if not (np.allclose(rotations @ rotations.transpose(0, 2, 1), np.eye(3), atol=1e-6)

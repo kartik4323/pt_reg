@@ -149,10 +149,18 @@ def sample_results(model, sample, cfg, device, conditions=("contact_only",), *, 
 
 
 def evaluate(checkpoint, manifest, output, device, *, split="val", conditions=("contact_only", "predicted", "gt", "perturbed"),
-             seeds=(4101, 4102, 4103), guard=None, query_cache=None, overfit=False, modes=("samples_poses",), resume=False):
+             seeds=(4101, 4102, 4103), guard=None, query_cache=None, overfit=False, modes=("samples_poses",), resume=False,
+             solver_overrides=None):
+    from .orientation import validate_overrides
+    solver_overrides = validate_overrides(solver_overrides)
     integrity = verify_manifest(manifest)
     model, state = load_model(checkpoint, device, integrity["dataset_fingerprint"])
-    cfg = state["cfg"]
+    cfg = copy.deepcopy(state["cfg"])
+    checkpoint_signature = signature(cfg)
+    if solver_overrides is not None:
+        cfg['solver'].update(solver_overrides)
+        from .config import validate_config
+        validate_config(cfg)
     if state["stage"] == 1 and any(c != "contact_only" for c in conditions):
         raise ValueError("A stage-1 checkpoint has no trained scaffold; evaluate contact_only")
     if (state["purpose"] == "overfit") != overfit:
@@ -169,6 +177,8 @@ def evaluate(checkpoint, manifest, output, device, *, split="val", conditions=("
         "dataset_fingerprint": dataset.fingerprint, "config_signature": signature(cfg), "split": split,
         "purpose": state["purpose"], "seeds": list(seeds), "modes": list(modes), "conditions": list(conditions),
         "pattern_ids": [r["pattern_id"] for r in dataset.records], "provenance": provenance(device)}
+    invocation.update(checkpoint_config_signature=checkpoint_signature, solver_overrides=solver_overrides,
+        effective_solver=copy.deepcopy(cfg['solver']), diagnostic_only=solver_overrides is not None)
     rows, started = [], time.perf_counter()
     invocation_path = output / "invocation.json"
     if resume and invocation_path.exists():
@@ -177,6 +187,8 @@ def evaluate(checkpoint, manifest, output, device, *, split="val", conditions=("
                 "purpose", "seeds", "modes", "conditions", "pattern_ids")
         if any(old.get(k) != invocation[k] for k in keys) or old["provenance"]["code"] != invocation["provenance"]["code"]:
             raise ValueError("Evaluation resume inputs or implementation changed")
+        if old.get('solver_overrides') != solver_overrides:
+            raise ValueError('Evaluation resume solver overrides changed')
         rows_path = output / "examples.jsonl"
         if rows_path.exists():
             # A killed append can leave only its final line incomplete. Keep all
@@ -260,7 +272,7 @@ def evaluate(checkpoint, manifest, output, device, *, split="val", conditions=("
     return report
 
 
-def contact_gate(checkpoint, overfit_checkpoint, manifest, output, device, guard=None, *, resume=False):
+def contact_gate(checkpoint, overfit_checkpoint, manifest, output, device, guard=None, *, resume=False, solver_overrides=None):
     output = Path(output).resolve()
     if output.exists() and any(output.iterdir()) and not resume:
         raise FileExistsError("Choose a fresh contact gate directory")
@@ -268,9 +280,9 @@ def contact_gate(checkpoint, overfit_checkpoint, manifest, output, device, guard
     overfit_state = load_checkpoint(overfit_checkpoint, cfg=state["cfg"], fingerprint=state["dataset_fingerprint"], stage=1, purpose="overfit")
     regression = evaluate(overfit_checkpoint, manifest, output / "overfit", device,
         split="train", conditions=("contact_only",), seeds=(4101, 4102, 4103), overfit=True,
-        modes=("unchanged", "rotation", "samples", "samples_poses"), guard=guard, resume=resume)
+        modes=("unchanged", "rotation", "samples", "samples_poses"), guard=guard, resume=resume, solver_overrides=solver_overrides)
     training = evaluate(checkpoint, manifest, output / "training", device, split="train",
-        conditions=("contact_only",), seeds=(4101,), modes=("samples_poses",), guard=guard, resume=resume)
+        conditions=("contact_only",), seeds=(4101,), modes=("samples_poses",), guard=guard, resume=resume, solver_overrides=solver_overrides)
     fixed = regression["summaries"]["unchanged/0/contact_only"]
     robustness = {mode: sum(regression["summaries"][f"{mode}/{s}/contact_only"]["successes"] for s in (4101, 4102, 4103))/48
                   for mode in ("rotation", "samples", "samples_poses")}
@@ -283,12 +295,17 @@ def contact_gate(checkpoint, overfit_checkpoint, manifest, output, device, guard
         "checkpoint_sha256": _file_sha256(checkpoint), "overfit_checkpoint_sha256": _file_sha256(overfit_checkpoint),
         "evidence": {name: {"path": str(output / name / "evaluation.json"), "sha256": _file_sha256(output / name / "evaluation.json")}
                      for name in ("overfit", "training")}}
+    if solver_overrides is not None:
+        report.update(diagnostic_only=True, solver_overrides=regression['solver_overrides'],
+                      effective_solver=regression['effective_solver'])
     write_json(output / "contact_gate.json", report, guard)
     return report
 
 
 def require_contact_gate(path, checkpoint, fingerprint):
     report = json.loads(Path(path).read_text(encoding="utf-8"))
+    if report.get('diagnostic_only'):
+        raise ValueError('Diagnostic solver overrides cannot certify training lineage; run the configured experiment gate')
     if report.get("kind") != "repair_contact_gate" or not report.get("passed") or not all(report.get("checks", {}).values()):
         raise ValueError("Contact assembly gate has not passed; field training is blocked")
     if report["checkpoint_sha256"] != _file_sha256(checkpoint) or report["dataset_fingerprint"] != fingerprint:

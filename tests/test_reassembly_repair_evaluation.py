@@ -54,6 +54,34 @@ class RepairEvaluationTests(unittest.TestCase):
         return evaluate(self.checkpoint, self.manifest, output, "cpu", seeds=(4101,),
                         conditions=("contact_only",), **kwargs)
 
+    def test_solver_override_is_diagnostic_immutable_and_resume_bound(self):
+        from reassembly.repair.config import signature
+        from reassembly.repair.checkpoints import load_checkpoint
+        before = self.checkpoint.read_bytes()
+        overrides = {'contact_orientation': {'enabled': True}}
+        output = self.root/'orientation_eval'
+        report = self.run_evaluation(output, solver_overrides=overrides)
+        self.assertTrue(report['diagnostic_only'])
+        self.assertEqual(report['checkpoint_config_signature'], signature(load_checkpoint(self.checkpoint)['cfg']))
+        self.assertEqual(report['solver_overrides'], overrides)
+        self.assertEqual(report['metric_threshold'], .01)
+        self.assertEqual(before, self.checkpoint.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'Diagnostic'):
+            read_rows(output/'evaluation.json')
+        with self.assertRaises(ValueError):
+            self.run_evaluation(output, resume=True, solver_overrides={'contact_orientation': {'enabled': True, 'offset': .03}})
+        resumed = self.run_evaluation(output, resume=True, solver_overrides=overrides)
+        self.assertEqual(resumed['results_sha256'], report['results_sha256'])
+        with self.assertRaises(ValueError):
+            self.run_evaluation(self.root/'invalid', solver_overrides={'success_threshold': .03})
+
+    def test_diagnostic_gate_cannot_certify_field_training(self):
+        from reassembly.repair.evaluation import require_contact_gate
+        path=self.root/'diagnostic_gate.json'
+        write_json(path, {'diagnostic_only': True, 'passed': True})
+        with self.assertRaisesRegex(ValueError, 'Diagnostic'):
+            require_contact_gate(path, self.checkpoint, self.fingerprint)
+
     def test_real_evaluation_and_completed_resume_skip_computation(self):
         output = self.root / "evaluation"
         self.run_evaluation(output)
