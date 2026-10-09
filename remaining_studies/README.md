@@ -189,3 +189,13 @@ separate freeze/test workflow after architecture choices are final.
 For CPU software validation, pass `generative_assembly/configs/smoke.json` and
 a separately generated `python -m generative_assembly demo` dataset. Smoke
 outputs are never research evidence or production priors.
+
+For failed tasks or `complete_with_failures`, collect bounded child-worker logs:
+
+```bash
+python scripts/diagnose_remaining_studies.py --root "$GA_RUN_GROUP"
+```
+
+This helper only reads saved files and lives outside the hashed experiment
+packages. An outer `CalledProcessError` needs the underlying `worker.log` error;
+an abrupt task-log ending alone does not identify a termination cause.
