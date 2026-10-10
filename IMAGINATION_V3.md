@@ -93,6 +93,18 @@ unsupported hardware is recorded and skipped, never replaced with another model 
 dtype. A V100 will fail this BF16 capability check. Offload speed/memory still need
 pilot measurement. Downloaded checkpoints are locked by revision and hash.
 
+InstantMesh's Zero123++ adapter locks the authors' `sudo-ai/zero123plus-pipeline`
+repository separately from the weights, downloads `pipeline.py` at that commit,
+and passes its local file path to Diffusers. The generic community mirror is a
+dataset, not a model repository, and does not contain this pipeline. A repository
+commit is not a Diffusers community-version folder. An older lock missing the
+authors' pipeline must be regenerated in a new run identity, not edited in place.
+
+If the initial pilot stopped in `lock-models` with the community-mirror 404,
+update the code and create a new v3 `RUN_GROUP`; retain the failed directory for
+diagnostics. Setup environments and matte weights can be reused. That initial
+locking failure occurred before inference and did not consume GPU experiment time.
+
 After reviewing the pilot images, masks, resource failures and runtime:
 
 ```bash

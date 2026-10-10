@@ -8,6 +8,15 @@ separate pinned Python 3.11 image/matte environments and the existing InstantMes
 
 ## Checks actually run
 
+Post-pilot model-lock repair: the full suite passed **59 tests** in 78.507 seconds.
+New coverage rejects querying the community dataset as a model, preserves requested
+author-pipeline revisions, and verifies local custom-code loading independently of
+the model-weight revision. A live CPU-only Hub check resolved and downloaded
+`sudo-ai/zero123plus-pipeline/pipeline.py` at commit
+`983e66d28a3637ddd8e3e2fd8165cdff32230872`, with SHA256
+`d33babc5d138b832294da9e18496c52d0ea7006b47464d4e5b1bd60cd7e37acd`.
+This verifies code availability, not successful GPU reconstruction.
+
 - `python -m unittest discover -s generative_assembly/tests -v`: **58 passed**
   (23 existing + 35 new), 76.955 seconds in the final run.
 - `python -m compileall -q generative_assembly`: passed.

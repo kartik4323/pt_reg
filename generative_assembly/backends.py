@@ -61,8 +61,13 @@ def lock_models(config):
     repos = {config['images'][m] for m in config['image_models'] if m != 'gemini'}
     if 'sd15_depth' in config['image_models']: repos.add(config['images']['controlnet'])
     config['images']['revisions'] = {r: api.model_info(r, revision=config['images']['revisions'].get(r, 'main')).sha for r in sorted(repos)}
+    # Zero123++ is published by its authors as a Hub custom pipeline, not
+    # a Diffusers community script. The community mirror is a dataset and
+    # does not contain zero123plus.py; neither its model endpoint nor a
+    # mirror SHA passed as custom_revision can load this pipeline.
+    pipeline_repo = 'sudo-ai/zero123plus-pipeline'
     config['reconstruction']['revisions'] = {r: api.model_info(r, revision=config['reconstruction']['revisions'].get(r, 'main')).sha
-                                          for r in ('sudo-ai/zero123plus-v1.2', 'TencentARC/InstantMesh','diffusers/community-pipelines-mirror')}
+                                          for r in ('sudo-ai/zero123plus-v1.2', 'TencentARC/InstantMesh', pipeline_repo)}
     if config['reconstruction']['backend'] == 'instantmesh':
         repo = Path(config['reconstruction']['repo']).resolve()
         config['reconstruction']['repo'] = str(repo)
@@ -278,7 +283,8 @@ def run_reconstruction(req, out):
         model = kwargs.get('repo_id', args[0] if args else None)
         if model in cfg['revisions']: kwargs['revision'] = cfg['revisions'][model]
         path = original_download(*args, **kwargs)
-        downloaded.append(dict(path=str(path), sha256=digest(path)))
+        downloaded.append(dict(path=str(path), sha256=digest(path), repo_id=model,
+                               repo_type=kwargs.get('repo_type', 'model'), revision=kwargs.get('revision')))
         return path
     huggingface_hub.hf_hub_download = download
     original_pretrained = diffusers.DiffusionPipeline.from_pretrained
@@ -287,7 +293,16 @@ def run_reconstruction(req, out):
         if model not in cfg['revisions']: raise ValueError(f'Unpinned model: {model}')
         kwargs['revision'] = cfg['revisions'][model]
         if kwargs.get('custom_pipeline'):
-            kwargs['custom_revision']=cfg['revisions']['diffusers/community-pipelines-mirror']
+            pipeline_repo = 'sudo-ai/zero123plus-pipeline'
+            if kwargs['custom_pipeline'] not in ('zero123plus', pipeline_repo):
+                raise ValueError(f"Unsupported InstantMesh custom pipeline: {kwargs['custom_pipeline']}")
+            if pipeline_repo not in cfg['revisions']:
+                raise ValueError(f'Unpinned custom pipeline: {pipeline_repo}; regenerate model locks')
+            # Both historical and modern Diffusers accept a local .py path.
+            # Explicit download pins the code independently of the weights,
+            # without version-folder lookup or floating remote-code loading.
+            kwargs['custom_pipeline'] = download(repo_id=pipeline_repo, repo_type='model', filename='pipeline.py')
+            kwargs.pop('custom_revision', None)
         pipe=original_pretrained(model, *args, **kwargs)
         if pipe is not None:
             source=Path(inspect.getfile(type(pipe)))

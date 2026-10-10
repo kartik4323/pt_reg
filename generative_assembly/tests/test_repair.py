@@ -269,19 +269,42 @@ class RepairTests(unittest.TestCase):
                 self.assertEqual(captured['call']['true_cfg_scale'],cfg['qwen_cfg'])
             else: self.assertEqual(captured['call']['mask_image'].size,(cfg['resolution'],cfg['resolution']))
 
-    def test_reconstruction_rgba_and_custom_revision_mock(self):
+    def test_model_locks_use_author_pipeline_not_community_mirror(self):
+        calls=[]
+        class Api:
+            def model_info(self, repo, revision):
+                if repo == 'diffusers/community-pipelines-mirror':
+                    raise RuntimeError('Dataset is not a model repository')
+                calls.append((repo,revision))
+                return types.SimpleNamespace(sha='a'*40)
+        cfg=copy.deepcopy(self.cfg)
+        cfg['reconstruction']['backend']='smoke'
+        cfg['reconstruction']['revisions']={'sudo-ai/zero123plus-pipeline':'b'*40}
+        with patch.dict('sys.modules',{'huggingface_hub':types.SimpleNamespace(HfApi=Api)}):
+            result=backends.lock_models(cfg)
+        self.assertIn(('sudo-ai/zero123plus-pipeline','b'*40),calls)
+        self.assertEqual(set(result['reconstruction']['revisions']),
+                         {'sudo-ai/zero123plus-v1.2','TencentARC/InstantMesh','sudo-ai/zero123plus-pipeline'})
+
+    def test_reconstruction_rgba_and_pinned_local_pipeline_mock(self):
         repo=self.root/'repo'; repo.mkdir(); script=repo/'run.py'
         script.write_text('if not args.no_rembg:\n    image = resize_foreground(image, 0.85)\n')
         rgba=self.root/'input.png'; arr=np.zeros((64,64,4),np.uint8); arr[10:30,20:30]=[150,150,150,255]; Image.fromarray(arr).save(rgba)
         cfg=copy.deepcopy(self.cfg['reconstruction']); cfg.update(repo=str(repo),commit='a'*40,input_mode='rgba',
-            local_hashes={'run.py':digest(script)},revisions={'sudo-ai/zero123plus-v1.2':'b'*40,'diffusers/community-pipelines-mirror':'c'*40})
+            local_hashes={'run.py':digest(script)},revisions={'sudo-ai/zero123plus-v1.2':'b'*40,'sudo-ai/zero123plus-pipeline':'c'*40})
         captured={}
         class Pipeline:
             @staticmethod
             def from_pretrained(model,**kw): captured.update(kw)
         module=types.SimpleNamespace(DiffusionPipeline=Pipeline)
-        hub=types.SimpleNamespace(hf_hub_download=lambda *a,**kw: str(script))
+        downloads=[]
+        def download(*args,**kwargs):
+            downloads.append(kwargs)
+            return str(script)
+        hub=types.SimpleNamespace(hf_hub_download=download)
         def run(*args,**kwargs):
+            with self.assertRaisesRegex(ValueError,'Unsupported InstantMesh custom pipeline'):
+                module.DiffusionPipeline.from_pretrained('sudo-ai/zero123plus-v1.2',custom_pipeline='unknown')
             module.DiffusionPipeline.from_pretrained('sudo-ai/zero123plus-v1.2',custom_pipeline='zero123plus')
             self.assertIn('--no_rembg',sys.argv)
             with Image.open(sys.argv[2]) as image: self.assertEqual(image.mode,'RGBA'); self.assertEqual(image.size,(512,512))
@@ -291,7 +314,14 @@ class RepairTests(unittest.TestCase):
              'huggingface_hub':hub}),patch.object(backends.subprocess,'check_output',side_effect=['a'*40,'']),\
              patch.object(backends.runpy,'run_path',side_effect=run),patch.object(backends.importlib.metadata,'version',return_value='mock'):
             result=backends.run_reconstruction(dict(config=cfg,image=str(rgba),smoke=False),self.root)
-        self.assertEqual(captured['custom_revision'],'c'*40); self.assertTrue(result['foreground_resize'])
+        self.assertNotIn('custom_revision',captured)
+        self.assertEqual(captured['custom_pipeline'],str(script))
+        self.assertEqual(captured['revision'],'b'*40)
+        self.assertEqual(downloads,[dict(repo_id='sudo-ai/zero123plus-pipeline',repo_type='model',
+                                         filename='pipeline.py',revision='c'*40)])
+        self.assertEqual(result['downloaded'][0]['sha256'],digest(script))
+        self.assertEqual(result['downloaded'][0]['revision'],'c'*40)
+        self.assertTrue(result['foreground_resize'])
         self.assertEqual(result['local_hashes']['run.py'],digest(script))
 
     def test_worker_failure_keeps_diagnostics_and_peak_fields(self):
