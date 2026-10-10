@@ -19,6 +19,7 @@ def main():
             q.add_argument('--stages',nargs='+',default=['E0','E1','E2','E3','E4','E5'],choices=[f'E{i}' for i in range(8)])
             q.add_argument('--split',default='dev',choices=['train','dev','test','real'])
             q.add_argument('--limit',type=int); q.add_argument('--retry-failed',action='store_true'); q.add_argument('--allow-failures',action='store_true')
+            q.add_argument('--case-ids',nargs='+'); q.add_argument('--source-limit',type=int)
         if name=='train': q.add_argument('--retry-failed',action='store_true')
         if name=='evaluate': q.add_argument('--split',default='dev',choices=['train','dev','test','real'])
         if name=='export': q.add_argument('--out',required=True); q.add_argument('--kind',choices=['pipeline','research'],default='pipeline')
@@ -71,16 +72,21 @@ def main():
         return
     if args.split=='test': require_frozen(store)
     records=[c for c in ds['cases'] if c['split']==args.split]
+    if args.source_limit is not None: records=data.balanced_cases(ds['cases'],args.split,args.source_limit)
+    if args.case_ids:
+        wanted=set(args.case_ids)
+        records=[c for c in records if c['id'] in wanted]
+        if {c['id'] for c in records}!=wanted: raise ValueError('Unknown case ID or case from wrong split')
     if args.limit: records=records[:args.limit]
     if not records: raise ValueError(f'No cases in {args.split}')
-    from .experiments import STAGES
+    from .experiments import STAGES,run_stage
     for stage in args.stages:
         for rec in records:
             case=data.load_case(args.dataset,rec,cfg)
             if stage=='E6':
                 from .learning import infer
                 rows=infer(store,case)
-            else: rows=STAGES[stage](store,case)
+            else: rows=run_stage(store,stage,case,args.allow_failures)
             store.index()
             if any(r['status']=='failed' for r in rows) and not args.allow_failures:
                 raise RuntimeError(f'{stage} failure recorded; inspect error.txt/worker.log. Use --retry-failed after fixing the environment, or --allow-failures to retain failures in a benchmark.')

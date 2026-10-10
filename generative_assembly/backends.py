@@ -1,6 +1,8 @@
 """Isolated real model workers. Smoke substitutes are explicitly branded."""
 from __future__ import annotations
 import importlib.metadata
+import ast
+import inspect
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,25 @@ import time
 import numpy as np
 from PIL import Image
 from .storage import digest, read, write
+from .resources import gpu_admission, worker_budget
+
+
+def verify_preprocessing(path):
+    """Fail closed if pinned upstream no longer couples resizing to rembg."""
+    tree=ast.parse(Path(path).read_text(encoding='utf-8'))
+    all_resize=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='resize_foreground']
+    guarded=[]
+    for node in ast.walk(tree):
+        if (isinstance(node,ast.If) and isinstance(node.test,ast.UnaryOp) and isinstance(node.test.op,ast.Not)
+            and isinstance(node.test.operand,ast.Attribute) and node.test.operand.attr=='no_rembg'
+            and isinstance(node.test.operand.value,ast.Name) and node.test.operand.value.id=='args'):
+            guarded.extend(n for n in ast.walk(node) if n in all_resize)
+    if len(all_resize)!=1 or len(guarded)!=1:
+        raise ValueError('Unsupported InstantMesh preprocessing: verify pinned run.py no_rembg/resize_foreground contract')
+    call=all_resize[0]
+    if len(call.args)<2 or not isinstance(call.args[1],ast.Constant) or call.args[1].value!=.85:
+        raise ValueError('InstantMesh foreground-fill convention changed')
+    return dict(no_rembg_disables_upstream_resize=True,upstream_fill=.85,source_sha256=digest(path))
 
 
 def launch(request, directory, python=None, timeout=3600):
@@ -26,9 +47,10 @@ def launch(request, directory, python=None, timeout=3600):
         env['PATH'] = os.path.dirname(python) + os.pathsep + env.get('PATH', '')
     package_parent = str(Path(__file__).resolve().parent.parent)
     env['PYTHONPATH'] = package_parent + os.pathsep + env.get('PYTHONPATH', '')
-    with (directory / 'worker.log').open('w', encoding='utf-8') as log:
-        subprocess.run([python or sys.executable, '-m', 'generative_assembly.worker', str(directory / 'request.json')],
-                       stdout=log, stderr=subprocess.STDOUT, env=env, check=True, timeout=timeout)
+    with gpu_admission(request,directory), worker_budget(request,directory,timeout) as allowed:
+        with (directory / 'worker.log').open('w', encoding='utf-8') as log:
+            subprocess.run([python or sys.executable, '-m', 'generative_assembly.worker', str(directory / 'request.json')],
+                           stdout=log, stderr=subprocess.STDOUT, env=env, check=True, timeout=allowed)
     return read(directory / 'backend.json')
 
 
@@ -40,11 +62,23 @@ def lock_models(config):
     if 'sd15_depth' in config['image_models']: repos.add(config['images']['controlnet'])
     config['images']['revisions'] = {r: api.model_info(r, revision=config['images']['revisions'].get(r, 'main')).sha for r in sorted(repos)}
     config['reconstruction']['revisions'] = {r: api.model_info(r, revision=config['reconstruction']['revisions'].get(r, 'main')).sha
-                                          for r in ('sudo-ai/zero123plus-v1.2', 'TencentARC/InstantMesh')}
+                                          for r in ('sudo-ai/zero123plus-v1.2', 'TencentARC/InstantMesh','diffusers/community-pipelines-mirror')}
     if config['reconstruction']['backend'] == 'instantmesh':
         repo = Path(config['reconstruction']['repo']).resolve()
         config['reconstruction']['repo'] = str(repo)
         config['reconstruction']['commit'] = subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'], text=True).strip()
+        from omegaconf import OmegaConf
+        upstream = OmegaConf.load(repo/config['reconstruction']['config'])
+        assets = [repo/'run.py',repo/config['reconstruction']['config']]
+        assets += list((repo/'src').rglob('*.py'))
+        external=[]
+        for key in ('unet_path','model_path'):
+            p = repo/str(upstream.infer_config[key])
+            if p.is_file():
+                if p.is_relative_to(repo): assets.append(p)
+                else: external.append(p)
+        config['reconstruction']['local_hashes'] = {str(p.relative_to(repo)):digest(p) for p in assets}
+        config['reconstruction']['external_checkpoint_hashes']={str(p):digest(p) for p in external}
     return config
 
 
@@ -101,6 +135,7 @@ def run_image(req, out):
     cfg, model = req['config'], req['model']
     if req['smoke']:
         shutil.copy2(req['image'], out / 'image.png')
+        shutil.copy2(req['image'], out / 'image_raw.png')
         return dict(kind='smoke_copy_NOT_image_completion', model=model, smoke=True)
     if model == 'gemini':
         return run_gemini_image(req, out)
@@ -110,6 +145,12 @@ def run_image(req, out):
     repo = cfg[model]
     if not revisions.get(repo) or len(revisions[repo]) != 40:
         raise ValueError('Run lock-models first; exact image checkpoint revisions required')
+    if model=='qwen' and cfg['device'].startswith('cuda') and not torch.cuda.is_bf16_supported():
+        raise RuntimeError('unsupported_capability: Qwen requires BF16 support; no silent dtype substitution')
+    if model=='qwen' and cfg['cpu_offload']:
+        import psutil
+        if psutil.virtual_memory().available < cfg.get('qwen_host_free_gib',64)*1024**3:
+            raise RuntimeError('unsupported_capability: Qwen full-weight CPU offload requires 64 GiB available host memory')
     dtype = getattr(torch, 'bfloat16' if model == 'qwen' else cfg['dtype'])
     kwargs = dict(torch_dtype=dtype, revision=revisions[repo], safety_checker=None)
     if model == 'sd15_depth':
@@ -119,6 +160,7 @@ def run_image(req, out):
     elif model == 'sd15':
         pipe = StableDiffusionInpaintPipeline.from_pretrained(repo, **kwargs)
     elif model == 'sdxl':
+        kwargs.pop('safety_checker',None)
         pipe = AutoPipelineForInpainting.from_pretrained(repo, **kwargs)
     elif model == 'qwen':
         from diffusers import QwenImageEditPlusPipeline
@@ -127,23 +169,28 @@ def run_image(req, out):
     else:
         raise ValueError(f'Unsupported image model {model}')
     if cfg['cpu_offload'] and cfg['device'].startswith('cuda'):
-        pipe.enable_model_cpu_offload()
+        gpu_id=int(cfg['device'].split(':')[1]) if ':' in cfg['device'] else 0
+        if model=='qwen' and cfg.get('qwen_offload')=='sequential': pipe.enable_sequential_cpu_offload(gpu_id=gpu_id)
+        else: pipe.enable_model_cpu_offload(gpu_id=gpu_id)
     else: pipe.to(cfg['device'])
     image = Image.open(req['image']).convert('RGB')
+    native = cfg.get('resolution') or image.width
+    source_dimensions=list(image.size)
+    image=image.resize((native,native),Image.Resampling.LANCZOS)
     params = dict(prompt=req['prompt'], generator=torch.Generator(device='cpu').manual_seed(req['seed']),
                   num_inference_steps=cfg['qwen_steps'] if model == 'qwen' else cfg['steps'])
     if model == 'qwen':
         use_depth = cfg.get('qwen_use_depth', False)
         params.update(image=[image, Image.open(req['control']).convert('RGB')] if use_depth else [image],
                       true_cfg_scale=cfg['qwen_cfg'], guidance_scale=1.0,
-                      negative_prompt=' ', prompt=req['prompt'] +
+                      negative_prompt=cfg.get('qwen_negative_prompt',' '),width=native,height=native, prompt=req['prompt'] +
                       (' The second image is a depth rendering of the same input, not another object.' if use_depth else ''))
     else:
-        neg_prompt = 'vignette, shadow, dark background, grey background, floor, table, gradient, noisy, blurry, border, frame, studio background'
-        params.update(image=image, mask_image=Image.open(req['mask']).convert('L'), width=image.width, height=image.height,
+        neg_prompt = cfg.get('negative_prompt','vignette, shadow, dark background, grey background, floor, table')
+        params.update(image=image, mask_image=Image.open(req['mask']).convert('L').resize(image.size,Image.Resampling.NEAREST), width=image.width, height=image.height,
                       guidance_scale=cfg['guidance'], negative_prompt=neg_prompt)
         if model == 'sd15_depth':
-            params.update(control_image=Image.open(req['control']).convert('RGB'), controlnet_conditioning_scale=cfg['control_strength'])
+            params.update(control_image=Image.open(req['control']).convert('RGB').resize(image.size,Image.Resampling.NEAREST), controlnet_conditioning_scale=cfg['control_strength'])
     with torch.inference_mode():
         result = pipe(**params)
     if getattr(result, 'nsfw_content_detected', None) and any(result.nsfw_content_detected):
@@ -171,7 +218,13 @@ def run_image(req, out):
     # ─────────────────────────────────────────────────────────────────────────
     output_image.save(out / 'image.png')
     return dict(kind='pretrained_image_generation', model=repo, revision=revisions[repo], revisions=revisions, dtype=str(dtype),
-                dimensions=list(output_image.size), diffusers=importlib.metadata.version('diffusers'), torch=torch.__version__,
+                dimensions=list(output_image.size), source_dimensions=source_dimensions,
+                negative_prompt=params.get('negative_prompt'), generation_resolution=native,
+                interface='instruction_edit' if model=='qwen' else 'inpainting',
+                offload=cfg.get('qwen_offload','model') if cfg['cpu_offload'] else 'none',
+                generation_settings={k:v for k,v in params.items() if k in ('width','height','guidance_scale',
+                    'true_cfg_scale','num_inference_steps','controlnet_conditioning_scale')},
+                diffusers=importlib.metadata.version('diffusers'), torch=torch.__version__,
                 bg_obj_threshold=bg_obj_threshold)
 
 
@@ -198,10 +251,20 @@ def run_reconstruction(req, out):
         raise ValueError('InstantMesh commit differs from model lock')
     dirty = subprocess.check_output(['git','-C',str(repo),'diff','--name-only','HEAD'], text=True).strip()
     if dirty: raise ValueError('InstantMesh tracked source has uncommitted changes')
+    for relative, expected in cfg.get('local_hashes',{}).items():
+        if digest(repo/relative)!=expected: raise ValueError(f'Changed pinned InstantMesh asset: {relative}')
+    for path,expected in cfg.get('external_checkpoint_hashes',{}).items():
+        if digest(path)!=expected: raise ValueError(f'Changed pinned external InstantMesh checkpoint: {path}')
+    preprocessing=verify_preprocessing(repo/'run.py')
 
     # The official run.py path accepts one conditioning image. A collage is not
     # a calibrated multi-view bypass, and independent edits are not consistent views.
     input_image_path = req['image']
+    transform = None
+    if cfg.get('input_mode')=='rgba':
+        from .quality import normalize_foreground
+        input_image_path=str(out/'reconstruction_input.png')
+        transform=normalize_foreground(req['image'],input_image_path,cfg.get('foreground_fill',.85))
     multiview_images = req.get('multiview_images', [])
     if multiview_images:
         raise ValueError('InstantMesh grid bypass is unsupported by this adapter; provide a single image')
@@ -219,10 +282,17 @@ def run_reconstruction(req, out):
         return path
     huggingface_hub.hf_hub_download = download
     original_pretrained = diffusers.DiffusionPipeline.from_pretrained
+    used_pipeline_sources={}
     def pretrained(model, *args, **kwargs):
         if model not in cfg['revisions']: raise ValueError(f'Unpinned model: {model}')
         kwargs['revision'] = cfg['revisions'][model]
-        return original_pretrained(model, *args, **kwargs)
+        if kwargs.get('custom_pipeline'):
+            kwargs['custom_revision']=cfg['revisions']['diffusers/community-pipelines-mirror']
+        pipe=original_pretrained(model, *args, **kwargs)
+        if pipe is not None:
+            source=Path(inspect.getfile(type(pipe)))
+            used_pipeline_sources[str(source)]=digest(source)
+        return pipe
     diffusers.DiffusionPipeline.from_pretrained = staticmethod(pretrained)
     sys.path.insert(0, str(repo))
     os.chdir(repo)
@@ -232,19 +302,36 @@ def run_reconstruction(req, out):
     meshes = list((out/'upstream').glob('*/meshes/*.obj'))
     if len(meshes) != 1: raise RuntimeError('Expected exactly one InstantMesh output mesh')
     shutil.copy2(meshes[0], out/'mesh.obj')
+    from diffusers.utils import HF_MODULES_CACHE
+    custom_files=[p for p in Path(HF_MODULES_CACHE).glob('diffusers_modules/**/*.py') if p.is_file()]
     return dict(kind='InstantMesh', commit=commit, run_py_sha256=digest(repo/'run.py'), revisions=cfg['revisions'],
-                downloaded=downloaded, foreground_resize=False, diffusers=importlib.metadata.version('diffusers'),
+                downloaded=downloaded, local_hashes=cfg.get('local_hashes',{}),
+                custom_pipeline_hashes={str(p):digest(p) for p in custom_files},
+                actual_pipeline_source_hashes=used_pipeline_sources,
+                external_checkpoint_hashes=cfg.get('external_checkpoint_hashes',{}),
+                foreground_resize=transform is not None, foreground_transform=transform,
+                preprocessing_verification=preprocessing,
+                input_mode=cfg.get('input_mode','legacy_rgb'),diffusers=importlib.metadata.version('diffusers'),
                 multiview_grid=False, n_views_in_grid=1)
 
 
 def worker(path):
     req, out = read(path), Path(path).resolve().parent
     start = time.time()
-    result = run_image(req, out) if req['kind'] == 'image' else run_reconstruction(req, out)
-    result['seconds'] = time.time()-start
+    result={}
     try:
-        import torch
-        result['peak_cuda_allocated_bytes'] = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None
-        result['peak_cuda_reserved_bytes'] = torch.cuda.max_memory_reserved() if torch.cuda.is_available() else None
-    except ImportError: pass
-    write(out/'backend.json', result)
+        if req['kind']=='matte':
+            from .quality import segment
+            result=segment(req,out)
+        else: result = run_image(req, out) if req['kind'] == 'image' else run_reconstruction(req, out)
+    except Exception as exc:
+        result=dict(failed=True,error=f'{type(exc).__name__}: {exc}')
+        raise
+    finally:
+        result['seconds'] = time.time()-start
+        try:
+            import torch
+            result['peak_cuda_allocated_bytes'] = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None
+            result['peak_cuda_reserved_bytes'] = torch.cuda.max_memory_reserved() if torch.cuda.is_available() else None
+        except ImportError: pass
+        write(out/'backend.json', result)

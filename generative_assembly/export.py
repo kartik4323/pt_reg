@@ -57,6 +57,9 @@ def bundle(store,destination,kind='pipeline'):
     write(destination/'dataset'/'dataset.json',ds)
     if kind=='research' and (base/'evaluator_only').exists(): shutil.copytree(base/'evaluator_only',destination/'dataset'/'evaluator_only')
     if (store.root/'evaluation').exists(): shutil.copytree(store.root/'evaluation',destination/'evaluation')
+    if (store.root/'priors').exists(): shutil.copytree(store.root/'priors',destination/'priors')
+    for name in ('review.json','blinded_review.html'):
+        if (store.root/name).exists(): shutil.copy2(store.root/name,destination/name)
     if (store.root/'pseudo_labels').exists(): shutil.copytree(store.root/'pseudo_labels',destination/'pseudo_labels')
     shutil.copytree(Path(__file__).parent,destination/'source'/'generative_assembly',ignore=shutil.ignore_patterns('__pycache__','.pytest_cache'))
     recipe=dict(recipe,bundle_kind=kind,exported_jobs=len(selected),pretrained_weights='download exact locked revisions; not duplicated in bundle',

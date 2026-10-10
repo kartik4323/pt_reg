@@ -5,9 +5,14 @@ from .storage import read
 DEFAULT = {
     'schema_version': 1, 'smoke': False, 'seed': 4101, 'points': 512, 'evaluation_points': 2048,
     'pixels': 512, 'splat_radius': 2, 'canvas_extent': 1.5,
+    'render_points': 8192, 'framing_fill': 0.0,
+    'matte': {'enabled': False, 'python': None, 'model': 'isnet-general-use',
+              'weights': None, 'sha256': None, 'threshold': 128,
+              'min_occupancy': 0.01, 'max_occupancy': 0.85,
+              'min_retention': 0.95, 'max_border': 0.02, 'min_dominant_fraction': 0.95},
     # Compare imagination models in experiment:
     # 'sd15_depth' : SD 1.5 with ControlNet depth conditioning
-    # 'sd15'       : SD 1.5 pure inpainting without depth blocker
+    # 'sd15'       : SD 1.5 pure inpainting; depth is a soft conditioning ablation
     # 'gemini'     : Google Gemini multimodal API
     # 'sdxl'       : SDXL inpainting
     'image_models': ['sd15_depth', 'sd15'], 'input_types': ['F', 'A'], 'image_seeds': [11, 23, 37, 51],
@@ -23,6 +28,13 @@ DEFAULT = {
     # 'short'     : short, concrete, visually descriptive (recommended fix)
     # 'category'  : short prompt + explicit category name appended
     'prompt_variant': 'short',
+    'prompt_bottle': ('One complete intact smooth opaque grey bottle continuing the supplied '
+                      'exterior in the same camera view and location. Full bottle outline visible, '
+                      'pure white background, no decoration, labels, text, rubble, shadows or extra objects.'),
+    'prompt_bottle_edit': ('Complete the grey bottle in the supplied image. Continue its surviving '
+                          'exterior into one intact smooth opaque bottle; preserve the camera view and '
+                          'location. Show its full outline on pure white, without labels, decoration, '
+                          'rubble, texture, shadows or additional objects.'),
 
     # Original prompt kept for reference / ablation
     'prompt_original': (
@@ -48,7 +60,7 @@ DEFAULT = {
     'mask_type': 'exterior',
 
     # ── Surface rendering (FIX #1) ────────────────────────────────────────────
-    # 'surface'   : Poisson mesh + Phong shading (requires open3d; falls back if unavailable)
+    # 'surface'   : diagnostic Poisson mesh; raises on failure, never silently falls back
     # 'splat'     : original point-splat renderer
     'render_mode': 'surface',
 
@@ -73,14 +85,18 @@ DEFAULT = {
     'n_instantmesh_views': 1,
 
     'images': {'python': None, 'device': 'cuda', 'dtype': 'float16', 'cpu_offload': True,
+               'negative_prompt': 'rubble, concrete, stone, debris, hands, decoration, labels, text, watermark, vignette, shadow, dark background, grey background, floor, table, gradient, noisy, blurry, border, frame',
+               'resolution': None,
                'bg_obj_threshold': 0,
                'steps': 30, 'qwen_steps': 40, 'guidance': 7.5, 'control_strength': 0.5, 'qwen_cfg': 4.0,
+               'qwen_offload': 'model', 'qwen_host_free_gib': 64,
                'sd15_depth': 'stable-diffusion-v1-5/stable-diffusion-inpainting',
                'sd15': 'stable-diffusion-v1-5/stable-diffusion-inpainting',
                'controlnet': 'lllyasviel/control_v11f1p_sd15_depth',
                'qwen': 'Qwen/Qwen-Image-Edit-2509',
                'sdxl': 'diffusers/stable-diffusion-xl-1.0-inpainting-0.1', 'revisions': {}},
     'reconstruction': {'backend': 'instantmesh', 'python': None, 'repo': None, 'commit': None,
+                       'input_mode': 'legacy_rgb', 'foreground_fill': 0.85,
                        'config': 'configs/instant-mesh-large.yaml', 'steps': 75, 'seed': 42,
                        'revisions': {}, 'timeout_seconds': 3600,
                        # FIX #8: Reject templates with degenerate shape before feeding to E3.
@@ -90,6 +106,7 @@ DEFAULT = {
                        # Above this, the template is considered degenerate.
                        'template_max_flatness': 0.85},
     'solver': {'candidates': 32, 'patches': 32, 'contact_fraction': 0.08, 'contact_cap': 0.15,
+               'continuous_scale': False, 'scale_bounds': [0.5, 6.0],
                'template_weight': 0.3, 'refine_evaluations': 25, 'alignment_starts': 8,
                'alignment_iterations': 8, 'scales': [1.0, 1.5, 2.0],
                'gate_exterior': 0.06, 'gate_contact_ratio': 1.1},
@@ -98,7 +115,9 @@ DEFAULT = {
     'robustness': {'noise': [0.0025, 0.005, 0.01], 'dropout': [0.25, 0.5],
                    'repeats': 3, 'missing_piece': True, 'erosion_fraction': 0.1},
     'evaluation': {'threshold': 0.01, 'bootstrap': 2000, 'success_gain': 0.05, 'damage_max': 0.05},
-    'oracles': True, 'resources': {'minimum_free_gib': 10, 'worker_timeout_seconds': 3600}
+    'oracles': True, 'oracle_full_frame_control': False, 'resources': {'minimum_free_gib': 10, 'worker_timeout_seconds': 3600,
+        'gpu_preflight': False, 'image_free_gib': 8, 'reconstruction_free_gib': 24,
+        'poll_seconds': 30, 'wait_seconds': 1800, 'budget_path': None, 'budget_bucket': 'screen'}
 }
 
 
@@ -119,6 +138,17 @@ def load(path):
         cfg['images']['bg_obj_threshold'] = supplied['bg_obj_threshold']
     if cfg['mask_type'] not in ('original', 'inverted', 'exterior', 'none'):
         raise ValueError('Unknown mask_type')
+    if cfg['render_mode'] not in ('splat', 'surface', 'surfel'):
+        raise ValueError('Unknown renderer')
+    if not 0 <= cfg['framing_fill'] < 1 or cfg['render_points'] < 16:
+        raise ValueError('Invalid input framing/render budget')
+    if cfg['reconstruction']['input_mode'] not in ('legacy_rgb', 'rgba', 'raw_rgb'):
+        raise ValueError('Unknown reconstruction input mode')
+    lo, hi = cfg['solver']['scale_bounds']
+    if not 0 < lo < hi or not 0 < cfg['reconstruction']['foreground_fill'] < 1:
+        raise ValueError('Invalid scale bounds/foreground fill')
+    if cfg['matte']['enabled'] and cfg['images']['bg_obj_threshold']:
+        raise ValueError('Matte processing must not use destructive legacy whitening')
     if cfg['prior_count'] < 1:
         raise ValueError('prior_count must be positive')
     if cfg['primary_model'] not in cfg['image_models'] or cfg['primary_input'] not in cfg['input_types']:

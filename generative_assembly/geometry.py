@@ -152,6 +152,15 @@ def candidates(case, cfg, seed, budget=None, template=None):
     return np.asarray(bank)[best_indices], np.asarray(scores)[best_indices]
 
 
+def template_diagnostics(template):
+    pts=np.asarray(template,float)
+    _,_,basis=np.linalg.svd(pts-pts.mean(0),full_matrices=False)
+    dimensions=np.sort(np.ptp((pts-pts.mean(0))@basis.T,axis=0))
+    return dict(pca_dimensions=dimensions.tolist(),thickness=float(dimensions[0]),
+                second_to_thickness=float(dimensions[1]/max(dimensions[0],1e-12)),
+                shape_gate='PCA_surface_proxy_not_solid_validation')
+
+
 def check_template_shape(template, cfg):
     """Return (is_valid, reason_str).
 
@@ -192,7 +201,7 @@ def check_template_shape(template, cfg):
     return True, 'ok'
 
 
-def fit_template(template, case, cfg, seed):
+def fit_template(template, case, cfg, seed, *, evaluator_diagnostic=False):
     """One global similarity fitted only to observed reference-fragment evidence.
 
     Returns (aligned_points, fit_dict).
@@ -205,8 +214,9 @@ def fit_template(template, case, cfg, seed):
 
     # ── FIX #8: Reject degenerate flat-slab templates ────────────────────────
     is_valid, reason = check_template_shape(template, cfg)
-    if not is_valid:
-        return None, {'rejected': reason, 'uses_ground_truth_alignment': False}
+    if not is_valid and not evaluator_diagnostic:
+        return None, {'rejected': reason, 'uses_ground_truth_alignment': False,
+                      'shape_diagnostics':template_diagnostics(template)}
     # ─────────────────────────────────────────────────────────────────────────
 
     center = template.mean(0)
@@ -220,9 +230,19 @@ def fit_template(template, case, cfg, seed):
     if len(hold) < 3: hold = p[::2]
     rng = np.random.default_rng(seed)
     rotations = [np.eye(3)] + list(Rotation.random(max(0, cfg['alignment_starts']-1), random_state=rng).as_matrix())
+    if cfg.get('continuous_scale'):
+        if cfg.get('camera_basis') is not None:
+            basis=np.asarray(cfg['camera_basis'],float)
+            if basis.shape==(3,3) and np.linalg.det(basis)>0: rotations.extend([basis,basis.T])
+        source_axes=np.linalg.svd(unit,full_matrices=False)[2].T
+        target_axes=np.linalg.svd(fit-fit.mean(0),full_matrices=False)[2].T
+        for signs in ((1,1,1),(1,-1,-1),(-1,1,-1),(-1,-1,1)):
+            R=target_axes@np.diag(signs)@source_axes.T
+            if np.linalg.det(R)>0: rotations.append(R)
     best = None
-    for s in cfg['scales']:
+    for initial_scale in cfg['scales']:
         for R in rotations:
+            s=float(np.clip(initial_scale,*cfg.get('scale_bounds',[.5,6.]))) if cfg.get('continuous_scale') else float(initial_scale)
             q = unit @ R.T * s
             T = np.eye(4); T[:3, 3] = fit.mean(0) - q.mean(0)
             for _ in range(cfg['alignment_iterations']):
@@ -230,15 +250,69 @@ def fit_template(template, case, cfg, seed):
                 _, ids = cKDTree(aligned).query(fit)
                 delta = kabsch(aligned[ids], fit)
                 T = delta @ T
+                if cfg.get('continuous_scale'):
+                    current=apply(q,T)
+                    _,ids=cKDTree(current).query(fit)
+                    a=current[ids]; ac=a-a.mean(0); bc=fit-fit.mean(0)
+                    distance=np.linalg.norm(a-fit,axis=1)
+                    w=np.minimum(1.,.03/np.maximum(distance,1e-10))
+                    factor=float(np.sum(w[:,None]*ac*bc)/max(np.sum(w[:,None]*ac*ac),1e-12))
+                    lo,hi=cfg.get('scale_bounds',[.5,6.])
+                    new_s=float(np.clip(s*max(factor,1e-6),lo,hi)); ratio=new_s/s
+                    pivot=a.mean(0)
+                    T[:3,3]=pivot+(T[:3,3]-pivot)*ratio
+                    s=new_s; q=unit@R.T*s
             aligned = apply(q, T)
-            error = float(cKDTree(aligned).query(fit)[0].mean())
+            error = float(np.minimum(cKDTree(aligned).query(fit)[0],.1).mean()) if cfg.get('continuous_scale') else float(cKDTree(aligned).query(fit)[0].mean())
             if best is None or error < best[0]:
                 best = error, aligned, s, R, T
     error, q, s, R, T = best
+    similarity=np.eye(4); similarity[:3,:3]=(T[:3,:3]@R)*s/max(2*radius,1e-10)
+    similarity[:3,3]=T[:3,3]-similarity[:3,:3]@center
     return q, dict(fit_error=error, heldout_error=float(cKDTree(q).query(hold)[0].mean()),
                     source_center=center.tolist(), source_radius=float(radius), scale=float(s),
                     rotation=(T[:3, :3] @ R).tolist(), translation=T[:3, 3].tolist(),
-                    uses_ground_truth_alignment=False)
+                    similarity_transform=similarity.tolist(),continuous_scale=bool(cfg.get('continuous_scale')),
+                    fit_indices=use[::2].tolist(),heldout_indices=use[1::2].tolist(),
+                    shape_diagnostics=template_diagnostics(template),uses_ground_truth_alignment=evaluator_diagnostic,
+                    evaluator_diagnostic=evaluator_diagnostic,quality_gate_reason=reason)
+
+
+def enclosure_error(case,poses,mesh,cfg):
+    """Buffered outside distance, only for verified watertight meshes."""
+    if mesh is None or not mesh.is_watertight: return None
+    try:
+        points=np.concatenate([apply(p,T) for p,T in zip(case['points'],poses)])
+        outside=~mesh.contains(points)
+        distance=mesh.nearest.on_surface(points)[1]
+        return float(np.maximum(distance-cfg.get('enclosure_buffer',.02),0)[outside].sum()/len(points))
+    except (ImportError,ModuleNotFoundError): return None
+
+
+def choose_assembly(case, bank, cfg, hypotheses, meshes=None):
+    """Compare every gated proposal under one common input-only objective."""
+    baseline,diag=solve(case,bank,cfg,None,'gated',True)
+    candidates=[(baseline,diag,None)]
+    meshes=meshes or {}
+    for name,template,error in hypotheses:
+        poses,details=solve(case,bank,cfg,template,'gated',True,error)
+        if details['template_accepted']: candidates.append((poses,details,name))
+    def objective(poses):
+        value=contact_score(case,poses,cfg)+penetration_proxy(case,poses)
+        if hypotheses:
+            value+=cfg['template_weight']*min(exterior_score(case,poses,p) for _,p,_ in hypotheses)
+            enclosures=[enclosure_error(case,poses,meshes.get(name),cfg) for name,_,_ in hypotheses]
+            available=[v for v in enclosures if v is not None]
+            if available: value+=cfg.get('enclosure_weight',.1)*min(available)
+        return float(value)
+    scored=[objective(p) for p,_,_ in candidates]
+    rank=int(np.argmin(scored)); poses,details,name=candidates[rank]
+    details=dict(details,selected_prior=name,abstained=name is None,
+        selection_objective='common_contact_penetration_min_exterior_input_only',
+        baseline_objective=scored[0],selected_objective=scored[rank],
+        candidates_considered=len(candidates),uses_ground_truth=False)
+    details['enclosure_measured']=any(enclosure_error(case,poses,m,cfg) is not None for m in meshes.values())
+    return poses,details
 
 
 def exterior_score(case, poses, template):

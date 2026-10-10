@@ -1,8 +1,8 @@
 """Deterministic CPU orthographic point-splat rendering with camera/depth provenance.
 
 Changes vs original:
-  - render_surface(): mesh-based rendering with Phong shading when trimesh is available,
-    falls back to point splatting if not.
+  - render_surface(): explicitly diagnostic Poisson surface; never silently falls back.
+  - render_surfel(): bounded tangent support on original observed point samples.
   - tight_crop(): crops the canvas to the fragment silhouette with a small border margin,
     so the subject fills the frame instead of floating in a large white void.
   - inverted_mask(): returns a mask covering the BACKGROUND (region SD should fill in
@@ -14,6 +14,8 @@ import numpy as np
 from scipy.ndimage import binary_dilation, label
 from PIL import Image
 from .geometry import frame
+from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
 
 
 # ── Camera ─────────────────────────────────────────────────────────────────────
@@ -35,7 +37,7 @@ def camera_for(points, pixels, extent, radius=2, n_views=1):
                     projection='orthographic', view_scores=scores,
                     selected_from='reference_fragment_only')
 
-    # Multi-view: n_views equally-spaced azimuth rotations around the Z axis,
+    # Multi-view: n_views equally-spaced rotations around the actual camera up axis,
     # starting from the canonical best view so the first camera is always comparable.
     base_cam = camera_for(points, pixels, extent, radius, n_views=1)
     B0 = np.asarray(base_cam['basis'])
@@ -44,7 +46,7 @@ def camera_for(points, pixels, extent, radius=2, n_views=1):
         theta = 2 * np.pi * i / n_views
         c, s = np.cos(theta), np.sin(theta)
         # Rotate around the world-up axis (column 1 of B0)
-        Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], float)
+        Rz = Rotation.from_rotvec(B0[:,1]*theta).as_matrix()
         B = Rz @ B0
         cameras.append(dict(basis=B.tolist(), pixels=pixels, extent=extent,
                             projection='orthographic', azimuth_index=i,
@@ -57,7 +59,7 @@ def camera_for(points, pixels, extent, radius=2, n_views=1):
 def render(points, normals, exterior, camera, radius=2):
     size, extent = camera['pixels'], camera['extent']
     B = np.asarray(camera['basis'])
-    q = np.asarray(points) @ B
+    q = (np.asarray(points)-np.asarray(camera.get('center',[0,0,0]))) @ B
     u = np.rint((q[:, 0]/(2*extent)+0.5)*(size-1)).astype(int)
     v = np.rint((0.5-q[:, 1]/(2*extent))*(size-1)).astype(int)
     depth = np.full(size*size, -np.inf)
@@ -90,13 +92,56 @@ def render(points, normals, exterior, camera, radius=2):
     return result
 
 
+def frame_observed(camera, points, fill):
+    if not fill: return dict(camera)
+    B = np.asarray(camera['basis']); q = np.asarray(points)@B
+    center_q = (q.min(0)+q.max(0))/2
+    extent = max(float(np.ptp(q[:,:2],axis=0).max())/(2*fill),1e-6)
+    return dict(camera, center=(center_q@B.T).tolist(), extent=extent,
+                framing_fill=fill, image_transform='input_derived_camera', projection='orthographic')
+
+
+def render_surfel(points, normals, exterior, camera, radius=2):
+    """Bounded tangent disks, not Poisson completion; ids reference observed samples."""
+    points = np.asarray(points,float); normals = np.asarray(normals,float)
+    if normals.shape != points.shape or not np.isfinite(normals).all(): raise ValueError('Invalid surfel normals')
+    B = np.asarray(camera['basis']); size = camera['pixels']; extent = camera['extent']
+    q = (points-np.asarray(camera.get('center',[0,0,0])))@B; ns = normals@B
+    spacing = cKDTree(points).query(points,k=min(3,len(points)))[0][:,-1]
+    cap = max(float(np.quantile(spacing,.9)),extent/(size-1))
+    support = np.clip(spacing*1.2,extent/(size-1)*.6,cap*1.2)
+    pixel_scale = (size-1)/(2*extent)
+    depth = np.full((size,size),-np.inf); ids = np.full((size,size),-1,dtype=int)
+    for i in np.argsort(q[:,2],kind='stable'):
+        u = (q[i,0]/(2*extent)+.5)*(size-1); v = (.5-q[i,1]/(2*extent))*(size-1)
+        pr = min(12,max(1,int(np.ceil(support[i]*pixel_scale))))
+        x0,x1 = max(0,int(np.floor(u))-pr),min(size,int(np.ceil(u))+pr+1)
+        y0,y1 = max(0,int(np.floor(v))-pr),min(size,int(np.ceil(v))+pr+1)
+        if x0>=x1 or y0>=y1: continue
+        ys,xs = np.mgrid[y0:y1,x0:x1]
+        dx=(xs-u)/pixel_scale; dy=-(ys-v)/pixel_scale
+        nz=ns[i,2]
+        dz=-(ns[i,0]*dx+ns[i,1]*dy)/(np.copysign(max(abs(nz),.1),nz))
+        good=dx*dx+dy*dy+dz*dz <= support[i]**2
+        z=q[i,2]+dz; take=good & (z>depth[y0:y1,x0:x1])
+        depth[y0:y1,x0:x1][take]=z[take]; ids[y0:y1,x0:x1][take]=i
+    valid=ids>=0; rgb=np.full((size,size,3),255,np.uint8)
+    shade=125+40*np.abs(ns[:,2]); rgb[valid]=shade[ids[valid],None].astype(np.uint8)
+    protected=valid & (np.asarray(exterior)[np.maximum(ids,0)]>=.6) if exterior is not None else np.zeros_like(valid)
+    control=np.zeros((size,size),np.uint8)
+    if valid.any():
+        z=depth[valid]; control[valid]=(40+200*(z-z.min())/max(np.ptp(z),1e-6)).astype(np.uint8)
+    return dict(rgb=rgb,valid=valid,depth=np.where(valid,depth,0),ids=ids,protected=protected,
+        control=np.repeat(control[:,:,None],3,axis=2),renderer_actual='surfel',
+        support_radius_max=float(support.max()), observed_samples=len(points))
+
+
 # ── Surface-mesh renderer (FIX #1) ─────────────────────────────────────────────
 
 def render_surface(points, normals, exterior, camera, radius=2):
     """Attempt Poisson surface reconstruction → Phong-shaded mesh render.
 
-    Falls back silently to the original point-splat renderer if trimesh or
-    open3d is unavailable, or if the point cloud is too sparse to mesh.
+    Fails explicitly if open3d is unavailable or the surface cannot be reconstructed.
     The result dict is identical to render() so callers are interchangeable.
     """
     try:
@@ -113,9 +158,10 @@ def render_surface(points, normals, exterior, camera, radius=2):
         mesh = mesh.simplify_quadric_decimation(4000)
 
         if len(np.asarray(mesh.triangles)) < 10:
-            raise ValueError('Mesh too sparse, falling back')
+            raise ValueError('Poisson diagnostic mesh too sparse')
 
         # Sample dense point cloud from mesh surface for rendering
+        o3d.utility.random.seed(4101)
         sampled = mesh.sample_points_uniformly(number_of_points=max(4096, len(points)))
         pts_s = np.asarray(sampled.points, float)
         mesh.compute_vertex_normals()
@@ -131,11 +177,12 @@ def render_surface(points, normals, exterior, camera, radius=2):
         else:
             ext_s = None
 
-        return render(pts_s, ns_s, ext_s, camera, radius)
+        result = render(pts_s, ns_s, ext_s, camera, radius)
+        result.update(renderer_actual='poisson_dense_splats', generated_surface_not_observed=True)
+        return result
 
-    except Exception:
-        # Graceful fallback to point-splat renderer
-        return render(points, normals, exterior, camera, radius)
+    except Exception as exc:
+        raise RuntimeError(f'Explicit Poisson diagnostic renderer failed: {exc}') from exc
 
 
 # ── Tight crop (FIX #6) ────────────────────────────────────────────────────────
@@ -247,6 +294,8 @@ def save(directory, rendered, use_inverted_mask=False, mask_type=None):
     """
     Image.fromarray(rendered['rgb']).save(directory / 'image.png')
     Image.fromarray(rendered['control']).save(directory / 'control.png')
+    Image.fromarray(rendered['valid'].astype(np.uint8)*255).save(directory/'observed_mask.png')
+    Image.fromarray(rendered['protected'].astype(np.uint8)*255).save(directory/'exterior_mask.png')
     # Always save both mask variants so E1 arms can select
     orig_mask = (~rendered['protected']).astype(np.uint8) * 255
     inv_mask  = inverted_mask(rendered)

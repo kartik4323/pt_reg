@@ -8,6 +8,7 @@ import platform
 import sys
 import time
 import traceback
+import shutil
 from pathlib import Path
 
 
@@ -110,6 +111,11 @@ class Store:
             raise RuntimeError(f'Job locked: {lock}. Check its PID/host before unlock.')
         os.write(fd, json.dumps(dict(pid=os.getpid(), host=platform.node(), time=time.time())).encode())
         os.close(fd)
+        if result.exists() and self.retry:
+            archive=directory/'attempts'/str(time.time_ns()); archive.mkdir(parents=True)
+            for item in list(directory.iterdir()):
+                if item.name not in ('attempts','running.lock'):
+                    shutil.move(str(item),str(archive/item.name))
         started = time.time()
         versions = {}
         for package in ('numpy', 'scipy', 'Pillow', 'trimesh', 'torch', 'diffusers'):
@@ -129,11 +135,24 @@ class Store:
         except Exception as exc:
             (directory / 'error.txt').write_text(traceback.format_exc(), encoding='utf-8')
             row.update(status='failed', error=f'{type(exc).__name__}: {exc}', artifacts=[])
+            evidence=str(exc)+'\n'+'\n'.join(p.read_text(encoding='utf-8',errors='replace')[-8000:]
+                                             for p in directory.rglob('worker.log') if 'attempts' not in p.parts)
+            row['failure_kind']=('cuda_oom' if 'CUDA out of memory' in evidence else
+                'resource_unavailable' if type(exc).__name__=='ResourceUnavailable' else
+                'budget_exhausted' if type(exc).__name__=='BudgetExhausted' else
+                'unsupported_capability' if 'unsupported_capability' in evidence else
+                'timeout' if type(exc).__name__=='TimeoutExpired' else
+                'extraction_failure' if 'extract_mesh' in evidence else
+                'segmentation_failure' if "'matte'" in evidence or 'matte weights' in evidence else
+                'alignment_failure' if 'fit_template' in evidence else
+                'model_failure' if stage in ('E1','E2') else 'stage_error')
             print(row['error'], flush=True)
         finally:
             row['seconds'] = time.time() - started
             write(result, row)
             lock.unlink(missing_ok=True)
+        if row.get('failure_kind') in ('budget_exhausted','resource_unavailable'):
+            raise RuntimeError(row['error'])
         return row
 
     def artifact(self, row, filename):

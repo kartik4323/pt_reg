@@ -60,6 +60,15 @@ def inventory(path):
     return doc
 
 
+def balanced_cases(records,split,source_limit):
+    """One deterministic fracture case per independent source; never first-N variants."""
+    if source_limit < 1: raise ValueError('source_limit must be positive')
+    groups={}
+    for r in sorted(records,key=lambda r:r['id']):
+        if r['split']==split: groups.setdefault(r['source_id'],r)
+    return [groups[s] for s in sorted(groups)[:source_limit]]
+
+
 def load_case(dataset_path, record, cfg, seed=None):
     """Never opens evaluator data; returns normalization and original point indices."""
     from .geometry import normals_features
@@ -77,19 +86,43 @@ def load_case(dataset_path, record, cfg, seed=None):
             raise ValueError('Degenerate fragments')
         anchor = int(np.argmax(diameters))
         indices = [rng.choice(len(p), min(cfg['points'], len(p)), replace=False) for p in original]
-        pts, normals, exterior = [], [], []
+        pts, normals, exterior,original_normals = [], [], [], []
         for i, p in enumerate(original):
             q = (p[indices[i]] - centers[i]) / scale
             n, e = normals_features(q)
             if f'normals_{i}' in f.files:
-                n = np.asarray(f[f'normals_{i}'], float)[indices[i]]
+                full_n=np.asarray(f[f'normals_{i}'],float)
+                original_normals.append(full_n)
+                n = full_n[indices[i]]
                 if n.shape != q.shape or not np.isfinite(n).all() or (np.linalg.norm(n, axis=1) < 1e-8).any():
                     raise ValueError('Invalid observed normals')
                 n /= np.linalg.norm(n, axis=1, keepdims=True)
+            else: original_normals.append(None)
             pts.append(q); normals.append(n); exterior.append(e)
     return dict(record=record, points=pts, normals=normals, exterior=exterior, original=original,
                 indices=indices, centers=centers, scale=scale, anchor=anchor,
+                original_normals=original_normals,
                 exterior_method='fixed_local_curvature_heuristic_not_true_fracture_labels')
+
+
+def rendering_evidence(case, cfg):
+    """Dense deterministic samples of public inputs, independent of assembly sampling."""
+    from .geometry import normals_features
+    points, normals, exterior, indices = [], [], [], []
+    for i, original in enumerate(case['original']):
+        rng = np.random.default_rng(seed_for(cfg['seed'],case['record']['id'],'render',i))
+        idx = np.sort(rng.choice(len(original), min(cfg.get('render_points',8192),len(original)),replace=False))
+        p = (original[idx]-case['centers'][i])/case['scale']
+        n,e = normals_features(p)
+        supplied=case.get('original_normals',[None]*len(case['original']))[i]
+        if supplied is not None:
+            n=np.asarray(supplied[idx],float).copy()
+            if n.shape!=p.shape or not np.isfinite(n).all() or (np.linalg.norm(n,axis=1)<1e-8).any():
+                raise ValueError('Invalid dense observed normals')
+            n/=np.linalg.norm(n,axis=1,keepdims=True)
+        points.append(p); normals.append(n); exterior.append(e); indices.append(idx)
+    return dict(points=points,normals=normals,exterior=exterior,indices=indices,
+                provenance='public_observed_points_only')
 
 
 def reference(dataset_path, case):

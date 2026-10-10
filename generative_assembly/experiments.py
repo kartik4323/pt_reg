@@ -7,9 +7,11 @@ import time
 from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
+from PIL import Image
 from . import data, geometry as g, render
 from .backends import launch
 from .storage import read, write
+from .quality import score_alpha, save_matte
 
 
 def prepared(store, case):
@@ -19,6 +21,18 @@ def prepared(store, case):
     with np.load(store.artifact(row, 'candidates.npz'), allow_pickle=False) as f:
         bank = f['poses']
     return row, bank
+
+
+def run_stage(store,stage,case,allow_failures=False):
+    """Keep case-local dependency failures in the cohort; resource/budget stops stay fatal."""
+    try: return STAGES[stage](store,case)
+    except Exception as exc:
+        resource_failures=[r for r in store.jobs() if r['case_id']==case['record']['id'] and
+                           r.get('failure_kind') in ('budget_exhausted','resource_unavailable')]
+        if not allow_failures or resource_failures: raise
+        message=f'{type(exc).__name__}: {exc}'
+        def unavailable(out): raise RuntimeError('stage_dependency_or_execution_failure: '+message)
+        return [store.run(stage,case['record'],'stage_unavailable',unavailable)]
 
 
 def save_prediction(directory, case, poses, diagnostics, **extra):
@@ -32,7 +46,9 @@ def save_prediction(directory, case, poses, diagnostics, **extra):
 def _build_prompt(cfg, rec):
     """Select the active prompt text based on cfg['prompt_variant']."""
     variant = cfg.get('prompt_variant', 'original')
-    if variant == 'original':
+    if variant == 'bottle':
+        base = cfg['prompt_bottle']
+    elif variant == 'original':
         base = cfg.get('prompt_original', cfg.get('prompt', ''))
     else:  # 'short' or 'category'
         base = cfg.get('prompt_short', cfg.get('prompt', ''))
@@ -47,6 +63,9 @@ def _render_fragment(case, cfg, bank, kind):
     Applies render_mode (surface vs splat) and tight_crop based on config.
     """
     selected = [case['anchor']] if kind == 'F' else list(range(len(case['points'])))
+    if cfg.get('render_mode') == 'surfel':
+        evidence = data.rendering_evidence(case,cfg)
+        case = dict(case,points=evidence['points'],normals=evidence['normals'],exterior=evidence['exterior'])
     points = np.concatenate([case['points'][i] if kind == 'F' else g.apply(case['points'][i], bank[0, i]) for i in selected])
     ns = np.concatenate([case['normals'][i] if kind == 'F' else case['normals'][i] @ bank[0, i, :3, :3].T for i in selected])
     ext = np.concatenate([case['exterior'][i] for i in selected])
@@ -67,13 +86,16 @@ def e0(store, case):
 
         # ── Camera(s) ────────────────────────────────────────────────────────
         anchor_pts = case['points'][case['anchor']]
+        framing_pts=(case['original'][case['anchor']]-case['centers'][case['anchor']])/case['scale']
         if n_views == 1:
-            camera = render.camera_for(anchor_pts, cfg['pixels'], cfg['canvas_extent'], cfg['splat_radius'])
+            camera = render.frame_observed(render.camera_for(anchor_pts, cfg['pixels'], cfg['canvas_extent'], cfg['splat_radius']),
+                                          framing_pts,cfg.get('framing_fill',0))
             cameras = [camera]
             camera_labels = ['v0']
         else:
             cameras = render.camera_for(anchor_pts, cfg['pixels'], cfg['canvas_extent'],
                                         cfg['splat_radius'], n_views=n_views)
+            cameras = [render.frame_observed(c,framing_pts,cfg.get('framing_fill',0)) for c in cameras]
             camera_labels = [f'v{i}' for i in range(n_views)]
             camera = cameras[0]  # keep canonical camera for coordinate checks
 
@@ -85,7 +107,9 @@ def e0(store, case):
 
             for cam, vlabel in zip(cameras, camera_labels):
                 # Choose renderer
-                if render_mode == 'surface':
+                if render_mode == 'surfel':
+                    rendered = render.render_surfel(pts,ns,ext,cam,cfg['splat_radius'])
+                elif render_mode == 'surface':
                     rendered = render.render_surface(pts, ns, ext, cam, cfg['splat_radius'])
                 else:
                     rendered = render.render(pts, ns, ext, cam, cfg['splat_radius'])
@@ -98,6 +122,20 @@ def e0(store, case):
                 directory = out / f'{kind}_{vlabel}' if n_views > 1 else out / kind
                 directory.mkdir(exist_ok=True)
                 render.save(directory, rendered, mask_type=mask_type)
+                write(directory/'renderer.json',dict(requested=render_mode,
+                    actual=rendered.get('renderer_actual','splat'),observed_samples=len(pts),
+                    requested_points_per_fragment=cfg.get('render_points') if render_mode=='surfel' else cfg['points'],
+                    coverage=float(rendered['valid'].mean()),label_provenance=case['exterior_method'],
+                    camera_up_axis=np.asarray(cam['basis'])[:,1].tolist(),
+                    depth_background_meaning='unobserved_not_known_empty',
+                    support_radius_max=rendered.get('support_radius_max'),
+                    generated_surface_not_observed=render_mode=='surface'))
+                if render_mode=='surfel':
+                    evidence=data.rendering_evidence(case,cfg)
+                    selected=[case['anchor']] if kind=='F' else list(range(len(case['points'])))
+                    np.savez_compressed(directory/'point_provenance.npz',
+                        original_indices=np.concatenate([evidence['indices'][i] for i in selected]),
+                        fragment_ids=np.concatenate([np.full(len(evidence['indices'][i]),i) for i in selected]))
                 write(directory / 'camera.json', dict(cam, crop_box=rendered.get('crop_box'),
                       image_transform='crop_then_resize' if fill_target > 0 else 'identity'))
 
@@ -110,8 +148,8 @@ def e0(store, case):
         errors = [np.max(abs((g.apply(case['points'][i]*case['scale']+case['centers'][i],exported[i])-case['centers'][case['anchor']])/case['scale'] - g.apply(case['points'][i],bank[0,i]))) for i in range(len(exported))]
         p_anc = case['points'][case['anchor']]
         r = render.render(p_anc, None, None, camera, 0)
-        y,x = np.nonzero(r['valid']); B=np.asarray(camera['basis']); extent=cfg['canvas_extent']; size=cfg['pixels']
-        reconstructed = np.column_stack(((x/(size-1)-0.5)*2*extent,(0.5-y/(size-1))*2*extent,r['depth'][y,x])) @ B.T
+        y,x = np.nonzero(r['valid']); B=np.asarray(camera['basis']); extent=camera['extent']; size=cfg['pixels']
+        reconstructed = np.column_stack(((x/(size-1)-0.5)*2*extent,(0.5-y/(size-1))*2*extent,r['depth'][y,x])) @ B.T + np.asarray(camera.get('center',[0,0,0]))
         raster_error = float(np.linalg.norm(reconstructed-p_anc[r['ids'][y,x]],axis=1).max())
         tolerance = np.sqrt(2)*extent/(size-1)+1e-6
         if max(errors) > 1e-5 or raster_error > tolerance: raise RuntimeError('Coordinate integrity failed')
@@ -153,11 +191,15 @@ def e1(store, case):
         try:
             with np.load(store.artifact(parent, f'{dir_name}/render.npz'), allow_pickle=False) as f:
                 input_render = {k: f[k] for k in f.files}
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f'Invalid E0 render evidence for {dir_name}') from exc
 
         def raw(out, image=image_path, kl=kind_label):
             shutil.copy2(image, out / 'image.png')
+            if cfg['matte']['enabled']:
+                shutil.copy2(image,out/'image_raw.png')
+                save_matte(Image.open(image),
+                    input_render['valid'].astype(np.uint8)*255,out,dict(source='observed_render_mask_not_segmentation'))
             return dict(model='raw', input_type=kl, seed=None)
 
         rows.append(store.run('E1', rec, f'raw__{kind_label}', raw, parents=[parent]))
@@ -166,34 +208,63 @@ def e1(store, case):
             for seed in cfg['image_seeds']:
                 def generate(out, model=model, kl=kind_label, dn=dir_name, seed=seed,
                              input_render=input_render, image=image_path):
+                    model_prompt=cfg['prompt_bottle_edit'] if model=='qwen' and cfg.get('prompt_variant')=='bottle' else prompt
                     request = dict(
                         kind='image', smoke=cfg['smoke'], model=model,
                         config=cfg['images'], image=str(image),
                         control=str(store.artifact(parent, f'{dn}/control.png')),
                         mask=str(store.artifact(parent, f'{dn}/mask.png')),
-                        seed=seed, prompt=prompt, oracle=False,
+                        seed=seed, prompt=model_prompt, oracle=False,resources=cfg['resources'],
                     )
                     launch(request, out, cfg['images']['python'], cfg['resources']['worker_timeout_seconds'])
+                    if cfg['matte']['enabled']:
+                        from PIL import Image
+                        if cfg['smoke']:
+                            save_matte(Image.open(out/'image.png'),input_render['valid'].astype(np.uint8)*255,out,
+                                       dict(source='SMOKE_observed_mask_NOT_segmentation'))
+                        else:
+                            matte_dir=out/'matte'; matte_dir.mkdir()
+                            try:
+                                launch(dict(kind='matte',smoke=False,config=cfg['matte'],
+                                    image=str(out/'image_raw.png')),matte_dir,cfg['matte']['python'],300)
+                                for name in ('alpha.png','image_rgba.png','image_white.png','image.png','matte.json'):
+                                    shutil.copy2(matte_dir/name,out/name)
+                            except Exception as exc:
+                                return dict(model=model,input_type=kl,seed=seed,prompt=prompt,
+                                    selection=dict(valid_foreground=False,selection_score=100,
+                                        rejection_reasons=['segmentation_failed'],segmentation_error=str(exc),
+                                        camera_preservation_verified=False))
+                        alpha=np.asarray(Image.open(out/'alpha.png'))
+                        selection=score_alpha(alpha,input_render['valid'],input_render['protected'],cfg['matte'])
+                        generated=Image.open(out/'image_raw.png').convert('RGB')
+                        with Image.open(image) as source:
+                            original=source.convert('RGB').resize(generated.size)
+                        protected=np.asarray(Image.fromarray(input_render['protected']).resize(generated.size,Image.Resampling.NEAREST),bool)
+                        selection['protected_colour_mae']=float(np.abs(np.asarray(original,float)-np.asarray(generated,float))[protected].mean()/255) if protected.any() else None
+                    else: selection=render.image_score(out/'image.png',input_render)
                     return dict(model=model, input_type=kl, seed=seed,
-                                selection=render.image_score(out / 'image.png', input_render),
+                                selection=selection,
                                 raw_selection=render.image_score(out / 'image_raw.png', input_render)
                                 if (out / 'image_raw.png').exists() else None,
-                                mask_type=cfg['mask_type'], prompt=prompt)
+                                mask_type=cfg['mask_type'], prompt=model_prompt)
                 rows.append(store.run('E1', rec, f'{model}__{kind_label}__{seed}', generate, parents=[parent]))
     return rows
 
 
 
-def _reconstruct(store, case, row, multiview_rows=None):
+def _reconstruct(store, case, row, multiview_rows=None, input_mode=None):
     """Run InstantMesh reconstruction on a single E1 image row.
 
-    If multiview_rows is provided (list of E1 rows from different camera angles),
-    their images are packed into a 2×3 grid and passed to InstantMesh as Fix C.
+    Independently generated views are hypotheses, never calibrated reconstruction views.
     """
     cfg = store.config
     def reconstruct(out):
         import trimesh
         image = store.artifact(row, 'image.png')
+        mode=input_mode or cfg['reconstruction'].get('input_mode','legacy_rgb')
+        if mode=='rgba': image=store.artifact(row,'image_rgba.png')
+        if mode=='raw_rgb' and (store.root/'jobs'/row['job_id']/'image_raw.png').exists():
+            image=store.artifact(row,'image_raw.png')
 
         # Fix C: Collect sibling view images for multi-view grid if configured
         multiview_images = []
@@ -206,29 +277,47 @@ def _reconstruct(store, case, row, multiview_rows=None):
                 except Exception:
                     pass
 
-        launch(dict(kind='reconstruction', smoke=cfg['smoke'], config=cfg['reconstruction'],
+        reconstruction_cfg=dict(cfg['reconstruction'],input_mode=mode)
+        launch(dict(kind='reconstruction', smoke=cfg['smoke'], config=reconstruction_cfg,
                     image=str(image), oracle=row['oracle'],
-                    multiview_images=multiview_images),
+                    multiview_images=multiview_images,resources=cfg['resources']),
                out, cfg['reconstruction']['python'], cfg['reconstruction']['timeout_seconds'])
         mesh = trimesh.load(out / 'mesh.obj', force='mesh', process=False)
         if len(mesh.faces) == 0: raise ValueError('Reconstructor returned no surface')
+        if not np.isfinite(mesh.vertices).all(): raise ValueError('Reconstructor returned nonfinite vertices')
         points, _ = data.sample_mesh(mesh, max(1024, cfg['evaluation_points']),
                                      np.random.default_rng(data.seed_for(row['job_id'], 'surface')))
 
         # FIX #8: fit_template returns (None, rejection_dict) for degenerate shapes.
         solver_cfg = dict(cfg.get('reconstruction', {}), **cfg['solver'])
+        parent,_=prepared(store,case)
+        kind=row['output']['input_type']
+        camera_file=store.root/'jobs'/parent['job_id']/kind/'camera.json'
+        if not camera_file.exists(): camera_file=store.root/'jobs'/parent['job_id']/'camera.json'
+        solver_cfg['camera_basis']=read(camera_file)['basis']
         aligned, fit = g.fit_template(points, case, solver_cfg, data.seed_for(case['record']['id'], 'align'))
         if aligned is None:
             np.savez_compressed(out / 'shape.npz', raw=points)
         else:
             np.savez_compressed(out / 'shape.npz', raw=points, aligned=aligned)
         write(out / 'alignment.json', fit)
+        components=mesh.split(only_watertight=False)
+        dominant_area=max((m.area for m in components),default=0)/max(mesh.area,1e-12)
+        minimum=cfg['reconstruction'].get('template_min_component_area_fraction',0)
+        if dominant_area<minimum:
+            fit=dict(fit,rejected='disconnected_mesh_components',dominant_component_area_fraction=float(dominant_area))
+            write(out/'alignment.json',fit)
         return dict(model=row['output']['model'], input_type=row['output']['input_type'],
                     seed=row['output'].get('seed'), image_job=row['job_id'],
                     alignment=fit, template_rejected='rejected' in fit,
                     watertight=bool(mesh.is_watertight), vertices=len(mesh.vertices), faces=len(mesh.faces),
+                    components=len(components), component_faces=[len(m.faces) for m in components],
+                    dominant_component_area_fraction=float(dominant_area),
+                    input_mode=mode, shape_diagnostics=g.template_diagnostics(points),
+                    diagnostic_only=input_mode is not None,
                     n_multiview_images=len(multiview_images))
-    return store.run('E2', case['record'], row['arm'], reconstruct, oracle=row['oracle'], parents=[row])
+    arm=row['arm']+(f'__input_{input_mode}' if input_mode else '')
+    return store.run('E2', case['record'], arm, reconstruct, oracle=row['oracle'], parents=[row])
 
 
 
@@ -274,10 +363,29 @@ def e2(store, case):
                     if 'crop_box' in f.files:
                         r = render.crop_render(r, f['crop_box'])
                 render.save(out, r)
+                if cfg['matte']['enabled']:
+                    from PIL import Image
+                    save_matte(Image.fromarray(r['rgb']),r['valid'].astype(np.uint8)*255,out,
+                               dict(source='EVALUATOR_ONLY_complete_render_mask',oracle=True))
                 return dict(model='true_image', input_type='oracle', seed=None)
             r = store.run('E1_ORACLE', case['record'], 'true_image', oracle_image, oracle=True, parents=[parent])
             if r['status'] == 'complete':
                 rows.append(_reconstruct(store, case, r))
+            if cfg.get('oracle_full_frame_control'):
+                def full_image(out):
+                    complete=ref['complete']
+                    full_camera=render.frame_observed(camera,complete,.85)
+                    normals,exterior=g.normals_features(complete)
+                    rendered=render.render_surfel(complete,normals,exterior,full_camera)
+                    render.save(out,rendered)
+                    shutil.copy2(out/'image.png',out/'image_raw.png')
+                    save_matte(Image.fromarray(rendered['rgb']),rendered['valid'].astype(np.uint8)*255,out,
+                        dict(source='EVALUATOR_ONLY_full_object_render_mask',oracle=True))
+                    write(out/'camera.json',full_camera)
+                    return dict(model='true_image_full_frame',input_type='oracle',seed=None,
+                        evaluator_only=True,framing_from_ground_truth=True,renderer='surfel',foreground_fill=.85)
+                full=store.run('E1_ORACLE',case['record'],'true_image_full_frame',full_image,oracle=True,parents=[parent])
+                if full['status']=='complete': rows.append(_reconstruct(store,case,full))
     select_priors(store, case)
     if not rows: raise RuntimeError('No valid E1 outputs to reconstruct')
     return rows
@@ -287,6 +395,7 @@ def e2(store, case):
 def templates(store,case,model=None,kind=None):
     rows=store.find('E2',case['record']['id'])
     rows=[r for r in rows if not r['output'].get('template_rejected')
+          and not r['output'].get('diagnostic_only')
           and r['output'].get('alignment', {}).get('heldout_error') is not None
           and (model is None or r['output']['model']==model)
           and (kind is None or r['output']['input_type'].split('_v')[0]==kind)]
@@ -308,23 +417,41 @@ def select_priors(store, case):
     for model in ['raw'] + store.config['image_models']:
         for kind in store.config['input_types']:
             selected = []
+            selected_meshes=[]
             rejected = []
             for row, points in templates(store, case, model, kind):
                 if row['output']['alignment']['heldout_error'] > store.config.get('prior_max_heldout_error', 0.08):
                     rejected.append(dict(job_id=row['job_id'], reason='heldout_error'))
                     continue
-                if model != 'raw' and not store.config['smoke']:
+                if model != 'raw' and (not store.config['smoke'] or store.config['matte']['enabled']):
                     image_rows = store.find('E1', case['record']['id'])
                     image_row = next((r for r in image_rows if r['job_id'] == row['output'].get('image_job')), None)
                     if not image_row or image_row['output'].get('selection', {}).get('growth_relative_to_input', 0) < store.config.get('prior_min_growth', 0.05):
                         rejected.append(dict(job_id=row['job_id'], reason='insufficient_foreground_growth'))
                         continue
-                distances = [(cKDTree(p).query(points)[0].mean() +
-                              cKDTree(points).query(p)[0].mean()) / 2 for _, p in selected]
+                    if store.config['matte']['enabled'] and not image_row['output'].get('selection',{}).get('valid_foreground'):
+                        rejected.append(dict(job_id=row['job_id'],reason='invalid_matte')); continue
+                mesh_path=store.root/'jobs'/row['job_id']/'mesh.obj'
+                candidate_mesh=None
+                if mesh_path.exists():
+                    import trimesh
+                    candidate_mesh=trimesh.load(mesh_path,force='mesh',process=False)
+                    transform=row['output']['alignment'].get('similarity_transform')
+                    if transform is not None: candidate_mesh.apply_transform(np.asarray(transform))
+                if store.config['matte']['enabled'] and candidate_mesh is None:
+                    rejected.append(dict(job_id=row['job_id'],reason='mesh_unavailable')); continue
+                try:
+                    distances=[float((mesh.nearest.on_surface(points)[1].mean()+candidate_mesh.nearest.on_surface(p)[1].mean())/2)
+                        if candidate_mesh is not None and mesh is not None else
+                        float((cKDTree(p).query(points)[0].mean()+cKDTree(points).query(p)[0].mean())/2)
+                        for (_,p),mesh in zip(selected,selected_meshes)]
+                except (ImportError,ModuleNotFoundError):
+                    rejected.append(dict(job_id=row['job_id'],reason='mesh_diversity_measurement_unavailable')); continue
                 if distances and min(distances) < store.config.get('prior_diversity_distance', 0.025):
                     rejected.append(dict(job_id=row['job_id'], reason='duplicate_geometry'))
                     continue
                 selected.append((row, points))
+                selected_meshes.append(candidate_mesh)
                 if len(selected) == store.config.get('prior_count', 3):
                     break
             bundle = {}
@@ -335,11 +462,24 @@ def select_priors(store, case):
             if bundle:
                 bundle_path.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(bundle_path, **bundle)
+                import trimesh
+                for rank,(row,_) in enumerate(selected):
+                    mesh_path=store.root/'jobs'/row['job_id']/'mesh.obj'
+                    if mesh_path.exists():
+                        mesh=trimesh.load(mesh_path,force='mesh',process=False)
+                        transform=np.asarray(row['output']['alignment'].get('similarity_transform',np.eye(4)))
+                        mesh.apply_transform(transform)
+                        mesh.export(bundle_path.parent/f'{model}__{kind}__{rank+1}_normalized.obj')
+                        mesh.vertices=np.asarray(mesh.vertices)*case['scale']+case['centers'][case['anchor']]
+                        mesh.export(bundle_path.parent/f'{model}__{kind}__{rank+1}_original.obj')
             groups[f'{model}__{kind}'] = dict(job_ids=[r['job_id'] for r, _ in selected],
                 requested=store.config.get('prior_count', 3), available=len(selected),
                 filtered_candidates=rejected,
-                point_cloud_bundle=str(bundle_path.relative_to(store.root)) if bundle else None,
-                selection='heldout_observed_error_then_aligned_shape_diversity')
+                point_cloud_bundle=bundle_path.relative_to(store.root).as_posix() if bundle else None,
+                scores=[r['output']['alignment']['heldout_error'] for r,_ in selected],
+                shortfall_reason=None if len(selected)==store.config.get('prior_count',3) else 'insufficient_valid_compatible_diverse_candidates',
+                selection='heldout_observed_error_then_aligned_mesh_surface_diversity',
+                diversity_metric='bidirectional_sample_to_mesh_distance_when_meshes_available')
     write(store.root / 'priors' / f"{case['record']['id']}.json", groups)
     return groups
 
@@ -398,10 +538,11 @@ def e3(store,case):
 def e4(store,case):
     cfg=store.config; parent,bank=prepared(store,case); rows=[]
     arms=[('B0',None,None,False)]
+    groups=select_priors(store,case)
     for model,tag in [('raw','B1')]+[(m,'B2') for m in cfg['image_models']]:
         for kind in cfg['input_types']:
             found=templates(store,case,model,kind)
-            chosen = select_priors(store, case)[f'{model}__{kind}']['job_ids']
+            chosen = groups[f'{model}__{kind}']['job_ids']
             found = [x for x in found if x[0]['job_id'] in chosen]
             if found:
                 for rank, (tr, points) in enumerate(found):
@@ -422,6 +563,42 @@ def e4(store,case):
                                tr['output']['alignment']['heldout_error'] if tr else None)
                 return save_prediction(out,case,p,diag,template_job=tr['job_id'] if tr else None)
             rows.append(store.run('E4',case['record'],name+('__refine' if refine else '__rerank'),job,oracle=oracle,parents=[parent]+([tr] if tr else [])))
+    def deploy(out):
+        model,kind=cfg['primary_model'],cfg['primary_input']
+        selected=groups[f'{model}__{kind}']['job_ids']
+        hypotheses=[(r['job_id'],p,r['output']['alignment']['heldout_error'])
+                    for r,p in templates(store,case,model,kind) if r['job_id'] in selected]
+        import trimesh
+        meshes={}
+        for r,_ in templates(store,case,model,kind):
+            if r['job_id'] not in selected: continue
+            path=store.root/'jobs'/r['job_id']/'mesh.obj'
+            if path.exists() and r['output'].get('watertight'):
+                m=trimesh.load(path,force='mesh',process=False)
+                transform=r['output']['alignment'].get('similarity_transform')
+                if transform is not None: m.apply_transform(np.asarray(transform)); meshes[r['job_id']]=m
+        poses,diag=g.choose_assembly(case,bank,cfg['solver'],hypotheses,meshes)
+        return save_prediction(out,case,poses,diag,model=model,input_type=kind)
+    parents=[parent]+[r for r,_ in templates(store,case,cfg['primary_model'],cfg['primary_input'])
+                      if r['job_id'] in groups[f'{cfg["primary_model"]}__{cfg["primary_input"]}']['job_ids']]
+    rows.append(store.run('E4',case['record'],'B2__deploy',deploy,parents=parents))
+    if cfg['oracles'] and case['record']['split']!='train':
+        ref=data.reference(store.dataset,case)
+        if ref is not None:
+            def ceiling(out):
+                from .evaluate import pose_metrics
+                errors=[pose_metrics(case,ref,p,cfg)['max_part_chamfer'] for p in bank]
+                best=int(np.argmin(errors))
+                return save_prediction(out,case,bank[best],dict(best_candidate_error=errors[best],
+                    candidate_recall=errors[best]<=cfg['evaluation']['threshold'],
+                    evaluator_only=True,uses_ground_truth=True))
+            rows.append(store.run('E3',case['record'],'candidate_bank_ceiling',ceiling,oracle=True,parents=[parent]))
+            def registration(out):
+                if 'complete' not in ref: return dict(not_applicable='complete_reference_unavailable')
+                aligned,fit=g.fit_template(ref['complete'],case,dict(cfg['reconstruction'],**cfg['solver']),0)
+                np.savez_compressed(out/'registration.npz',raw=ref['complete'],**({'aligned':aligned} if aligned is not None else {}))
+                return dict(diagnostics=fit,evaluator_only=True)
+            rows.append(store.run('E3',case['record'],'complete_geometry_registration',registration,oracle=True,parents=[parent]))
     # Compute-control is explicitly capped and reports whether it actually matched.
     def extra_compute(out):
         target=sum(r['seconds'] for r in store.find('E1',case['record']['id'])+store.find('E2',case['record']['id']))

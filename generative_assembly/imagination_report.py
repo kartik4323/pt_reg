@@ -20,9 +20,21 @@ def discover(root):
 
 
 def collect(root, dataset=None):
+    cached=Path(root)/'analysis'/'metrics.json'
+    runs=discover(root)
+    if dataset is None and cached.exists() and runs and all(
+        not (r/'experiment.json').exists() or not Path(read(r/'experiment.json')['dataset']).exists() for r in runs):
+        rows=read(cached)
+        profiles={read(r/'experiment.json').get('profile',r.name) if (r/'experiment.json').exists() else
+                  read(r/'study.json')['identity']['config'].get('experiment_profile',r.name):r for r in runs}
+        for row in rows:
+            if row['profile'] in profiles: row['artifact_dir']=str(profiles[row['profile']]/'jobs'/row['job_id'])
+            row['cached_evaluator_metrics']=True
+        return rows
     rows = []
-    for run in discover(root):
+    for run in runs:
         cfg = read(run / 'study.json')['identity']['config']
+        manifest=read(run/'experiment.json') if (run/'experiment.json').exists() else {}
         # Explicit dataset override makes downloaded artifacts portable.
         ds = Path(dataset) if dataset else Path(read(run / 'experiment.json')['dataset']) if (run / 'experiment.json').exists() else None
         cases = {c['id']: c for c in read(ds)['cases']} if ds and ds.exists() else {}
@@ -30,20 +42,29 @@ def collect(root, dataset=None):
         prepared = {j['case_id']: j for j in jobs if j['stage'] == 'E0' and j['status'] == 'complete'}
         cache = {}
         for job in jobs:
-            if job['stage'] not in ('E1', 'E1_ORACLE', 'E2', 'E4'):
+            if job['stage'] not in ('E0','E1', 'E1_ORACLE', 'E2', 'E3','E4'):
                 continue
             out = job.get('output', {})
             directory = run / 'jobs' / job['job_id']
-            row = dict(profile=cfg.get('experiment_profile', run.name), case_id=job['case_id'],
+            row = dict(profile=manifest.get('profile',cfg.get('experiment_profile', run.name)), case_id=job['case_id'],
+                source_id=job.get('source_id'), split=job.get('split'),
                 stage=job['stage'], arm=job['arm'], status=job['status'], job_id=job['job_id'],
                 model=out.get('model'), input_type=out.get('input_type'), seed=out.get('seed'),
                 oracle=job.get('oracle', False), smoke=job.get('smoke', False), seconds=job.get('seconds'),
                 error=job.get('error'), artifact_dir=str(directory), normalized_distance_units=True,
                 reference_available=False)
+            row['failure_kind']=job.get('failure_kind')
             if job['status'] != 'complete':
                 rows.append(row); continue
             if out.get('not_applicable'):
                 row.update(status='not_applicable', reason=out['not_applicable'])
+                rows.append(row); continue
+            if job['stage'] in ('E0','E3'):
+                row.update(renderer_requested=out.get('render_mode'),diagnostics=out.get('diagnostics'))
+                if job['stage']=='E0':
+                    renderers=[read(p) for p in directory.glob('*/renderer.json')]
+                    row['renderer_actual']=[v['actual'] for v in renderers]
+                    row['render_coverage']=[v['coverage'] for v in renderers]
                 rows.append(row); continue
             if job['case_id'] in cases:
                 if job['case_id'] not in cache:
@@ -57,7 +78,8 @@ def collect(root, dataset=None):
                 row.update(out.get('selection', {}))
                 if out.get('raw_selection'):
                     row.update({'raw_' + k: v for k, v in out['raw_selection'].items()})
-                    row['cleanup_removed_foreground_fraction'] = out['raw_selection']['foreground_fraction'] - out['selection']['foreground_fraction']
+                    if out.get('selection',{}).get('foreground_fraction') is not None:
+                        row['cleanup_removed_foreground_fraction'] = out['raw_selection']['foreground_fraction'] - out['selection']['foreground_fraction']
                 if row['reference_available']:
                     parent = prepared.get(job['case_id'])
                     if parent:
@@ -71,7 +93,9 @@ def collect(root, dataset=None):
                             if camera.get('crop_box') is not None:
                                 truth = render.crop_render(truth, camera['crop_box'])
                             truth = binary_closing(truth['valid'], iterations=2)
-                            predicted = render.foreground(Image.open(directory / 'image.png').convert('RGB'))
+                            alpha=directory/'alpha.png'
+                            predicted=np.asarray(Image.open(alpha).resize((cfg['pixels'],cfg['pixels']),Image.Resampling.NEAREST))>=128 if alpha.exists() else render.foreground(Image.open(directory / 'image.png').convert('RGB'))
+                            row['foreground_metric']='object_matte' if alpha.exists() else 'legacy_brightness_proxy'
                             predicted = binary_closing(predicted, iterations=2)
                             row['silhouette_iou'] = float((truth & predicted).sum() / max(1, (truth | predicted).sum()))
                             row['silhouette_metric'] = 'point_splat_proxy_2px_closing'
@@ -82,6 +106,8 @@ def collect(root, dataset=None):
                                 row['missing_region_precision'] = float((missing & added).sum() / max(1, added.sum()))
                                 row['missing_region_recall'] = float((missing & added).sum() / max(1, missing.sum()))
             elif job['stage'] == 'E2':
+                row.update(shape_diagnostics=out.get('shape_diagnostics'),watertight=out.get('watertight'),
+                           components=out.get('components'),reconstruction_input_mode=out.get('input_mode'))
                 fit = out.get('alignment', {})
                 shape = directory / 'shape.npz'
                 row.update(template_rejected=bool(out.get('template_rejected') or fit.get('rejected')),
@@ -97,11 +123,17 @@ def collect(root, dataset=None):
                                 precision_002=float((a < .02).mean()), recall_002=float((b < .02).mean()))
                             pr, re = row['precision_002'], row['recall_002']
                             row['f1_002'] = 2 * pr * re / max(1e-12, pr + re)
+                            from .quality import shape_metrics,evaluator_observed
+                            from . import geometry as g
+                            kind=out.get('input_type','F').split('_v')[0]
+                            observed=evaluator_observed(case,ref,kind)
+                            row.update(shape_metrics(points,truth,observed))
                 # Never score a rejected/raw template in the normalized reference frame.
             elif job['stage'] == 'E4' and ref is not None:
                 from .evaluate import pose_metrics
                 with np.load(directory / 'poses.npz', allow_pickle=False) as f:
                     row.update(pose_metrics(case, ref, f['normalized'], cfg))
+                row['abstained']=out.get('diagnostics',{}).get('abstained')
             rows.append(row)
     return rows
 
@@ -114,7 +146,7 @@ def gallery(rows, case_id, stage='E1', max_images=48):
         if row['case_id'] != case_id or row['stage'] not in (stage, 'E1_ORACLE') or row['status'] != 'complete':
             continue
         directory = Path(row['artifact_dir'])
-        for name in ('image_raw.png', 'image.png'):
+        for name in ('image_raw.png','alpha.png','image_white.png', 'image.png'):
             path = directory / name
             if not path.exists(): continue
             image = Image.open(path).convert('RGB'); image.thumbnail((220, 220))
@@ -124,6 +156,59 @@ def gallery(rows, case_id, stage='E1', max_images=48):
             tiles.append(f'<div style="display:inline-block;margin:8px;width:230px"><p>{label}</p><img src="data:image/png;base64,{encoded}"/></div>')
         if len(tiles) >= max_images: break
     return ''.join(tiles)
+
+
+def review_sheet(rows,case_id):
+    """Blinded input-only review, with no GT image or evaluator outcome."""
+    from html import escape
+    tiles=gallery([r for r in rows if not r.get('oracle')],case_id,max_images=1000)
+    return '<p>Review: bottle identity; full outline; same view/location; texture corruption. '+\
+           'Foreground retention is NOT camera verification. Mark uncertain cases.</p>'+tiles
+
+
+def study_diagnostics(root):
+    funnel=[]; priors=[]; resources=[]
+    for run in discover(root):
+        for p in (run/'jobs').glob('*/result.json'):
+            r=read(p); output=r.get('output',{})
+            funnel.append(dict(profile=run.name,stage=r['stage'],case_id=r['case_id'],
+                source_id=r['source_id'],status=r['status'],failure_kind=r.get('failure_kind'),
+                valid_e1=output.get('selection',{}).get('valid_foreground'),
+                template_rejected=output.get('template_rejected')))
+        for p in (run/'priors').glob('*.json'):
+            for arm,value in read(p).items(): priors.append(dict(profile=run.name,case_id=p.stem,arm=arm,**value))
+        for p in (run/'jobs').glob('*/gpu_preflight.json'): resources.append(dict(profile=run.name,**read(p)))
+    budget=read(Path(root)/'budget.json') if (Path(root)/'budget.json').exists() else None
+    return dict(funnel=funnel,priors=priors,resources=resources,budget=budget)
+
+
+def prepare_review(root):
+    """Create blank, non-overwriting review forms keyed by selected E2 candidate."""
+    for run in discover(root):
+        jobs={read(p)['job_id']:read(p) for p in (run/'jobs').glob('*/result.json')}
+        review=read(run/'review.json') if (run/'review.json').exists() else {}
+        for path in (run/'priors').glob('*.json'):
+            for arm,entry in read(path).items():
+                if arm.startswith('raw__'): continue
+                for jid in entry['job_ids']:
+                    review.setdefault(jid,dict(bottle_identity=None,full_outline=None,same_view=None,
+                        surface_quality=None,image_job=jobs[jid]['output'].get('image_job'),
+                        case_id=path.stem,arm=arm,reviewer_note='Blinded image/geometry review; never use GT scores'))
+        write(run/'review.json',review)
+        from html import escape
+        blocks=['<!doctype html><meta charset="utf-8"><title>Blinded prior review</title>',
+            '<h1>Input-only review: no reference images or evaluator scores</h1>',
+            '<p>Review bottle identity, complete outline, same camera/location and surface quality. '
+            'Use review.json; null is pending. Review this page before inspecting evaluator results.</p>']
+        for jid,entry in review.items():
+            image_job=entry.get('image_job'); image=jobs.get(image_job)
+            if not image or image.get('oracle'): continue
+            blocks.append('<h2>'+escape(jid+' | '+entry['case_id']+' | '+entry['arm'])+'</h2>')
+            blocks.append('<h3>Observed inputs (not reference geometry)</h3>'+input_gallery(run,entry['case_id']))
+            blocks.append(gallery([dict(profile=run.name,case_id=entry['case_id'],stage='E1',status='complete',
+                arm=image['arm'],artifact_dir=str(run/'jobs'/image_job))],entry['case_id']))
+        (run/'blinded_review.html').write_text(''.join(blocks),encoding='utf-8')
+    return 'Fill boolean review fields in each profile/review.json; null is pending, not approval.'
 
 
 def input_gallery(root, case_id):

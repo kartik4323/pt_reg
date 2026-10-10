@@ -9,6 +9,23 @@ DATASET="${DATASET:-$GA_ROOT/bottles498-inputs-v1/dataset_2parts.json}"
 BASE_CONFIG="${BASE_CONFIG:-$GA_ROOT/configs/sd15-v100-locked.json}"
 IMAGES_PYTHON="${IMAGES_PYTHON:-$GA_ROOT/envs/images/bin/python}"
 INSTANTMESH_PYTHON="${INSTANTMESH_PYTHON:-$GA_ROOT/envs/instantmesh/bin/python}"
+if [[ -n "${PHASE:-}" ]]; then
+  RUN_GROUP="${RUN_GROUP:-$GA_ROOT/runs/imagination-v3-$(date -u +%Y%m%dT%H%M%SZ)}"
+  IMAGES_PYTHON="${IMAGES_V3_PYTHON:-$GA_ROOT/envs/images-v3/bin/python}"
+  MATTE_PYTHON="${MATTE_PYTHON:-$GA_ROOT/envs/matte-v3/bin/python}"
+  MATTE_LOCK="${MATTE_LOCK:-$GA_ROOT/models/matte-v3/lock.json}"
+  extra=()
+  [[ "${RETRY_FAILED:-0}" == 1 ]] && extra+=(--retry-failed)
+  if [[ -n "${STAGES:-}" ]]; then read -r -a stages <<< "$STAGES"; extra+=(--stages "${stages[@]}"); fi
+  if [[ -n "${FINALISTS:-}" ]]; then read -r -a finalists <<< "$FINALISTS"; extra+=(--finalists "${finalists[@]}"); fi
+  if [[ -n "${PROFILES:-}" ]]; then read -r -a profiles <<< "$PROFILES"; extra+=(--profiles "${profiles[@]}"); fi
+  [[ -n "${REPRESENTATION:-}" ]] && extra+=(--representation "$REPRESENTATION")
+  printf 'V3 phase: %s\nRun group: %s\n' "$PHASE" "$RUN_GROUP"
+  exec "$IMAGES_PYTHON" -m generative_assembly.study_cycle phase --phase "$PHASE" \
+    --root "$RUN_GROUP" --dataset "$DATASET" --base "$BASE_CONFIG" --matte-lock "$MATTE_LOCK" \
+    --images-python "$IMAGES_PYTHON" --mesh-python "$INSTANTMESH_PYTHON" --matte-python "$MATTE_PYTHON" \
+    "${extra[@]}"
+fi
 RUN_GROUP="${RUN_GROUP:-$GA_ROOT/runs/imagination-v2-$(date -u +%Y%m%dT%H%M%SZ)}"
 LIMIT="${LIMIT:-3}"
 read -r -a PROFILES <<< "${PROFILES:-legacy_cleanup clean completion exterior}"

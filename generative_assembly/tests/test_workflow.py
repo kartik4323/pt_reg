@@ -130,6 +130,7 @@ class WorkflowTests(unittest.TestCase):
         output=bundle(self.store,self.root/'evidence','research')
         self.assertGreater(output['files'],20)
         self.assertTrue((self.root/'evidence'/'SHA256SUMS.json').is_file())
+        self.assertTrue((self.root/'evidence'/'priors'/f'{self.case["record"]["id"]}.json').is_file())
 
     def test_evaluator_reference_identity_guard(self):
         evaluate(self.store,'dev')

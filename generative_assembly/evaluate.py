@@ -70,16 +70,30 @@ def evaluate(store,split):
             row['status']='not_applicable'; row['reason']=job['output']['not_applicable']
         elif ref is None:
             row['status']='unscored_no_reference'; row['input_only_diagnostics']=job['output'].get('diagnostics')
+        elif job['arm']=='complete_geometry_registration':
+            row['metrics']=dict(registration_control=job['output']['diagnostics'])
         elif job['stage'] in ('E3','E4','E5','E6','E7'):
             with np.load(store.artifact(job,'poses.npz'),allow_pickle=False) as f: poses=f['normalized']
             row['metrics']=pose_metrics(case,ref,poses,cfg,job['output'].get('retained_ids'))
             row['input_only_diagnostics']=job['output']['diagnostics']
-            if job['stage']=='E3':
+            if job['stage']=='E3' and job['arm']!='candidate_bank_ceiling':
                 with np.load(store.artifact(job,'starts.npz'),allow_pickle=False) as f: starts=f['poses']
                 before=[pose_metrics(case,ref,p,cfg) for p in starts]
                 row['metrics'].update(candidate_recall=any(m['success'] for m in before),best_candidate_error=min(m['max_part_chamfer'] for m in before),
                                       initially_successful=before[0]['success'] if len(before)==1 else None)
         elif job['stage']=='E2' and 'complete' in ref:
+            if job['output'].get('model','').startswith('true_image'):
+                from .geometry import fit_template
+                with np.load(store.artifact(job,'shape.npz'),allow_pickle=False) as f: raw=f['raw']
+                target=ref['complete'][np.linspace(0,len(ref['complete'])-1,min(2048,len(ref['complete']))).astype(int)]
+                center=target.mean(0); diameter=max(2*np.linalg.norm(target-center,axis=1).max(),1e-10)
+                privileged=dict(points=[(target-center)/diameter],exterior=[np.ones(len(target))],anchor=0)
+                registered,diagnostic=fit_template(raw,privileged,dict(cfg['reconstruction'],**cfg['solver']),42,evaluator_diagnostic=True)
+                registered=registered*diameter+center
+                transform=np.asarray(diagnostic['similarity_transform']); transform[:3]*=diameter; transform[:3,3]+=center
+                row['evaluator_only_complete_registration']=dict(chamfer=chamfer(registered,ref['complete']),
+                    similarity_transform=transform.tolist(),uses_ground_truth=True,
+                    quality_gate_bypassed_for_diagnostic=True,not_deployable=True)
             if job['output'].get('template_rejected') or job['output'].get('alignment', {}).get('heldout_error') is None:
                 row['status'] = 'rejected'
                 row['metrics'] = dict(valid_surface=False, rejection=job['output'].get('alignment', {}).get('rejected'))
@@ -91,6 +105,10 @@ def evaluate(store,split):
             row['metrics']=dict(shape_chamfer=chamfer(p,q),fscore_001=2*precision*recall/max(precision+recall,1e-12),
                                 observed_heldout_error=job['output']['alignment']['heldout_error'],valid_surface=True,
                                 alignment='input_only_not_oracle_aligned',thickness_and_cavity_metrics=None)
+            from .quality import shape_metrics,evaluator_observed
+            kind=job['output']['input_type'].split('_v')[0]
+            observed=evaluator_observed(case,ref,kind)
+            row['metrics'].update(shape_metrics(p,q,observed))
         elif job['stage']=='E1' and 'complete' in ref:
             parents=store.find('E0',base,'prepare')
             kind=job['output']['input_type']
@@ -103,7 +121,8 @@ def evaluate(store,split):
                     Image.fromarray(truth[y0:y1,x0:x1].astype(np.uint8)*255).resize(
                         (cfg['pixels'],cfg['pixels']),Image.NEAREST))>127
             image=Image.open(store.artifact(job,'image.png')).convert('RGB').resize((cfg['pixels'],cfg['pixels']))
-            predicted=render.foreground(image)
+            alpha_path=store.root/'jobs'/job['job_id']/'alpha.png'
+            predicted=np.asarray(Image.open(alpha_path).resize((cfg['pixels'],cfg['pixels']),Image.Resampling.NEAREST))>=128 if alpha_path.exists() else render.foreground(image)
             # Explicit point-splat silhouette proxy. No filled convex hull/cavity replacement.
             truth=binary_closing(truth,iterations=2); predicted=binary_closing(predicted,iterations=2)
             intersection=(truth&predicted).sum(); union=(truth|predicted).sum()
@@ -172,7 +191,7 @@ def evaluate(store,split):
         if a:
             targeted.append(dict(stage=stage,arm=arm,baseline_stage=baseline_stage,baseline=baseline_arm,
                                  paired_cases=sum(map(len,a.values())),**bootstrap_delta(a,b,count=cfg['evaluation']['bootstrap'])))
-    primary_arm=f'B2__{cfg["primary_model"]}__{cfg["primary_input"]}__refine'
+    primary_arm='B2__deploy' if any(r['arm']=='B2__deploy' for r in rows) else f'B2__{cfg["primary_model"]}__{cfg["primary_input"]}__refine'
     for control in [f'B1__raw__{cfg["primary_input"]}__refine','B3__refine','B4__refine','B5__refine','B6__refine']:
         compare('E4',primary_arm,'E4',control)
     for K in sorted(set([1,2,4,len(cfg['image_seeds'])])):
