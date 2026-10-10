@@ -199,3 +199,20 @@ python scripts/diagnose_remaining_studies.py --root "$GA_RUN_GROUP"
 This helper only reads saved files and lives outside the hashed experiment
 packages. An outer `CalledProcessError` needs the underlying `worker.log` error;
 an abrupt task-log ending alone does not identify a termination cause.
+
+If E1 reports `ModuleNotFoundError: torch`, configure its dedicated image
+interpreter rather than relying on the currently activated shell environment.
+Check all three runtimes before creating a replacement configuration:
+
+```bash
+python scripts/prepare_remaining_studies_runtime.py --from-suite "$GA_RUN_GROUP" \
+  --out "$GA_ROOT/configs/remaining-runtime-fixed.json" \
+  --images-python "$GA_ROOT/envs/images/bin/python" \
+  --reconstruction-python "$GA_ROOT/envs/instantmesh/bin/python"
+```
+
+The helper prints `GA_CONFIG`, `GA_PYTHON` and `GA_DATA` exports after successful
+import/CUDA checks. It preserves the frozen model revisions and refuses to
+overwrite existing configuration files. Choose a new `GA_RUN_GROUP`, include
+the old suite in `GA_SOURCE_RUNS`, and launch with the same sharing policy.
+Compatible completed artifacts can be imported; failed or locked jobs cannot.
